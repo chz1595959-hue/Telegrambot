@@ -312,7 +312,7 @@ async def update_game_message(game: Game, app):
         print(f"update error: {e}")
 
 # ---------- 命令处理 ----------
-async def dezhou(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
     if chat_id in games and games[chat_id].phase != 'waiting':
@@ -348,7 +348,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = query.message.chat.id
     game = games.get(chat_id)
     if not game:
-        await query.edit_message_text("游戏不存在，请使用 /德州 创建。")
+        await query.edit_message_text("游戏不存在，请使用 /DZ 创建。")
         return
 
     if game.game_msg_id != query.message.message_id:
@@ -413,7 +413,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if game.phase == 'showdown':
             winners = game.showdown()
-            # 关键修正：确保结算时显示完整的五张公共牌
             board_str = " ".join(card_str(c) for c in game.board) if game.board else "无公共牌"
             win_text = f"🏆 游戏结束！\n公共牌: {board_str}\n"
             for wid, desc in winners:
@@ -434,7 +433,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_game_message(game, context.application)
 
 async def start_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("你好！请在群组中使用 /德州 开始德州扑克。")
+    await update.message.reply_text("你好！请在群组中使用 /DZ 开始德州扑克。")
 
 def main():
     import os
@@ -444,8 +443,8 @@ def main():
         return
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start_private))
-    app.add_handler(CommandHandler("德州", dezhou))            # 现在需要用 /德州 创建
-    app.add_handler(CommandHandler("结束", end_game))         # /结束 强制终止
+    app.add_handler(CommandHandler("dz", dz))               # 开始命令 /DZ
+    app.add_handler(CommandHandler("end", end_game))        # 中断命令 /end
     app.add_handler(CallbackQueryHandler(button_handler))
     print("Bot 已启动...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
