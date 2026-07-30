@@ -1,5 +1,4 @@
 import random
-import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from treys import Card, Evaluator
@@ -37,6 +36,7 @@ class Game:
         self.dealer_idx = 0
         self.game_msg_id = None
         self.evaluator = Evaluator()
+        self.hand_revealed = set()  # 记录当前展开手牌的用户
 
     def add_player(self, user_id):
         if user_id not in self.players and self.phase == 'waiting':
@@ -80,12 +80,19 @@ class Game:
             self.all_in.add(uid)
 
     def get_buttons(self, uid):
-        if uid not in self.players_in_hand or uid in self.folded or uid in self.all_in:
-            return []
+        """为当前行动玩家生成操作按钮，同时添加通用手牌按钮"""
+        buttons = []
+        # 所有存活玩家都能看手牌
+        if uid in self.hands and uid not in self.folded and self.phase != 'showdown':
+            buttons.append([InlineKeyboardButton("🂠 查看手牌", callback_data="hand")])
+
+        # 如果不是当前行动玩家，或者已弃牌/全下，只显示手牌按钮
+        if uid not in self.players_in_hand or uid in self.folded or uid in self.all_in or uid != self.current_player_id():
+            return InlineKeyboardMarkup(buttons)
+
         to_call = self.current_bet - self.round_bets[uid]
         if to_call < 0:
             to_call = 0
-        buttons = []
         buttons.append([InlineKeyboardButton("Fold", callback_data="fold")])
         if to_call == 0:
             buttons.append([InlineKeyboardButton("Check", callback_data="check")])
@@ -269,19 +276,23 @@ class Game:
         self.acted_this_round.clear()
         self.last_aggressor = None
         self.dealer_idx = 0
+        self.hand_revealed.clear()
 
 # ---------- 辅助函数 ----------
 def card_str(card_int):
-    raw = Card.int_to_pretty_str(card_int)
-    return raw.replace('T', '10')
-
-async def send_private_hand(app, user_id, hand):
-    try:
-        msg = f"你的手牌: {card_str(hand[0])}  {card_str(hand[1])}"
-        await app.bot.send_message(chat_id=user_id, text=msg)
-        return True
-    except Exception:
-        return False
+    """将牌面转换为漂亮的字符串，例如 10♠️"""
+    raw = Card.int_to_pretty_str(card_int)  # 例如 "T♥" 或 "As"
+    # 替换 T 为 10，并美化花色符号
+    suit_map = {
+        '♠': '♠️',
+        '♥': '♥️',
+        '♦': '♦️',
+        '♣': '♣️',
+    }
+    rank = raw[:-1].replace('T', '10')
+    suit = raw[-1]
+    suit_emoji = suit_map.get(suit, suit)
+    return f"{rank}{suit_emoji}"
 
 async def get_name(app, user_id):
     try:
@@ -291,11 +302,8 @@ async def get_name(app, user_id):
         return str(user_id)
 
 async def async_format_player_list(app, players):
-    names = []
-    for uid in players:
-        names.append(await get_name(app, uid))
-    lines = [f"{i}. {name}" for i, name in enumerate(names, 1)]
-    return "\n".join(lines)
+    names = [await get_name(app, uid) for uid in players]
+    return "\n".join(f"{i}. {name}" for i, name in enumerate(names, 1))
 
 async def update_game_message(game: Game, app):
     text = "♠️ 德州扑克 ♥️\n"
@@ -356,8 +364,7 @@ async def dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
         f"🃏 新一局德州扑克！\n发起人: {await get_name(context.application, user.id)}\n\n"
         f"已加入玩家:\n{player_list}\n\n"
-        f"点击下方按钮加入（至少2人）\n"
-        f"⚠️ 所有玩家必须先私聊机器人发送 /start",
+        f"点击下方按钮加入（至少2人）",
         reply_markup=InlineKeyboardMarkup(keyboard_buttons)
     )
     game.game_msg_id = msg.message_id
@@ -383,7 +390,6 @@ async def add_chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if context.args and len(context.args) >= 2:
         arg1 = context.args[0]
-        # 尝试通过 mention 实体
         if update.message.entities:
             for ent in update.message.entities:
                 if ent.type == 'text_mention':
@@ -405,7 +411,6 @@ async def add_chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             amount = 0
     elif context.args and len(context.args) == 1:
-        # 可能只有一个参数：数量，用于回复消息
         try:
             amount = int(context.args[0])
         except ValueError:
@@ -432,7 +437,6 @@ async def add_chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     group_chips[chat_id][target_id] += amount
 
-    # 同步等待中的游戏
     if chat_id in games and games[chat_id].phase == 'waiting':
         game = games[chat_id]
         if target_id in game.chips:
@@ -448,10 +452,7 @@ async def chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     chips_dict = group_chips[chat_id]
-    lines = []
-    for i, (uid, amount) in enumerate(chips_dict.items(), 1):
-        name = await get_name(context.application, uid)
-        lines.append(f"{i}. {name}: {amount}")
+    lines = [f"{i}. {await get_name(context.application, uid)}: {amount}" for i, (uid, amount) in enumerate(chips_dict.items(), 1)]
     text = "💰 当前筹码:\n" + "\n".join(lines)
     await update.message.reply_text(text)
 
@@ -467,6 +468,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if game.game_msg_id != query.message.message_id:
+        return
+
+    # 查看手牌按钮（所有阶段均可使用）
+    if data == 'hand':
+        if user.id in game.hands and user.id not in game.folded and game.phase != 'showdown':
+            if user.id in game.hand_revealed:
+                # 已展开 → 隐藏
+                game.hand_revealed.discard(user.id)
+                await query.answer("手牌已隐藏", show_alert=False)
+            else:
+                # 未展开 → 显示
+                game.hand_revealed.add(user.id)
+                hand = game.hands[user.id]
+                hand_text = f"你的手牌: {card_str(hand[0])}  {card_str(hand[1])}"
+                await query.answer(hand_text, show_alert=True)
+        else:
+            await query.answer("你已弃牌或游戏已结束", show_alert=True)
         return
 
     if game.phase == 'waiting':
@@ -497,24 +515,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if game.start_game():
-                failed = []
-                for uid in game.players:
-                    if not await send_private_hand(context.application, uid, game.hands[uid]):
-                        failed.append(uid)
-                if failed:
-                    game.reset_to_waiting()
-                    player_list = await async_format_player_list(context.application, game.players)
-                    failed_names = [await get_name(context.application, uid) for uid in failed]
-                    keyboard_buttons = [[InlineKeyboardButton("加入游戏", callback_data="join")]]
-                    if len(game.players) >= 2:
-                        keyboard_buttons.append([InlineKeyboardButton("开始游戏", callback_data="start_game")])
-                    await query.edit_message_text(
-                        f"无法开始游戏，以下玩家未私聊机器人：{', '.join(failed_names)}\n"
-                        "请先私聊机器人发送 /start，然后房主重新点击开始。\n\n"
-                        f"当前已加入玩家:\n{player_list}",
-                        reply_markup=InlineKeyboardMarkup(keyboard_buttons)
-                    )
-                    return
                 await update_game_message(game, context.application)
             else:
                 await query.edit_message_text("游戏开始失败")
@@ -577,8 +577,8 @@ def main():
     app.add_handler(CommandHandler("start", start_private))
     app.add_handler(CommandHandler("dz", dz))
     app.add_handler(CommandHandler("end", end_game))
-    app.add_handler(CommandHandler("add", add_chips))      # 简化命令 /add
-    app.add_handler(CommandHandler("ph", chips))           # 简化命令 /ph
+    app.add_handler(CommandHandler("add", add_chips))
+    app.add_handler(CommandHandler("ph", chips))
     app.add_handler(CallbackQueryHandler(button_handler))
     print("Bot 已启动...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
