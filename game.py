@@ -1,27 +1,34 @@
 from treys import Card, Deck, Evaluator
 
 class Player:
-    def __init__(self, user_id: int, name: str):
-        self.user_id = user_id
+    def __init__(self, uid, name):
+        self.user_id = uid
         self.name = name
         self.hand = []
         self.chips = 1000
-        self.current_round_bet = 0
+        self.round_bet = 0      # 本轮已下注额
         self.total_bet = 0
         self.folded = False
         self.all_in = False
+        self.acted_this_round = False  # 本轮是否已行动
 
-    def reset_round(self):
-        self.current_round_bet = 0
+    def reset_for_new_hand(self):
+        self.hand = []
+        self.round_bet = 0
+        self.total_bet = 0
         self.folded = False
         self.all_in = False
+        self.acted_this_round = False
+
+    def can_act(self):
+        return not self.folded and not self.all_in
 
 class PokerGame:
-    def __init__(self, group_id: int):
+    def __init__(self, group_id):
         self.group_id = group_id
         self.players: list[Player] = []
         self.deck = Deck()
-        self.community: list[int] = []
+        self.community = []
         self.pot = 0
         self.current_bet = 0
         self.sb = 10
@@ -32,20 +39,21 @@ class PokerGame:
         self.evaluator = Evaluator()
         self.last_raise = 0
         self.min_raise = self.bb
+        self.hand_over = False
 
-    def add_player(self, user_id: int, name: str):
+    def add_player(self, uid, name):
         if len(self.players) >= 9:
-            return False, "最多9名玩家"
-        if any(p.user_id == user_id for p in self.players):
-            return False, "你已经在游戏中"
-        self.players.append(Player(user_id, name))
-        return True, "加入成功"
+            return False, "最多9人"
+        if any(p.user_id == uid for p in self.players):
+            return False, "已在游戏中"
+        self.players.append(Player(uid, name))
+        return True, "已加入"
 
     def start_game(self):
         if len(self.players) < 2:
-            return False, "至少需要2名玩家"
+            return False, "至少2人"
         for p in self.players:
-            p.reset_round()
+            p.reset_for_new_hand()
             p.chips = 1000
         self.pot = 0
         self.community = []
@@ -54,142 +62,191 @@ class PokerGame:
         for p in self.players:
             p.hand = self.deck.draw(2)
         self.dealer_idx = 0
-        sb_player = self.players[(self.dealer_idx + 1) % len(self.players)]
-        bb_player = self.players[(self.dealer_idx + 2) % len(self.players)]
-        sb_amount = min(self.sb, sb_player.chips)
-        bb_amount = min(self.bb, bb_player.chips)
-        sb_player.chips -= sb_amount
-        sb_player.total_bet += sb_amount
-        sb_player.current_round_bet = sb_amount
-        bb_player.chips -= bb_amount
-        bb_player.total_bet += bb_amount
-        bb_player.current_round_bet = bb_amount
-        self.pot = sb_amount + bb_amount
-        self.current_bet = bb_amount
-        self.action_idx = (self.dealer_idx + 3) % len(self.players)
-        self.stage = 'preflop'
+        # 小盲、大盲
+        sb_p = self.players[(self.dealer_idx + 1) % len(self.players)]
+        bb_p = self.players[(self.dealer_idx + 2) % len(self.players)]
+        sb_amt = min(self.sb, sb_p.chips)
+        bb_amt = min(self.bb, bb_p.chips)
+        sb_p.chips -= sb_amt
+        sb_p.total_bet += sb_amt
+        sb_p.round_bet = sb_amt
+        sb_p.all_in = (sb_p.chips == 0)
+        bb_p.chips -= bb_amt
+        bb_p.total_bet += bb_amt
+        bb_p.round_bet = bb_amt
+        bb_p.all_in = (bb_p.chips == 0)
+        self.pot = sb_amt + bb_amt
+        self.current_bet = bb_amt
         self.min_raise = self.bb
-        return True, "游戏开始"
+        self.stage = 'preflop'
+        # 行动位置为大盲后一位
+        self.action_idx = (self.dealer_idx + 3) % len(self.players)
+        self._skip_inactive()
+        return True, "开始"
 
-    def get_current_player(self) -> Player:
+    def get_current_player(self):
         return self.players[self.action_idx]
 
-    def process_action(self, user_id: int, action: str, amount: int = 0):
-        player = self.get_current_player()
-        if player.user_id != user_id:
+    def _skip_inactive(self):
+        """跳过无法行动的玩家，若无人可行动则推进阶段"""
+        n = len(self.players)
+        for _ in range(n):
+            p = self.players[self.action_idx]
+            if p.can_act():
+                return True
+            self.action_idx = (self.action_idx + 1) % n
+        # 全部无法行动 → 下一阶段
+        self._next_stage()
+        return False
+
+    def _all_acted_equal(self):
+        """检查是否所有人都已行动且下注额一致"""
+        active = [p for p in self.players if not p.folded]
+        if not active:
+            return True
+        target = self.current_bet
+        return all((p.all_in or p.acted_this_round) and p.round_bet == target for p in active)
+
+    def process_action(self, uid, action, amount=0):
+        if self.stage == 'showdown':
+            return False, "游戏已结束"
+        cur = self.get_current_player()
+        if cur.user_id != uid:
             return False, "不是你的回合"
-        if player.folded or player.all_in:
-            return False, "你已经无法行动"
+        if not cur.can_act():
+            return False, "无法行动"
 
         if action == 'fold':
-            player.folded = True
-            self._next_player()
-            return True, f"{player.name} 弃牌"
+            cur.folded = True
+            cur.acted_this_round = True
+            self._next_action()
+            return True, f"{cur.name} 弃牌"
 
         elif action == 'check':
-            if self.current_bet > player.current_round_bet:
-                return False, "你需要跟注或加注"
-            self._next_player()
-            return True, f"{player.name} 过牌"
+            if self.current_bet > cur.round_bet:
+                return False, "不能过牌，需要跟注或加注"
+            cur.acted_this_round = True
+            self._next_action()
+            return True, f"{cur.name} 过牌"
 
         elif action == 'call':
-            call_amount = self.current_bet - player.current_round_bet
-            if call_amount <= 0:
-                return self.process_action(user_id, 'check')
-            actual = min(call_amount, player.chips)
-            player.chips -= actual
-            player.current_round_bet += actual
-            player.total_bet += actual
-            self.pot += actual
-            if player.chips == 0:
-                player.all_in = True
-            self._next_player()
-            return True, f"{player.name} 跟注 {actual}"
+            diff = self.current_bet - cur.round_bet
+            if diff <= 0:
+                # 已平跟，等同过牌
+                return self.process_action(uid, 'check')
+            call_amt = min(diff, cur.chips)
+            cur.chips -= call_amt
+            cur.round_bet += call_amt
+            cur.total_bet += call_amt
+            self.pot += call_amt
+            if cur.chips == 0:
+                cur.all_in = True
+            cur.acted_this_round = True
+            self._next_action()
+            return True, f"{cur.name} 跟注 {call_amt}"
 
         elif action == 'raise':
             if amount <= self.current_bet:
-                return False, "加注必须大于当前下注额"
+                return False, "加注必须大于当前注"
             if amount < self.current_bet + self.min_raise:
-                return False, f"最小加注额为 {self.min_raise}"
-            if amount > player.chips + player.current_round_bet:
+                return False, f"最小加注 {self.min_raise}"
+            needed = amount - cur.round_bet
+            if needed > cur.chips:
                 return False, "筹码不足"
-            add_amount = amount - player.current_round_bet
-            player.chips -= add_amount
-            player.current_round_bet = amount
-            player.total_bet += add_amount
-            self.pot += add_amount
-            self.current_bet = amount
-            self.last_raise = amount - (self.current_bet - self.min_raise)
+            cur.chips -= needed
+            cur.round_bet = amount
+            cur.total_bet += needed
+            self.pot += needed
+            self.last_raise = amount - self.current_bet
             self.min_raise = self.last_raise
-            if player.chips == 0:
-                player.all_in = True
-            self._next_player()
-            return True, f"{player.name} 加注到 {amount}"
+            self.current_bet = amount
+            if cur.chips == 0:
+                cur.all_in = True
+            cur.acted_this_round = True
+            # 重置其他未弃牌玩家的本轮行动状态
+            for p in self.players:
+                if p != cur and not p.folded:
+                    p.acted_this_round = False
+            self._next_action()
+            return True, f"{cur.name} 加注到 {amount}"
 
         elif action == 'allin':
-            allin_amount = player.chips
-            if allin_amount == 0:
+            amt = cur.chips
+            if amt == 0:
                 return False, "已经全下"
-            player.current_round_bet += allin_amount
-            player.total_bet += allin_amount
-            self.pot += allin_amount
-            player.chips = 0
-            player.all_in = True
-            if player.current_round_bet > self.current_bet:
-                self.current_bet = player.current_round_bet
-                self.last_raise = player.current_round_bet - self.current_bet
+            cur.round_bet += amt
+            cur.total_bet += amt
+            self.pot += amt
+            cur.chips = 0
+            cur.all_in = True
+            cur.acted_this_round = True
+            if cur.round_bet > self.current_bet:
+                # 相当于加注
+                self.last_raise = cur.round_bet - self.current_bet
                 self.min_raise = self.last_raise
-            self._next_player()
-            return True, f"{player.name} 全下 {allin_amount}"
+                self.current_bet = cur.round_bet
+                for p in self.players:
+                    if p != cur and not p.folded:
+                        p.acted_this_round = False
+            self._next_action()
+            return True, f"{cur.name} 全下 {amt}"
         else:
             return False, "未知操作"
 
-    def _next_player(self):
+    def _next_action(self):
+        """移动到下一个可行动玩家，若本轮结束则推进阶段"""
         n = len(self.players)
+        # 移动 action_idx
         for _ in range(n):
             self.action_idx = (self.action_idx + 1) % n
-            next_player = self.players[self.action_idx]
-            if not next_player.folded and not next_player.all_in:
+            if self.players[self.action_idx].can_act():
                 break
-        active_players = [p for p in self.players if not p.folded]
-        if all(p.all_in or p.current_round_bet == self.current_bet for p in active_players):
+        # 检查是否所有活跃玩家都已行动且下注额持平
+        if self._all_acted_equal():
             self._next_stage()
 
     def _next_stage(self):
-        if self.stage == 'preflop':
-            self.community.extend(self.deck.draw(3))
-            self.stage = 'flop'
-        elif self.stage == 'flop':
-            self.community.extend(self.deck.draw(1))
-            self.stage = 'turn'
-        elif self.stage == 'turn':
-            self.community.extend(self.deck.draw(1))
-            self.stage = 'river'
-        elif self.stage == 'river':
-            self.stage = 'showdown'
-            return
-        # 重置轮次下注
+        """发公共牌或结束"""
+        # 重置本轮行动状态
         for p in self.players:
-            p.current_round_bet = 0
+            p.acted_this_round = False
+            p.round_bet = 0
         self.current_bet = 0
         self.last_raise = 0
         self.min_raise = self.bb
-        # 寻找第一个未弃牌且未all-in的玩家
-        start_idx = (self.dealer_idx + 1) % len(self.players)
+
+        if self.stage == 'preflop':
+            self.community += self.deck.draw(3)
+            self.stage = 'flop'
+        elif self.stage == 'flop':
+            self.community += self.deck.draw(1)
+            self.stage = 'turn'
+        elif self.stage == 'turn':
+            self.community += self.deck.draw(1)
+            self.stage = 'river'
+        elif self.stage == 'river':
+            self.stage = 'showdown'
+            self.hand_over = True
+            return
+
+        # 寻找第一个能行动的玩家（从庄位后一人开始）
+        start = (self.dealer_idx + 1) % len(self.players)
         found = False
         for _ in range(len(self.players)):
-            p = self.players[start_idx]
-            if not p.folded and not p.all_in:
-                self.action_idx = start_idx
+            p = self.players[start]
+            if p.can_act():
+                self.action_idx = start
                 found = True
                 break
-            start_idx = (start_idx + 1) % len(self.players)
-        # 如果找不到可行动的玩家，自动进入下一阶段（可能直接摊牌）
+            start = (start + 1) % len(self.players)
         if not found:
+            # 无人能行动，继续发下一阶段
             self._next_stage()
-
-    def is_round_over(self):
-        return False
+        else:
+            # 即使找到玩家，还需检查是否只剩一人（直接摊牌）
+            active = [p for p in self.players if not p.folded]
+            if len(active) == 1:
+                self._next_stage()
 
     def get_winners(self):
         active = [p for p in self.players if not p.folded]
@@ -200,12 +257,11 @@ class PokerGame:
             score = self.evaluator.evaluate(p.hand, self.community)
             scores.append((p, score))
         min_score = min(scores, key=lambda x: x[1])[1]
-        winners = [item for item in scores if item[1] == min_score]
-        return winners
+        return [item for item in scores if item[1] == min_score]
 
     def end_game(self):
         winners = self.get_winners()
-        share = self.pot // len(winners)
+        share = self.pot // len(winners) if winners else 0
         for p, _ in winners:
             p.chips += share
         return winners, share
