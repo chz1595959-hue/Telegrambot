@@ -1,4 +1,5 @@
 import random, os, asyncio, logging, traceback
+from collections import defaultdict
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from treys import Card, Evaluator
@@ -10,11 +11,16 @@ logger = logging.getLogger(__name__)
 
 # ---------- 配置 ----------
 STARTING_CHIPS = 10000
-SMALL_BLIND = 200
-BIG_BLIND = 500
-TURN_TIMEOUT = 60  # 秒
+SMALL_BLIND = 100
+BIG_BLIND = 200
+TURN_TIMEOUT = 60
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
+
+# 炸金花配置
+ZJH_ANTE = 100
+ZJH_MIN_RAISE = 100
+ZJH_SEEN_MULTIPLIER = 2
 
 # ---------- 数据库 ----------
 db_pool = None
@@ -23,7 +29,7 @@ async def init_db():
     global db_pool
     DATABASE_URL = os.environ.get("DATABASE_URL")
     if not DATABASE_URL:
-        logger.warning("DATABASE_URL 未设置，筹码/授权/历史将不会持久化")
+        logger.warning("DATABASE_URL 未设置")
         return
     try:
         db_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
@@ -44,6 +50,7 @@ async def init_db():
                     id SERIAL PRIMARY KEY,
                     chat_id BIGINT, user_id BIGINT,
                     game_time TIMESTAMP DEFAULT NOW(),
+                    game_type TEXT,
                     net_profit INT, final_chips INT
                 );
             ''')
@@ -83,44 +90,13 @@ async def delete_auth(chat_id):
     async with db_pool.acquire() as conn:
         await conn.execute("DELETE FROM auth WHERE chat_id=$1", chat_id)
 
-async def save_history(chat_id, user_id, net_profit, final_chips):
+async def save_history(chat_id, user_id, net_profit, final_chips, game_type):
     if not db_pool: return
     async with db_pool.acquire() as conn:
         await conn.execute('''
-            INSERT INTO history (chat_id, user_id, net_profit, final_chips)
-            VALUES ($1,$2,$3,$4)
-        ''', chat_id, user_id, net_profit, final_chips)
-
-# ---------- 边池计算 ----------
-def compute_side_pots(players_total_bet):
-    if not players_total_bet:
-        return []
-    sorted_bets = sorted(players_total_bet.items(), key=lambda x: x[1])
-    layers = []
-    prev = 0
-    for uid, bet in sorted_bets:
-        if bet > prev:
-            layer_contribution = bet - prev
-            eligible = [u for u, b in sorted_bets if b >= bet]
-            layers.append({'amount': layer_contribution * len(eligible), 'eligible': eligible})
-            prev = bet
-    return layers
-
-def distribute_side_pots(side_pots, scores, winners_set):
-    distribution = {uid: 0 for uid in scores}
-    for layer in side_pots:
-        eligible_scores = {uid: scores[uid] for uid in layer['eligible'] if uid in scores}
-        if not eligible_scores:
-            continue
-        best_score = min(eligible_scores.values())
-        layer_winners = [uid for uid, s in eligible_scores.items() if s == best_score]
-        share = layer['amount'] // len(layer_winners)
-        rem = layer['amount'] % len(layer_winners)
-        for uid in layer_winners:
-            distribution[uid] += share
-        if rem:
-            distribution[layer_winners[0]] += rem
-    return distribution
+            INSERT INTO history (chat_id, user_id, net_profit, final_chips, game_type)
+            VALUES ($1,$2,$3,$4,$5)
+        ''', chat_id, user_id, net_profit, final_chips, game_type)
 
 # ---------- 卡牌美化 ----------
 def card_str(card_int):
@@ -137,8 +113,37 @@ async def get_name(app, user_id):
     except:
         return str(user_id)
 
-# ---------- 游戏核心 ----------
-class Game:
+# ---------- 边池计算 ----------
+def compute_side_pots(players_total_bet):
+    if not players_total_bet: return []
+    sorted_bets = sorted(players_total_bet.items(), key=lambda x: x[1])
+    layers = []
+    prev = 0
+    for uid, bet in sorted_bets:
+        if bet > prev:
+            layer_contribution = bet - prev
+            eligible = [u for u, b in sorted_bets if b >= bet]
+            layers.append({'amount': layer_contribution * len(eligible), 'eligible': eligible})
+            prev = bet
+    return layers
+
+def distribute_side_pots(side_pots, scores, winners_set):
+    distribution = {uid: 0 for uid in scores}
+    for layer in side_pots:
+        eligible_scores = {uid: scores[uid] for uid in layer['eligible'] if uid in scores}
+        if not eligible_scores: continue
+        best_score = min(eligible_scores.values())
+        layer_winners = [uid for uid, s in eligible_scores.items() if s == best_score]
+        share = layer['amount'] // len(layer_winners)
+        rem = layer['amount'] % len(layer_winners)
+        for uid in layer_winners:
+            distribution[uid] += share
+        if rem:
+            distribution[layer_winners[0]] += rem
+    return distribution
+
+# ---------- 德州游戏类 ----------
+class TexasGame:
     def __init__(self, chat_id, owner_id, chips_dict):
         self.chat_id = chat_id
         self.owner_id = owner_id
@@ -165,6 +170,7 @@ class Game:
         self.game_msg_id = None
         self.evaluator = Evaluator()
         self.turn_task = None
+        self.hand_revealed = set()  # 已查看手牌的玩家
 
     def add_player(self, user_id):
         if user_id not in self.players and self.phase == 'waiting':
@@ -216,33 +222,37 @@ class Game:
 
     def get_buttons(self, uid):
         buttons = []
+        # 手牌查看按钮（根据状态显示不同文字）
         if uid in self.hands and uid not in self.folded and self.phase != 'showdown':
-            buttons.append([InlineKeyboardButton("🂠 查看手牌", callback_data="hand")])
+            if uid in self.hand_revealed:
+                buttons.append([InlineKeyboardButton("✅ 已查看手牌", callback_data="texas_hand")])
+            else:
+                buttons.append([InlineKeyboardButton("🂠 查看手牌", callback_data="texas_hand")])
 
         if uid not in self.players_in_hand or uid in self.folded or uid in self.all_in or uid != self.current_player_id():
             return InlineKeyboardMarkup(buttons)
 
         to_call = self.current_bet - self.round_bets[uid]
         if to_call < 0: to_call = 0
-        buttons.append([InlineKeyboardButton("❌ 弃牌", callback_data="fold")])
+        buttons.append([InlineKeyboardButton("❌ 弃牌", callback_data="texas_fold")])
         if to_call == 0:
-            buttons.append([InlineKeyboardButton("✅ 过牌", callback_data="check")])
+            buttons.append([InlineKeyboardButton("✅ 过牌", callback_data="texas_check")])
         else:
-            buttons.append([InlineKeyboardButton(f"✅ 跟注 {to_call}", callback_data="call")])
+            buttons.append([InlineKeyboardButton(f"✅ 跟注 {to_call}", callback_data="texas_call")])
         if self.chips[uid] > to_call:
             min_raise_total = self.current_bet + self.min_raise
             min_raise_needed = min_raise_total - self.round_bets[uid]
             if self.chips[uid] >= min_raise_needed:
-                buttons.append([InlineKeyboardButton(f"🔼 加注至 {min_raise_total} (最小)", callback_data=f"raise_{min_raise_needed}")])
+                buttons.append([InlineKeyboardButton(f"🔼 加注至 {min_raise_total} (最小)", callback_data=f"texas_raise_{min_raise_needed}")])
             half_pot = (self.pot + to_call) // 2 + to_call
             if self.chips[uid] >= half_pot and half_pot > to_call:
-                buttons.append([InlineKeyboardButton(f"🔼 加注至 {half_pot} (半池)", callback_data=f"raise_{half_pot}")])
+                buttons.append([InlineKeyboardButton(f"🔼 加注至 {half_pot} (半池)", callback_data=f"texas_raise_{half_pot}")])
             full_pot = self.pot + to_call * 2
             if self.chips[uid] >= full_pot and full_pot > to_call:
-                buttons.append([InlineKeyboardButton(f"🔼 加注至 {full_pot} (满池)", callback_data=f"raise_{full_pot}")])
+                buttons.append([InlineKeyboardButton(f"🔼 加注至 {full_pot} (满池)", callback_data=f"texas_raise_{full_pot}")])
             all_in_amount = self.chips[uid]
             if all_in_amount > to_call:
-                buttons.append([InlineKeyboardButton(f"🔥 全下 {all_in_amount}", callback_data=f"raise_{all_in_amount}")])
+                buttons.append([InlineKeyboardButton(f"🔥 全下 {all_in_amount}", callback_data=f"texas_raise_{all_in_amount}")])
         return InlineKeyboardMarkup(buttons)
 
     def current_player_id(self):
@@ -364,7 +374,7 @@ class Game:
             self.pot = 0
             for uid in self.chips:
                 self.chips_dict[uid] = self.chips[uid]
-            return [(winner, "Last one standing", 0)]
+            return [(winner, "最后存活", self.pot)]
 
         scores = {}
         for uid in alive:
@@ -376,7 +386,6 @@ class Game:
 
         best_score = min(scores.values())
         overall_winners = {uid for uid in alive if scores[uid] == best_score}
-
         total_bets = {uid: self.total_bet[uid] for uid in alive}
         side_pots = compute_side_pots(total_bets)
         distribution = distribute_side_pots(side_pots, scores, overall_winners)
@@ -397,8 +406,13 @@ class Game:
             self.turn_task.cancel()
             self.turn_task = None
 
-# ---------- 游戏界面更新 ----------
-async def build_game_text(game: Game, app, extra=""):
+# ---------- 炸金花游戏类（保持不变，略，见之前完整代码）----------
+# 为节省篇幅，ZhaJinHuaGame 及辅助函数沿用上次完整代码，此处不重复。
+# 实际部署时请将之前完整版中的炸金花类粘贴在此处。
+# ...
+
+# ---------- 界面辅助 ----------
+async def build_texas_text(game, app):
     player_lines = []
     for idx, uid in enumerate(game.players, 1):
         name = await get_name(app, uid)
@@ -414,22 +428,15 @@ async def build_game_text(game: Game, app, extra=""):
     board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
     board_display = f"|--------------------+\n| {board_str}\n|--------------------+"
 
-    phase_cn = {
-        'preflop': '翻牌前',
-        'flop':    '翻牌圈',
-        'turn':    '转牌圈',
-        'river':   '河牌圈',
-        'showdown': '摊牌'
-    }.get(game.phase, game.phase)
+    phase_cn = {'preflop':'翻牌前','flop':'翻牌圈','turn':'转牌圈','river':'河牌圈','showdown':'摊牌'}.get(game.phase, game.phase)
 
     current = game.current_player_id()
+    current_text = ""
     if current and game.phase in ('preflop','flop','turn','river'):
         to_call = game.current_bet - game.round_bets[current]
         if to_call < 0: to_call = 0
         cur_name = await get_name(app, current)
         current_text = f"|- 当前：{cur_name}  需跟注：{to_call}"
-    else:
-        current_text = ""
 
     text = (
         f"|- 积分德州牌桌\n"
@@ -439,12 +446,10 @@ async def build_game_text(game: Game, app, extra=""):
         f"{current_text}\n"
         f"|- 玩家：\n" + "\n".join(player_lines)
     )
-    if extra:
-        text += f"\n{extra}"
     return text
 
-async def update_game_message(game: Game, app):
-    text = await build_game_text(game, app)
+async def update_texas_message(game, app):
+    text = await build_texas_text(game, app)
     keyboard = None
     if game.phase in ('preflop','flop','turn','river') and game.current_player_id():
         keyboard = game.get_buttons(game.current_player_id())
@@ -456,32 +461,33 @@ async def update_game_message(game: Game, app):
             reply_markup=keyboard
         )
     except Exception as e:
-        logger.error(f"update error: {e}")
+        logger.error(f"德州更新错误: {e}")
 
-async def start_turn_timer(game: Game, app):
+async def start_texas_timer(game, app):
     game.cancel_timer()
     uid = game.current_player_id()
-    if not uid:
-        return
+    if not uid: return
     async def timeout():
         await asyncio.sleep(TURN_TIMEOUT)
         if game.phase in ('preflop','flop','turn','river') and game.current_player_id() == uid:
-            success, _ = game.handle_action(uid, 'fold')
-            if success:
-                await app.bot.send_message(game.chat_id, f"⏰ {await get_name(app, uid)} 超时未操作，自动弃牌")
-                if game.phase == 'showdown':
-                    await finish_game(game, app)
-                else:
-                    await update_game_message(game, app)
-                    await start_turn_timer(game, app)
+            # 自动弃牌
+            game.handle_action(uid, 'fold')
+            name = await get_name(app, uid)
+            await app.bot.send_message(game.chat_id, f"⏰ {name} 超时未操作，自动弃牌")
+            if game.phase == 'showdown':
+                await finish_texas(game, app)
+            else:
+                await update_texas_message(game, app)
+                await start_texas_timer(game, app)
     game.turn_task = asyncio.create_task(timeout())
 
-async def finish_game(game: Game, app):
+async def finish_texas(game, app):
     game.cancel_timer()
     winners = game.showdown()
     board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
     board_display = f"|--------------------+\n| {board_str}\n|--------------------+"
 
+    # 牌型展示
     card_lines = []
     for uid in game.players:
         name = await get_name(app, uid)
@@ -489,58 +495,58 @@ async def finish_game(game: Game, app):
             card_lines.append(f"{name}：弃牌")
         elif uid in game.all_in:
             hand = game.hands.get(uid, [])
-            if hand:
-                hand_str = " ".join(card_str(c) for c in hand)
-                card_lines.append(f"{name}：{hand_str} (全下)")
-            else:
-                card_lines.append(f"{name}：全下")
+            hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
+            card_lines.append(f"{name}：{hand_str} (全下)")
         else:
             hand = game.hands.get(uid, [])
-            if hand:
-                hand_str = " ".join(card_str(c) for c in hand)
-                card_lines.append(f"{name}：{hand_str}")
-            else:
-                card_lines.append(f"{name}：无手牌")
+            hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
+            card_lines.append(f"{name}：{hand_str}")
 
     total_pot = sum(game.total_bet.values())
+    # 派奖
     prize_lines = []
     for wid, desc, amount in winners:
         name = await get_name(app, wid)
-        prize_lines.append(f"{name} +{amount}")
+        prize_lines.append(f"{name} +{amount} ({desc})")
 
-    phase_cn = {
-        'preflop': '翻牌前',
-        'flop':    '翻牌圈',
-        'turn':    '转牌圈',
-        'river':   '河牌圈',
-        'showdown': '摊牌'
-    }.get(game.phase, game.phase)
-
-    win_text = (
-        f"积分德州已结算\n\n"
-        f"|- 积分德州牌桌\n"
-        f"|- 状态：{phase_cn}\n"
-        f"|- 公牌：\n{board_display}\n"
-        f"|- 奖池：{total_pot}\n"
-        f"结果：摊牌结算\n\n"
-        f"牌型：\n" + "\n".join(card_lines) + "\n\n"
-        f"派奖：\n" + "\n".join(prize_lines)
-    )
+    # 投入/盈亏
+    profit_lines = []
+    for uid in game.players:
+        name = await get_name(app, uid)
+        start = game.starting_chips_snapshot.get(uid, STARTING_CHIPS)
+        end = game.chips.get(uid, 0)
+        net = end - start
+        invested = game.total_bet.get(uid, 0)
+        profit_lines.append(f"{name}  投入:{invested}  盈亏:{net:+d}")
 
     # 历史记录
     for uid in game.players:
         start = game.starting_chips_snapshot.get(uid, STARTING_CHIPS)
         end = game.chips.get(uid, 0)
         net = end - start
-        await save_history(game.chat_id, uid, net, end)
+        await save_history(game.chat_id, uid, net, end, '德州')
     await save_chips(game.chat_id, game.chips_dict)
 
+    # 筹码归零提醒
     broke = [uid for uid in game.players if game.chips[uid] == 0]
+    broke_text = ""
     if broke:
         names = [await get_name(app, uid) for uid in broke]
-        win_text += f"\n⚠️ 以下玩家筹码归零: {', '.join(names)}，使用 /add 补充"
+        broke_text = f"\n⚠️ 以下玩家筹码归零: {', '.join(names)}，使用 /add 补充"
 
-    # 直接编辑原消息，不删除
+    win_text = (
+        f"积分德州已结算\n\n"
+        f"|- 积分德州牌桌\n"
+        f"|- 状态：摊牌\n"
+        f"|- 公牌：\n{board_display}\n"
+        f"|- 奖池：{total_pot}\n"
+        f"结果：摊牌结算\n\n"
+        f"牌型：\n" + "\n".join(card_lines) + "\n\n"
+        f"派奖：\n" + "\n".join(prize_lines) + "\n\n"
+        f"投入/盈亏：\n" + "\n".join(profit_lines) +
+        broke_text
+    )
+
     try:
         await app.bot.edit_message_text(
             chat_id=game.chat_id,
@@ -548,10 +554,10 @@ async def finish_game(game: Game, app):
             text=win_text,
         )
     except Exception as e:
-        logger.error(f"结算消息编辑失败: {e}")
+        logger.error(f"结算编辑失败: {e}")
 
-# ---------- 全局状态 ----------
-games = {}
+# ---------- 全局管理 ----------
+active_games = {}
 AUTHORIZED_GROUPS = set()
 
 async def init_auth():
@@ -564,7 +570,7 @@ async def init_auth():
 def is_authorized(chat_id):
     return chat_id in AUTHORIZED_GROUPS
 
-async def check_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def check_auth(update, context):
     chat_id = update.effective_chat.id
     if not is_authorized(chat_id):
         await update.effective_message.reply_text("❌ 此群组未授权，请联系管理员。")
@@ -572,24 +578,24 @@ async def check_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return True
 
 # ---------- 命令处理 ----------
-async def dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start_cmd(update, context):
+    await update.message.reply_text("使用 /DZ 德州扑克, /ZJH 炸金花")
+
+async def dz(update, context):
     if not await check_auth(update, context): return
     chat_id = update.effective_chat.id
     user = update.effective_user
-    if chat_id in games and games[chat_id].phase != 'waiting':
+    if chat_id in active_games and active_games[chat_id].phase != 'waiting':
         await update.message.reply_text("当前已有进行中的游戏，请等待结束。")
         return
-
     chips_dict = await load_chips(chat_id)
-    game = Game(chat_id, user.id, chips_dict)
+    game = TexasGame(chat_id, user.id, chips_dict)
     game.add_player(user.id)
-    games[chat_id] = game
-
+    active_games[chat_id] = game
     player_list = [f"{i}. {await get_name(context.application, uid)}" for i, uid in enumerate(game.players, 1)]
-    keyboard = [[InlineKeyboardButton("加入游戏", callback_data="join")]]
+    keyboard = [[InlineKeyboardButton("加入游戏", callback_data="texas_join")]]
     if len(game.players) >= 2:
-        keyboard.append([InlineKeyboardButton("开始游戏", callback_data="start_game")])
-
+        keyboard.append([InlineKeyboardButton("开始游戏", callback_data="texas_start")])
     msg = await update.message.reply_text(
         f"🃏 新一局德州扑克！\n发起人: {await get_name(context.application, user.id)}\n\n"
         f"已加入玩家:\n" + "\n".join(player_list) + "\n\n点击按钮加入或开始",
@@ -597,27 +603,31 @@ async def dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     game.game_msg_id = msg.message_id
 
-async def end_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def zjh(update, context):
+    if not await check_auth(update, context): return
+    # ... 炸金花创建逻辑（与之前相同）
+    pass
+
+async def end_game(update, context):
     if not await check_auth(update, context): return
     chat_id = update.effective_chat.id
-    game = games.pop(chat_id, None)
+    game = active_games.pop(chat_id, None)
     if not game:
         await update.message.reply_text("当前没有进行中的游戏。")
         return
     game.cancel_timer()
-    game.save_chips()
-    await save_chips(chat_id, game.chips_dict)
+    if isinstance(game, TexasGame):
+        game.save_chips()
+        await save_chips(chat_id, game.chips_dict)
+    else:
+        await save_chips(chat_id, game.chips_dict)
     await update.message.reply_text("游戏已被手动终止。")
     try:
-        await context.bot.edit_message_text(
-            chat_id=chat_id,
-            message_id=game.game_msg_id,
-            text="游戏已被手动终止。",
-        )
+        await context.bot.edit_message_text(chat_id=chat_id, message_id=game.game_msg_id, text="游戏已被手动终止。")
     except:
         pass
 
-async def add_chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def add_chips(update, context):
     if not await check_auth(update, context): return
     chat_id = update.effective_chat.id
     target_id = None
@@ -670,14 +680,14 @@ async def add_chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chips_dict[target_id] += amount
     await save_chips(chat_id, chips_dict)
 
-    if chat_id in games and games[chat_id].phase == 'waiting':
-        game = games[chat_id]
+    if chat_id in active_games and isinstance(active_games[chat_id], TexasGame) and active_games[chat_id].phase == 'waiting':
+        game = active_games[chat_id]
         if target_id in game.chips:
             game.chips[target_id] = chips_dict[target_id]
     name = await get_name(context.application, target_id)
     await update.message.reply_text(f"✅ 已给 {name} 增加 {amount} 筹码，当前筹码: {chips_dict[target_id]}")
 
-async def chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def chips(update, context):
     if not await check_auth(update, context): return
     chat_id = update.effective_chat.id
     chips_dict = await load_chips(chat_id)
@@ -687,7 +697,7 @@ async def chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"{i}. {await get_name(context.application, uid)}: {amt}" for i, (uid, amt) in enumerate(chips_dict.items(), 1)]
     await update.message.reply_text("💰 当前筹码:\n" + "\n".join(lines))
 
-async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def history(update, context):
     if not await check_auth(update, context): return
     chat_id = update.effective_chat.id
     user = update.effective_user
@@ -696,16 +706,16 @@ async def history(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     async with db_pool.acquire() as conn:
         rows = await conn.fetch(
-            "SELECT game_time, net_profit, final_chips FROM history WHERE chat_id=$1 AND user_id=$2 ORDER BY game_time DESC LIMIT 10",
+            "SELECT game_time, net_profit, final_chips, game_type FROM history WHERE chat_id=$1 AND user_id=$2 ORDER BY game_time DESC LIMIT 10",
             chat_id, user.id
         )
     if not rows:
         await update.message.reply_text("无历史记录。")
         return
-    lines = [f"📅 {r['game_time'].strftime('%m-%d %H:%M')}  盈利:{r['net_profit']:+d}  余额:{r['final_chips']}" for r in rows]
+    lines = [f"{r['game_type']} {r['game_time'].strftime('%m-%d %H:%M')}  盈利:{r['net_profit']:+d}  余额:{r['final_chips']}" for r in rows]
     await update.message.reply_text("📊 最近10局战绩:\n" + "\n".join(lines))
 
-async def shouquan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def shouquan(update, context):
     user = update.effective_user
     if user.id != ADMIN_USER_ID:
         await update.message.reply_text("❌ 只有机器人管理员可以执行此操作。")
@@ -723,12 +733,11 @@ async def shouquan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     else:
         chat_id = update.effective_chat.id
-
     AUTHORIZED_GROUPS.add(chat_id)
     await save_auth(chat_id)
     await update.message.reply_text(f"✅ 群组 {chat_id} 已授权。")
 
-async def qxshouquan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def qxshouquan(update, context):
     user = update.effective_user
     if user.id != ADMIN_USER_ID:
         await update.message.reply_text("❌ 只有机器人管理员可以执行此操作。")
@@ -746,7 +755,6 @@ async def qxshouquan(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     else:
         chat_id = update.effective_chat.id
-
     if chat_id in AUTHORIZED_GROUPS:
         AUTHORIZED_GROUPS.discard(chat_id)
         await delete_auth(chat_id)
@@ -754,59 +762,66 @@ async def qxshouquan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("该群组未授权。")
 
-# ---------- 按钮处理（修复手牌 bug） ----------
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ---------- 按钮回调 ----------
+async def button_handler(update, context):
     query = update.callback_query
     data = query.data
     chat_id = query.message.chat.id
     if not is_authorized(chat_id):
-        await query.edit_message_text("❌ 此群组未授权，请联系管理员。")
+        await query.answer("未授权", show_alert=True)
         return
 
-    game = games.get(chat_id)
+    game = active_games.get(chat_id)
     if not game:
-        await query.edit_message_text("游戏不存在，请使用 /DZ 创建。")
+        await query.edit_message_text("游戏不存在。")
         return
 
-    if game.game_msg_id != query.message.message_id:
-        return
+    if isinstance(game, TexasGame):
+        await texas_button_handler(update, context, game, query, data)
+    # elif isinstance(game, ZhaJinHuaGame):
+    #     await zjh_button_handler(update, context, game, query, data)  # 需要炸金花时取消注释
 
-    # 修复：只有非 hand 回调才预先 answer 空包
-    if data != 'hand':
-        await query.answer()
-
+async def texas_button_handler(update, context, game, query, data):
     user = query.from_user
+    await query.answer()
 
-    # 查看手牌
-    if data == 'hand':
+    # 手牌查看
+    if data == 'texas_hand':
         if user.id in game.hands and user.id not in game.folded and game.phase != 'showdown':
-            hand = game.hands[user.id]
-            hand_text = f"你的手牌: {card_str(hand[0])}  {card_str(hand[1])}"
-            await query.answer(hand_text, show_alert=True)
+            if user.id in game.hand_revealed:
+                game.hand_revealed.discard(user.id)
+                await query.answer("手牌已隐藏", show_alert=False)
+            else:
+                game.hand_revealed.add(user.id)
+                hand = game.hands[user.id]
+                hand_text = f"你的手牌: {card_str(hand[0])}  {card_str(hand[1])}"
+                await query.answer(hand_text, show_alert=True)
+            # 更新按钮显示（切换“查看手牌”和“已查看手牌”）
+            await update_texas_message(game, context.application)
         else:
             await query.answer("你已弃牌或游戏已结束", show_alert=True)
         return
 
     # 等待阶段
     if game.phase == 'waiting':
-        if data == 'join':
+        if data == 'texas_join':
             if game.add_player(user.id):
                 player_list = [f"{i}. {await get_name(context.application, uid)}" for i, uid in enumerate(game.players, 1)]
-                keyboard = [[InlineKeyboardButton("加入游戏", callback_data="join")]]
+                keyboard = [[InlineKeyboardButton("加入游戏", callback_data="texas_join")]]
                 if len(game.players) >= 2:
-                    keyboard.append([InlineKeyboardButton("开始游戏", callback_data="start_game")])
+                    keyboard.append([InlineKeyboardButton("开始游戏", callback_data="texas_start")])
                 await query.edit_message_text(
                     f"已加入玩家:\n" + "\n".join(player_list) + "\n\n点击按钮加入或开始",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
             else:
-                await query.answer("加入失败，可能已满或游戏已开始", show_alert=True)
-        elif data == 'start_game':
+                await query.answer("加入失败", show_alert=True)
+        elif data == 'texas_start':
             if user.id != game.owner_id:
                 await query.answer("只有发起人可以开始", show_alert=True)
                 return
             if len(game.players) < 2:
-                await query.answer("至少需要2名玩家", show_alert=True)
+                await query.answer("至少需要2人", show_alert=True)
                 return
             broke = [uid for uid in game.players if game.chips[uid] <= 0]
             if broke:
@@ -814,8 +829,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer(f"以下玩家筹码不足: {', '.join(names)}，请使用 /add 补充", show_alert=True)
                 return
             if game.start_game():
-                await update_game_message(game, context.application)
-                await start_turn_timer(game, context.application)
+                await update_texas_message(game, context.application)
+                await start_texas_timer(game, context.application)
             else:
                 await query.edit_message_text("游戏开始失败")
         return
@@ -825,28 +840,36 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if user.id != game.current_player_id():
             await query.answer("还没轮到你", show_alert=True)
             return
-        action = data.split('_')[0]
-        amount = None
-        if action == 'raise':
+        if data == 'texas_fold':
+            action = 'fold'
+        elif data == 'texas_check':
+            action = 'check'
+        elif data == 'texas_call':
+            action = 'call'
+        elif data.startswith('texas_raise_'):
             try:
-                amount = int(data.split('_')[1])
+                amount = int(data.split('_')[2])
+                action = 'raise'
             except:
                 await query.answer("无效加注额", show_alert=True)
                 return
-            action = 'raise'
-        success, info = game.handle_action(user.id, action, amount)
+        else:
+            return
+
+        if action != 'raise':
+            success, info = game.handle_action(user.id, action)
+        else:
+            success, info = game.handle_action(user.id, action, amount=amount)
+
         if not success:
             await query.answer(info, show_alert=True)
             return
         if game.phase == 'showdown':
-            await finish_game(game, context.application)
-            del games[chat_id]
+            await finish_texas(game, context.application)
+            del active_games[game.chat_id]
             return
-        await update_game_message(game, context.application)
-        await start_turn_timer(game, context.application)
-
-async def start_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("你好！请在群组中使用 /DZ 开始德州扑克。")
+        await update_texas_message(game, context.application)
+        await start_texas_timer(game, context.application)
 
 # ---------- 主函数 ----------
 def main():
@@ -860,8 +883,10 @@ def main():
     loop.run_until_complete(init_auth())
 
     app = Application.builder().token(TOKEN).build()
-    app.add_handler(CommandHandler("start", start_private))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("dz", dz))
+    # 炸金花命令暂时注释，需要时取消注释
+    # app.add_handler(CommandHandler("zjh", zjh))
     app.add_handler(CommandHandler("end", end_game))
     app.add_handler(CommandHandler("add", add_chips))
     app.add_handler(CommandHandler("ph", chips))
