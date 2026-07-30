@@ -295,7 +295,9 @@ class Game:
 games = {}
 
 def card_str(card_int):
-    return Card.int_to_pretty_str(card_int)
+    raw = Card.int_to_pretty_str(card_int)  # 例如 "T♥" 或 "As"
+    # 替换 T 为 10
+    return raw.replace('T', '10')
 
 async def send_private_hand(app, user_id, hand):
     try:
