@@ -1,4 +1,5 @@
 import random
+import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from treys import Card, Evaluator
@@ -319,11 +320,14 @@ async def dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("当前已有进行中的游戏，请等待结束。")
         return
     game = Game(chat_id, user.id)
+    game.add_player(user.id)   # 房主自动加入
     games[chat_id] = game
-    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("加入游戏", callback_data="join")]])
+    keyboard_buttons = [[InlineKeyboardButton("加入游戏", callback_data="join")]]
+    if len(game.players) >= 2:
+        keyboard_buttons.append([InlineKeyboardButton("开始游戏", callback_data="start_game")])
     msg = await update.message.reply_text(
-        f"🃏 新一局德州扑克！\n发起人: {user.first_name}\n点击下方按钮加入（至少2人）\n⚠️ 所有玩家必须先私聊机器人发送 /start 才能收到手牌！",
-        reply_markup=keyboard
+        f"🃏 新一局德州扑克！\n发起人: {user.first_name}\n已加入: {await get_name(context.application, user.id)}\n点击下方按钮加入（至少2人）\n⚠️ 所有玩家必须先私聊机器人发送 /start 才能收到手牌！",
+        reply_markup=InlineKeyboardMarkup(keyboard_buttons)
     )
     game.game_msg_id = msg.message_id
 
@@ -358,11 +362,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == 'join':
             if game.add_player(user.id):
                 names = [await get_name(context.application, uid) for uid in game.players]
+                # 始终保留“加入游戏”按钮，人数足够时增加“开始游戏”按钮
+                keyboard_buttons = [[InlineKeyboardButton("加入游戏", callback_data="join")]]
+                if len(game.players) >= 2:
+                    keyboard_buttons.append([InlineKeyboardButton("开始游戏", callback_data="start_game")])
                 await query.edit_message_text(
-                    f"已加入: {', '.join(names)}\n发起人点击下方按钮开始游戏",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("开始游戏", callback_data="start_game")]
-                    ]) if user.id == game.owner_id and len(game.players) >= 2 else None
+                    f"已加入: {', '.join(names)}\n点击下方按钮加入或开始游戏",
+                    reply_markup=InlineKeyboardMarkup(keyboard_buttons)
                 )
             else:
                 await query.answer("加入失败，可能已满或游戏已开始", show_alert=True)
@@ -381,12 +387,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if failed:
                     game.reset_to_waiting()
                     failed_names = [await get_name(context.application, uid) for uid in failed]
+                    # 重置后保留玩家列表，重新显示加入/开始按钮
+                    keyboard_buttons = [[InlineKeyboardButton("加入游戏", callback_data="join")]]
+                    if len(game.players) >= 2:
+                        keyboard_buttons.append([InlineKeyboardButton("开始游戏", callback_data="start_game")])
                     await query.edit_message_text(
                         f"无法开始游戏，以下玩家未私聊机器人：{', '.join(failed_names)}\n"
                         "请这些玩家先私聊机器人发送 /start，然后房主重新点击开始。",
-                        reply_markup=InlineKeyboardMarkup([
-                            [InlineKeyboardButton("开始游戏", callback_data="start_game")]
-                        ]) if len(game.players) >= 2 else None
+                        reply_markup=InlineKeyboardMarkup(keyboard_buttons)
                     )
                     return
                 await update_game_message(game, context.application)
