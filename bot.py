@@ -11,8 +11,8 @@ logger = logging.getLogger(__name__)
 
 # ---------- 配置 ----------
 STARTING_CHIPS = 10000
-SMALL_BLIND = 100
-BIG_BLIND = 200
+SMALL_BLIND = 200
+BIG_BLIND = 300
 TURN_TIMEOUT = 60
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
@@ -141,6 +141,20 @@ def distribute_side_pots(side_pots, scores, winners_set):
             distribution[layer_winners[0]] += rem
     return distribution
 
+# ---------- 通用临时消息 ----------
+async def send_action_notification(chat_id, app, user_id, action_desc):
+    """发送动作提示，10秒后自动删除"""
+    name = await get_name(app, user_id)
+    msg = await app.bot.send_message(chat_id=chat_id, text=f"🎲 {name} {action_desc}")
+    asyncio.create_task(delete_after(msg, 10))
+
+async def delete_after(message, delay):
+    await asyncio.sleep(delay)
+    try:
+        await message.delete()
+    except:
+        pass
+
 # ---------- 德州游戏类 ----------
 class TexasGame:
     def __init__(self, chat_id, owner_id, chips_dict):
@@ -251,7 +265,6 @@ class TexasGame:
             all_in_amount = self.chips[uid]
             if all_in_amount > to_call:
                 buttons.append([InlineKeyboardButton(f"🔥 全下 {all_in_amount}", callback_data=f"texas_raise_{all_in_amount}")])
-            # 自定义加注提示
             buttons.append([InlineKeyboardButton("✏️ 自定义加注", callback_data="texas_custom_raise")])
         return InlineKeyboardMarkup(buttons)
 
@@ -288,10 +301,12 @@ class TexasGame:
             self.players_in_hand.remove(uid)
             if self.actor_idx >= len(self.players_in_hand):
                 self.actor_idx = 0
+            desc = "弃牌"
         elif action == 'check':
             if self.current_bet > self.round_bets[uid]:
-                return False, "must call or raise"
+                return False, "必须跟注或加注"
             self.acted_this_round.add(uid)
+            desc = "过牌"
         elif action == 'call':
             call_amount = self.current_bet - self.round_bets[uid]
             actual = min(call_amount, self.chips[uid])
@@ -302,6 +317,7 @@ class TexasGame:
             if self.chips[uid] == 0:
                 self.all_in.add(uid)
             self.acted_this_round.add(uid)
+            desc = f"跟注 {actual}"
         elif action == 'raise':
             needed = amount
             if needed <= 0 or self.chips[uid] < needed:
@@ -321,22 +337,23 @@ class TexasGame:
                 self.all_in.add(uid)
             self.acted_this_round = {uid}
             self.last_aggressor = uid
+            desc = f"加注 {needed}"
         else:
-            return False, "unknown action"
+            return False, "未知操作"
 
         alive = [p for p in self.players_in_hand if p not in self.folded]
         if len(alive) == 1:
             self.phase = 'showdown'
-            return True, None
+            return True, desc
 
         if self.all_players_acted_or_allin():
             self._end_round()
-            return True, None
+            return True, desc
 
         self.next_player()
         if self.current_player_id() is None or self.all_players_acted_or_allin():
             self._end_round()
-        return True, None
+        return True, desc
 
     def _end_round(self):
         for uid in self.round_bets:
@@ -515,7 +532,7 @@ class ZhaJinHuaGame:
             if uid in self.seen:
                 return False, "已看过牌"
             self.seen.add(uid)
-            return True, None
+            return True, "看牌"
         elif action == 'fold':
             self.folded.add(uid)
             self.players_in_game.remove(uid)
@@ -524,9 +541,9 @@ class ZhaJinHuaGame:
             alive = [p for p in self.players_in_game if p not in self.folded]
             if len(alive) == 1:
                 self.phase = 'showdown'
-                return True, None
-            self.next_player()
-            return True, None
+            else:
+                self.next_player()
+            return True, "弃牌"
         elif action == 'call':
             multiplier = ZJH_SEEN_MULTIPLIER if uid in self.seen else 1
             bet_amount = self.current_bet * multiplier
@@ -544,9 +561,9 @@ class ZhaJinHuaGame:
             alive = [p for p in self.players_in_game if p not in self.folded]
             if len(alive) == 1:
                 self.phase = 'showdown'
-                return True, None
-            self.next_player()
-            return True, None
+            else:
+                self.next_player()
+            return True, f"跟注 {actual}"
         elif action == 'raise':
             multiplier = ZJH_SEEN_MULTIPLIER if uid in self.seen else 1
             min_raise = ZJH_MIN_RAISE * multiplier
@@ -561,9 +578,9 @@ class ZhaJinHuaGame:
             alive = [p for p in self.players_in_game if p not in self.folded]
             if len(alive) == 1:
                 self.phase = 'showdown'
-                return True, None
-            self.next_player()
-            return True, None
+            else:
+                self.next_player()
+            return True, f"加注 {amount}"
         elif action == 'compare':
             target_id = target
             if target_id not in self.players_in_game or target_id == uid or target_id in self.folded:
@@ -586,7 +603,7 @@ class ZhaJinHuaGame:
                 self.phase = 'showdown'
             else:
                 self.next_player()
-            return True, loser
+            return True, f"比牌胜，{loser} 出局"
         return False, "未知操作"
 
     def showdown(self):
@@ -684,7 +701,7 @@ async def build_texas_text(game, app):
         else:
             status = "在局"
         invested = game.total_bet.get(uid, 0)
-        player_lines.append(f"|- {idx}. {name}  {status}  投入:{invested}")
+        player_lines.append(f"|- {idx}. {name}  {status}  投入:{invested}\n")  # 每行后面加换行，再加一个空行由join决定
 
     board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
     board_display = f"|--------------------+\n| {board_str}\n|--------------------+"
@@ -699,13 +716,14 @@ async def build_texas_text(game, app):
         cur_name = await get_name(app, current)
         current_text = f"|- 当前：{cur_name}  需跟注：{to_call}"
 
+    # 增加空行
     text = (
-        f"|- 积分德州牌桌\n"
-        f"|- 状态：{phase_cn}\n"
-        f"|- 公牌：\n{board_display}\n"
-        f"|- 奖池：{game.pot}  当前下注：{game.current_bet}\n"
-        f"{current_text}\n"
-        f"|- 玩家：\n" + "\n".join(player_lines)
+        f"|- 积分德州牌桌\n\n"
+        f"|- 状态：{phase_cn}\n\n"
+        f"|- 公牌：\n{board_display}\n\n"
+        f"|- 奖池：{game.pot}  当前下注：{game.current_bet}\n\n"
+        f"{current_text}\n\n"
+        f"|- 玩家：\n\n" + "\n".join(player_lines) + "\n"
     )
     return text
 
@@ -718,18 +736,18 @@ async def build_zjh_text(game, app):
         else:
             status = "在局" + ("(已看)" if uid in game.seen else "(未看)")
         invested = game.total_bet.get(uid, 0)
-        player_lines.append(f"|- {idx}. {name}  {status}  投入:{invested}")
+        player_lines.append(f"|- {idx}. {name}  {status}  投入:{invested}\n")
     current = game.current_player_id()
     current_text = ""
     if current:
         cur_name = await get_name(app, current)
         current_text = f"|- 当前：{cur_name}"
     text = (
-        f"|- 炸金花牌桌\n"
-        f"|- 底注：{ZJH_ANTE}\n"
-        f"|- 奖池：{game.pot}  当前下注：{game.current_bet}\n"
-        f"{current_text}\n"
-        f"|- 玩家：\n" + "\n".join(player_lines)
+        f"|- 炸金花牌桌\n\n"
+        f"|- 底注：{ZJH_ANTE}\n\n"
+        f"|- 奖池：{game.pot}  当前下注：{game.current_bet}\n\n"
+        f"{current_text}\n\n"
+        f"|- 玩家：\n\n" + "\n".join(player_lines) + "\n"
     )
     return text
 
@@ -831,10 +849,10 @@ async def finish_texas(game, app):
         broke_text = f"\n⚠️ 以下玩家筹码归零: {', '.join(names)}，使用 /add 补充"
     win_text = (
         f"积分德州已结算\n\n"
-        f"|- 积分德州牌桌\n"
-        f"|- 状态：摊牌\n"
-        f"|- 公牌：\n{board_display}\n"
-        f"|- 奖池：{total_pot}\n"
+        f"|- 积分德州牌桌\n\n"
+        f"|- 状态：摊牌\n\n"
+        f"|- 公牌：\n{board_display}\n\n"
+        f"|- 奖池：{total_pot}\n\n"
         f"结果：摊牌结算\n\n"
         f"牌型：\n" + "\n".join(card_lines) + "\n\n"
         f"派奖：\n" + "\n".join(prize_lines) + "\n\n"
@@ -869,9 +887,9 @@ async def finish_zjh(game, app):
     await save_chips(game.chat_id, game.chips_dict)
     text = (
         f"炸金花已结算\n\n"
-        f"|- 获胜玩家：{name}\n"
-        f"|- 手牌：{board_str}\n"
-        f"|- 奖池：{sum(game.total_bet.values())}\n"
+        f"|- 获胜玩家：{name}\n\n"
+        f"|- 手牌：{board_str}\n\n"
+        f"|- 奖池：{sum(game.total_bet.values())}\n\n"
         f"牌型：\n" + "\n".join(hand_lines)
     )
     try:
@@ -1104,7 +1122,6 @@ async def qxshouquan(update, context):
 
 # ---------- 文本消息处理（自定义加注） ----------
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """处理自定义加注指令：加注XXX"""
     msg = update.effective_message
     if not msg or not msg.text: return
     user = update.effective_user
@@ -1113,9 +1130,8 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     game = active_games.get(chat_id)
     if not game or not isinstance(game, TexasGame):
-        return  # 没有活跃的德州游戏
+        return
 
-    # 只允许当前玩家执行
     if game.phase not in ('preflop','flop','turn','river'):
         return
     if user.id != game.current_player_id():
@@ -1124,7 +1140,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = msg.text.strip()
     match = re.match(r'^加注\s*(\d+)$', text)
     if not match:
-        # 检查回复消息
         if msg.reply_to_message and msg.reply_to_message.message_id == game.game_msg_id:
             match = re.match(r'^加注\s*(\d+)$', text)
             if not match:
@@ -1133,12 +1148,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     amount = int(match.group(1))
-    success, info = game.handle_action(user.id, 'raise', amount=amount)
+    success, desc = game.handle_action(user.id, 'raise', amount=amount)
     if not success:
-        await msg.reply_text(f"❌ {info}")
+        await msg.reply_text(f"❌ {desc}")
         return
 
-    # 加注成功，更新游戏
+    # 发送临时提示
+    await send_action_notification(chat_id, context.application, user.id, desc)
+
     if game.phase == 'showdown':
         await finish_texas(game, context.application)
         del active_games[chat_id]
@@ -1221,15 +1238,15 @@ async def texas_button_handler(update, context, game, query, data):
             await query.answer("还没轮到你", show_alert=True)
             return
         if data == 'texas_fold':
-            success, info = game.handle_action(user.id, 'fold')
+            success, desc = game.handle_action(user.id, 'fold')
         elif data == 'texas_check':
-            success, info = game.handle_action(user.id, 'check')
+            success, desc = game.handle_action(user.id, 'check')
         elif data == 'texas_call':
-            success, info = game.handle_action(user.id, 'call')
+            success, desc = game.handle_action(user.id, 'call')
         elif data.startswith('texas_raise_'):
             try:
                 amount = int(data.split('_')[2])
-                success, info = game.handle_action(user.id, 'raise', amount=amount)
+                success, desc = game.handle_action(user.id, 'raise', amount=amount)
             except:
                 await query.answer("无效加注额", show_alert=True)
                 return
@@ -1240,8 +1257,12 @@ async def texas_button_handler(update, context, game, query, data):
             return
 
         if not success:
-            await query.answer(info, show_alert=True)
+            await query.answer(desc, show_alert=True)
             return
+
+        # 发送临时提示
+        await send_action_notification(game.chat_id, context.application, user.id, desc)
+
         if game.phase == 'showdown':
             await finish_texas(game, context.application)
             del active_games[game.chat_id]
@@ -1295,24 +1316,27 @@ async def zjh_button_handler(update, context, game, query, data):
             return
 
         if data == 'zjh_see':
-            res, info = game.handle_action(user.id, 'see')
+            res, desc = game.handle_action(user.id, 'see')
             if not res:
-                await query.answer(info, show_alert=True)
+                await query.answer(desc, show_alert=True)
             else:
+                await send_action_notification(game.chat_id, context.application, user.id, desc)
                 await update_zjh_message(game, context.application)
         elif data == 'zjh_fold':
-            game.handle_action(user.id, 'fold')
+            res, desc = game.handle_action(user.id, 'fold')
             if game.phase == 'showdown':
                 await finish_zjh(game, context.application)
                 del active_games[game.chat_id]
                 return
+            await send_action_notification(game.chat_id, context.application, user.id, desc)
             await update_zjh_message(game, context.application)
             await start_zjh_timer(game, context.application)
         elif data == 'zjh_call':
-            res, info = game.handle_action(user.id, 'call')
+            res, desc = game.handle_action(user.id, 'call')
             if not res:
-                await query.answer(info, show_alert=True)
+                await query.answer(desc, show_alert=True)
             else:
+                await send_action_notification(game.chat_id, context.application, user.id, desc)
                 if game.phase == 'showdown':
                     await finish_zjh(game, context.application)
                     del active_games[game.chat_id]
@@ -1332,10 +1356,11 @@ async def zjh_button_handler(update, context, game, query, data):
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup(btns))
         elif data.startswith('zjh_raise_'):
             amount = int(data.split('_')[2])
-            res, info = game.handle_action(user.id, 'raise', amount=amount)
+            res, desc = game.handle_action(user.id, 'raise', amount=amount)
             if not res:
-                await query.answer(info, show_alert=True)
+                await query.answer(desc, show_alert=True)
             else:
+                await send_action_notification(game.chat_id, context.application, user.id, desc)
                 if game.phase == 'showdown':
                     await finish_zjh(game, context.application)
                     del active_games[game.chat_id]
@@ -1344,12 +1369,11 @@ async def zjh_button_handler(update, context, game, query, data):
                 await start_zjh_timer(game, context.application)
         elif data.startswith('zjh_compare_'):
             target = int(data.split('_')[2])
-            res, info = game.handle_action(user.id, 'compare', target=target)
+            res, desc = game.handle_action(user.id, 'compare', target=target)
             if not res:
-                await query.answer(info, show_alert=True)
+                await query.answer(desc, show_alert=True)
             else:
-                loser = info
-                await query.answer(f"比牌结果：{await get_name(context.application, loser)} 出局", show_alert=True)
+                await send_action_notification(game.chat_id, context.application, user.id, desc)
                 if game.phase == 'showdown':
                     await finish_zjh(game, context.application)
                     del active_games[game.chat_id]
