@@ -1,12 +1,26 @@
 import random
+import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from treys import Card, Evaluator
 
 # ---------- 游戏配置 ----------
 STARTING_CHIPS = 10000
-SMALL_BLIND = 100
-BIG_BLIND = 200
+SMALL_BLIND = 200
+BIG_BLIND = 500
+
+# ---------- 授权管理 ----------
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", 0))
+AUTHORIZED_GROUPS = set()
+
+# 从环境变量加载预授权群组
+pre_auth = os.environ.get("AUTHORIZED_GROUPS", "")
+if pre_auth:
+    for gid in pre_auth.split(","):
+        try:
+            AUTHORIZED_GROUPS.add(int(gid.strip()))
+        except ValueError:
+            pass
 
 # ---------- 全局筹码存储 ----------
 group_chips = {}  # { chat_id: { user_id: chips } }
@@ -25,10 +39,10 @@ class Game:
     def __init__(self, chat_id, owner_id, chips_dict):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.players = []          # 加入顺序（座位）
-        self.chips = {}            # 当前筹码
-        self.chips_dict = chips_dict  # 全局筹码存储
-        self.total_bet = {}        # 本局累计投入
+        self.players = []
+        self.chips = {}
+        self.chips_dict = chips_dict
+        self.total_bet = {}
         self.hands = {}
         self.folded = set()
         self.all_in = set()
@@ -39,14 +53,14 @@ class Game:
         self.players_in_hand = []
         self.actor_idx = 0
         self.current_bet = 0
-        self.round_bets = {}       # 当前轮已下注额
+        self.round_bets = {}
         self.min_raise = BIG_BLIND
         self.acted_this_round = set()
         self.last_aggressor = None
         self.dealer_idx = 0
         self.game_msg_id = None
         self.evaluator = Evaluator()
-        self.hand_revealed = set() # 查看手牌状态
+        self.hand_revealed = set()
 
     def add_player(self, user_id):
         if user_id not in self.players and self.phase == 'waiting':
@@ -96,7 +110,6 @@ class Game:
             self.all_in.add(uid)
 
     def get_buttons(self, uid):
-        """为当前行动玩家生成操作按钮，同时添加通用手牌按钮"""
         buttons = []
         if uid in self.hands and uid not in self.folded and self.phase != 'showdown':
             buttons.append([InlineKeyboardButton("🂠 查看手牌", callback_data="hand")])
@@ -314,8 +327,17 @@ async def async_format_player_list(app, players):
     names = [await get_name(app, uid) for uid in players]
     return "\n".join(f"{i}. {name}" for i, name in enumerate(names, 1))
 
+def is_authorized(chat_id):
+    return chat_id in AUTHORIZED_GROUPS
+
+async def check_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not is_authorized(chat_id):
+        await update.effective_message.reply_text("❌ 此群组未授权使用机器人。请联系机器人管理员进行授权。")
+        return False
+    return True
+
 async def update_game_message(game: Game, app):
-    # 玩家列表字符串
     player_lines = []
     for idx, uid in enumerate(game.players, 1):
         name = await get_name(app, uid)
@@ -328,12 +350,9 @@ async def update_game_message(game: Game, app):
         invested = game.total_bet.get(uid, 0)
         player_lines.append(f"{idx}. {name}  {status}  投入:{invested}")
 
-    # 公牌框
     board_line = "无" if not game.board else " ".join(card_str(c) for c in game.board)
-    # 固定宽度边框
     board_display = f"|--------------------+\n| {board_line}\n|--------------------+"
 
-    # 当前玩家和需跟注
     current = game.current_player_id()
     if current and game.phase in ('preflop','flop','turn','river'):
         to_call = game.current_bet - game.round_bets[current]
@@ -370,6 +389,8 @@ async def update_game_message(game: Game, app):
 
 # ---------- 命令处理 ----------
 async def dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update, context):
+        return
     chat_id = update.effective_chat.id
     user = update.effective_user
     if chat_id in games and games[chat_id].phase != 'waiting':
@@ -396,6 +417,8 @@ async def dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     game.game_msg_id = msg.message_id
 
 async def end_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update, context):
+        return
     chat_id = update.effective_chat.id
     if chat_id not in games:
         await update.message.reply_text("当前没有进行中的游戏。")
@@ -410,6 +433,8 @@ async def end_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def add_chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update, context):
+        return
     chat_id = update.effective_chat.id
     target_id = None
     amount = 0
@@ -472,6 +497,8 @@ async def add_chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ 已给 {name} 增加 {amount} 筹码，当前筹码: {group_chips[chat_id][target_id]}")
 
 async def chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_auth(update, context):
+        return
     chat_id = update.effective_chat.id
     if chat_id not in group_chips or not group_chips[chat_id]:
         await update.message.reply_text("当前群组无筹码记录。")
@@ -482,12 +509,66 @@ async def chips(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "💰 当前筹码:\n" + "\n".join(lines)
     await update.message.reply_text(text)
 
+async def shouquan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ 只有机器人管理员可以执行此操作。")
+        return
+
+    chat_id = None
+    if update.effective_chat.type == "private":
+        if context.args and len(context.args) >= 1:
+            try:
+                chat_id = int(context.args[0])
+            except ValueError:
+                await update.message.reply_text("群组ID无效。")
+                return
+        else:
+            await update.message.reply_text("用法: /shouquan 群组ID")
+            return
+    else:
+        chat_id = update.effective_chat.id
+
+    if chat_id:
+        AUTHORIZED_GROUPS.add(chat_id)
+        await update.message.reply_text(f"✅ 群组 {chat_id} 已授权。")
+
+async def qxshouquan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id != ADMIN_USER_ID:
+        await update.message.reply_text("❌ 只有机器人管理员可以执行此操作。")
+        return
+
+    chat_id = None
+    if update.effective_chat.type == "private":
+        if context.args and len(context.args) >= 1:
+            try:
+                chat_id = int(context.args[0])
+            except ValueError:
+                await update.message.reply_text("群组ID无效。")
+                return
+        else:
+            await update.message.reply_text("用法: /qxshouquan 群组ID")
+            return
+    else:
+        chat_id = update.effective_chat.id
+
+    if chat_id and chat_id in AUTHORIZED_GROUPS:
+        AUTHORIZED_GROUPS.remove(chat_id)
+        await update.message.reply_text(f"✅ 群组 {chat_id} 已取消授权。")
+    else:
+        await update.message.reply_text("该群组未授权或ID无效。")
+
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    chat_id = query.message.chat.id
+    if not is_authorized(chat_id):
+        await query.edit_message_text("❌ 此群组未授权，请联系管理员。")
+        return
+
     data = query.data
     user = query.from_user
-    chat_id = query.message.chat.id
     game = games.get(chat_id)
     if not game:
         await query.edit_message_text("游戏不存在，请使用 /DZ 创建。")
@@ -496,7 +577,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if game.game_msg_id != query.message.message_id:
         return
 
-    # 查看手牌
     if data == 'hand':
         if user.id in game.hands and user.id not in game.folded and game.phase != 'showdown':
             if user.id in game.hand_revealed:
@@ -563,11 +643,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if game.phase == 'showdown':
             winners = game.showdown()
-            # 生成结算消息
             board_str = " ".join(card_str(c) for c in game.board) if game.board else "无公共牌"
             board_display = f"|--------------------+\n| {board_str}\n|--------------------+"
 
-            # 牌型部分
             card_lines = []
             for uid in game.players:
                 name = await get_name(context.application, uid)
@@ -577,8 +655,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     hand = game.hands.get(uid, [])
                     if hand:
                         hand_str = " ".join(card_str(c) for c in hand)
-                        # 获取牌型描述
-                        if uid in winners:
+                        if uid in [w[0] for w in winners]:
                             desc = [d for w, d in winners if w == uid][0]
                         else:
                             desc = game.evaluator.class_to_string(game.evaluator.get_rank_class(game.evaluator.evaluate(hand, game.board)))
@@ -589,7 +666,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     hand = game.hands.get(uid, [])
                     if hand:
                         hand_str = " ".join(card_str(c) for c in hand)
-                        if uid in winners:
+                        if uid in [w[0] for w in winners]:
                             desc = [d for w, d in winners if w == uid][0]
                         else:
                             desc = game.evaluator.class_to_string(game.evaluator.get_rank_class(game.evaluator.evaluate(hand, game.board)))
@@ -597,28 +674,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     else:
                         card_lines.append(f"{name}：无手牌")
 
-            # 派奖
-            prize_lines = []
-            for wid, desc in winners:
-                name = await get_name(context.application, wid)
-                prize_lines.append(f"{name} +{game.pot}")  # 此时 pot 已为0，需在 reset 前获取
-            # 实际派奖金额在 showdown 中已分配，pot 已清零，我们需要在调用 showdown 前记录 pot
-            # 这里简单用总筹码变化计算，或记录奖池
-            # 简便方法：记录结算前奖池 pot_before = game.pot，然后调用 showdown
-            # 我们调整顺序：先记录 pot 再 showdown
-            # 由于代码中已调用 showdown，pot 已分配，但我们可以从 winners 的数量反推
-            # 简单从 winners 和 total pot 计算，但更可靠的是在调用 showdown 前保存 pot
-            # 重构：在 button_handler 中先保存 pot_value = game.pot，然后调用 showdown
-            # 但为了不破坏流程，我在 update_game_message 后处理，这里暂用 prize_lines 占位
-            # 实际上需要 pot_value 变量
-            # 修复：在 button_handler 的 showdown 分支提前记录 pot_total
-            # 但为了保持当前代码结构，我们在结算时重新计算总奖池：sum(game.total_bet.values())
             total_pot = sum(game.total_bet.values())
+            prize_lines = []
             share = total_pot // len(winners)
             for wid, desc in winners:
                 name = await get_name(context.application, wid)
                 prize_lines.append(f"{name} +{share}")
-            # 处理剩余筹码
             remainder = total_pot % len(winners)
             if remainder:
                 prize_lines[-1] += f"+{remainder}"
@@ -632,7 +693,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"派奖：\n" + "\n".join(prize_lines)
             )
 
-            # 筹码归零提示
             broke_players = [uid for uid in game.players if game.chips[uid] == 0]
             if broke_players:
                 broke_names = [await get_name(context.application, uid) for uid in broke_players]
@@ -648,20 +708,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_game_message(game, context.application)
 
 async def start_private(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("你好！请在群组中使用 /DZ 开始德州扑克。")
+    await update.message.reply_text(
+        "你好！请在群组中使用 /DZ 开始德州扑克。\n"
+        "管理员命令: /shouquan [群组ID]  /qxshouquan [群组ID]"
+    )
 
+# ---------- 主函数 ----------
 def main():
-    import os
     TOKEN = os.environ.get("BOT_TOKEN")
     if not TOKEN:
         print("请设置环境变量 BOT_TOKEN")
         return
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start_private))
     app.add_handler(CommandHandler("dz", dz))
     app.add_handler(CommandHandler("end", end_game))
     app.add_handler(CommandHandler("add", add_chips))
     app.add_handler(CommandHandler("ph", chips))
+    app.add_handler(CommandHandler("shouquan", shouquan))      # 授权
+    app.add_handler(CommandHandler("qxshouquan", qxshouquan))  # 取消授权
     app.add_handler(CallbackQueryHandler(button_handler))
     print("Bot 已启动...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
