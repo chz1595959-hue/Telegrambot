@@ -5,24 +5,28 @@ from telegram.ext import Application, CommandHandler, CallbackQueryHandler, Cont
 from treys import Card, Evaluator
 
 # ---------- 游戏配置 ----------
-STARTING_CHIPS = 1000
-SMALL_BLIND = 1
-BIG_BLIND = 2
+STARTING_CHIPS = 10000          # 新玩家的初始筹码
+SMALL_BLIND = 100               # 小盲注（可调）
+BIG_BLIND = 200                 # 大盲注（可调）
+
+# ---------- 全局筹码存储 ----------
+# 格式：{ chat_id: { user_id: chips } }
+group_chips = {}
 
 # ---------- 德州扑克核心逻辑 ----------
 class Game:
-    def __init__(self, chat_id, owner_id):
+    def __init__(self, chat_id, owner_id, chips_dict):
         self.chat_id = chat_id
         self.owner_id = owner_id
         self.players = []          # 座位顺序
-        self.chips = {}
+        self.chips = {}            # 本局玩家筹码（从 chips_dict 加载）
+        self.chips_dict = chips_dict  # 引用全局筹码字典
         self.hands = {}
         self.folded = set()
         self.all_in = set()
         self.deck = []
         self.board = []
         self.pot = 0
-        self.side_pots = []
         self.phase = 'waiting'     # waiting, preflop, flop, turn, river, showdown
         self.players_in_hand = []
         self.actor_idx = 0
@@ -37,14 +41,20 @@ class Game:
 
     def add_player(self, user_id):
         if user_id not in self.players and self.phase == 'waiting':
+            # 从持久化存储中获取筹码，若无则赋予起始筹码
+            if user_id not in self.chips_dict:
+                self.chips_dict[user_id] = STARTING_CHIPS
+            self.chips[user_id] = self.chips_dict[user_id]
             self.players.append(user_id)
-            self.chips[user_id] = STARTING_CHIPS
             return True
         return False
 
     def start_game(self):
         if len(self.players) < 2:
             return False
+        # 确保所有玩家的筹码已从持久化字典加载（可能已更新过）
+        for uid in self.players:
+            self.chips[uid] = self.chips_dict.get(uid, STARTING_CHIPS)
         self.phase = 'preflop'
         self.deck = [Card.new(r + s) for r in "23456789TJQKA" for s in "shdc"]
         random.shuffle(self.deck)
@@ -215,6 +225,9 @@ class Game:
             winner = alive[0]
             self.chips[winner] += self.pot
             self.pot = 0
+            # 将本局筹码变化写回持久化存储
+            for uid in self.chips:
+                self.chips_dict[uid] = self.chips[uid]
             return [(winner, "Last one standing")]
 
         scores = {}
@@ -234,8 +247,16 @@ class Game:
         if remainder:
             self.chips[winners[0]] += remainder
         self.pot = 0
+        # 将本局筹码变化写回持久化存储
+        for uid in self.chips:
+            self.chips_dict[uid] = self.chips[uid]
         desc = self.evaluator.class_to_string(self.evaluator.get_rank_class(best_score))
         return [(uid, desc) for uid in winners]
+
+    def save_chips(self):
+        """将当前筹码保存到全局存储（用于中断等情况）"""
+        for uid in self.chips:
+            self.chips_dict[uid] = self.chips[uid]
 
     def reset_to_waiting(self):
         self.phase = 'waiting'
@@ -254,13 +275,14 @@ class Game:
         self.acted_this_round.clear()
         self.last_aggressor = None
         self.dealer_idx = 0
+        # 注意：保留 players 列表和 chips 字典（已经是最新的筹码）
 
-# ---------- 全局状态 ----------
+# ---------- 全局游戏状态 ----------
 games = {}
 
 def card_str(card_int):
-    raw = Card.int_to_pretty_str(card_int)  # 例如 "T♥" 或 "As"
-    return raw.replace('T', '10')           # 将 T 替换为 10
+    raw = Card.int_to_pretty_str(card_int)
+    return raw.replace('T', '10')
 
 async def send_private_hand(app, user_id, hand):
     try:
@@ -316,15 +338,23 @@ async def update_game_message(game: Game, app):
 async def dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
+
     if chat_id in games and games[chat_id].phase != 'waiting':
         await update.message.reply_text("当前已有进行中的游戏，请等待结束。")
         return
-    game = Game(chat_id, user.id)
+
+    # 获取或初始化该群组的筹码字典
+    if chat_id not in group_chips:
+        group_chips[chat_id] = {}
+
+    game = Game(chat_id, user.id, group_chips[chat_id])
     game.add_player(user.id)   # 房主自动加入
     games[chat_id] = game
+
     keyboard_buttons = [[InlineKeyboardButton("加入游戏", callback_data="join")]]
     if len(game.players) >= 2:
         keyboard_buttons.append([InlineKeyboardButton("开始游戏", callback_data="start_game")])
+
     msg = await update.message.reply_text(
         f"🃏 新一局德州扑克！\n发起人: {user.first_name}\n已加入: {await get_name(context.application, user.id)}\n点击下方按钮加入（至少2人）\n⚠️ 所有玩家必须先私聊机器人发送 /start 才能收到手牌！",
         reply_markup=InlineKeyboardMarkup(keyboard_buttons)
@@ -337,6 +367,8 @@ async def end_game(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("当前没有进行中的游戏。")
         return
     game = games[chat_id]
+    # 保存当前筹码（即使游戏未正常结束，已下注的筹码不会退还）
+    game.save_chips()
     del games[chat_id]
     await update.message.reply_text("游戏已被手动终止。")
     try:
@@ -362,7 +394,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data == 'join':
             if game.add_player(user.id):
                 names = [await get_name(context.application, uid) for uid in game.players]
-                # 始终保留“加入游戏”按钮，人数足够时增加“开始游戏”按钮
                 keyboard_buttons = [[InlineKeyboardButton("加入游戏", callback_data="join")]]
                 if len(game.players) >= 2:
                     keyboard_buttons.append([InlineKeyboardButton("开始游戏", callback_data="start_game")])
@@ -386,14 +417,15 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         failed.append(uid)
                 if failed:
                     game.reset_to_waiting()
-                    failed_names = [await get_name(context.application, uid) for uid in failed]
-                    # 重置后保留玩家列表，重新显示加入/开始按钮
+                    # 重置时保留已加入的玩家和筹码
+                    names = [await get_name(context.application, uid) for uid in game.players]
                     keyboard_buttons = [[InlineKeyboardButton("加入游戏", callback_data="join")]]
                     if len(game.players) >= 2:
                         keyboard_buttons.append([InlineKeyboardButton("开始游戏", callback_data="start_game")])
                     await query.edit_message_text(
-                        f"无法开始游戏，以下玩家未私聊机器人：{', '.join(failed_names)}\n"
-                        "请这些玩家先私聊机器人发送 /start，然后房主重新点击开始。",
+                        f"无法开始游戏，以下玩家未私聊机器人：{', '.join([await get_name(context.application, uid) for uid in failed])}\n"
+                        "请这些玩家先私聊机器人发送 /start，然后房主重新点击开始。\n"
+                        f"当前已加入: {', '.join(names)}",
                         reply_markup=InlineKeyboardMarkup(keyboard_buttons)
                     )
                     return
@@ -451,8 +483,8 @@ def main():
         return
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start_private))
-    app.add_handler(CommandHandler("dz", dz))               # 开始命令 /DZ
-    app.add_handler(CommandHandler("end", end_game))        # 中断命令 /end
+    app.add_handler(CommandHandler("dz", dz))
+    app.add_handler(CommandHandler("end", end_game))
     app.add_handler(CallbackQueryHandler(button_handler))
     print("Bot 已启动...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
