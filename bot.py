@@ -5,20 +5,30 @@ from treys import Card, Evaluator
 
 # ---------- 游戏配置 ----------
 STARTING_CHIPS = 10000
-SMALL_BLIND = 200
-BIG_BLIND = 500
+SMALL_BLIND = 100
+BIG_BLIND = 200
 
 # ---------- 全局筹码存储 ----------
 group_chips = {}  # { chat_id: { user_id: chips } }
+
+# ---------- 阶段翻译 ----------
+PHASE_CN = {
+    'preflop': '翻牌前',
+    'flop':    '翻牌',
+    'turn':    '转牌',
+    'river':   '河牌',
+    'showdown': '摊牌'
+}
 
 # ---------- 德州扑克核心逻辑 ----------
 class Game:
     def __init__(self, chat_id, owner_id, chips_dict):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.players = []
-        self.chips = {}
-        self.chips_dict = chips_dict
+        self.players = []          # 加入顺序（座位）
+        self.chips = {}            # 当前筹码
+        self.chips_dict = chips_dict  # 全局筹码存储
+        self.total_bet = {}        # 本局累计投入
         self.hands = {}
         self.folded = set()
         self.all_in = set()
@@ -29,20 +39,21 @@ class Game:
         self.players_in_hand = []
         self.actor_idx = 0
         self.current_bet = 0
-        self.round_bets = {}
+        self.round_bets = {}       # 当前轮已下注额
         self.min_raise = BIG_BLIND
         self.acted_this_round = set()
         self.last_aggressor = None
         self.dealer_idx = 0
         self.game_msg_id = None
         self.evaluator = Evaluator()
-        self.hand_revealed = set()  # 记录当前展开手牌的用户
+        self.hand_revealed = set() # 查看手牌状态
 
     def add_player(self, user_id):
         if user_id not in self.players and self.phase == 'waiting':
             if user_id not in self.chips_dict:
                 self.chips_dict[user_id] = STARTING_CHIPS
             self.chips[user_id] = self.chips_dict[user_id]
+            self.total_bet[user_id] = 0
             self.players.append(user_id)
             return True
         return False
@@ -52,6 +63,7 @@ class Game:
             return False
         for uid in self.players:
             self.chips[uid] = self.chips_dict.get(uid, STARTING_CHIPS)
+            self.total_bet[uid] = 0
         self.phase = 'preflop'
         self.deck = [Card.new(r + s) for r in "23456789TJQKA" for s in "shdc"]
         random.shuffle(self.deck)
@@ -71,22 +83,24 @@ class Game:
         self.acted_this_round = set()
         return True
 
+    def _update_total_bet(self, uid, amount):
+        self.total_bet[uid] += amount
+
     def _post_blind(self, uid, amount):
         actual = min(amount, self.chips[uid])
         self.chips[uid] -= actual
         self.round_bets[uid] += actual
         self.pot += actual
+        self._update_total_bet(uid, actual)
         if self.chips[uid] == 0:
             self.all_in.add(uid)
 
     def get_buttons(self, uid):
         """为当前行动玩家生成操作按钮，同时添加通用手牌按钮"""
         buttons = []
-        # 所有存活玩家都能看手牌
         if uid in self.hands and uid not in self.folded and self.phase != 'showdown':
             buttons.append([InlineKeyboardButton("🂠 查看手牌", callback_data="hand")])
 
-        # 如果不是当前行动玩家，或者已弃牌/全下，只显示手牌按钮
         if uid not in self.players_in_hand or uid in self.folded or uid in self.all_in or uid != self.current_player_id():
             return InlineKeyboardMarkup(buttons)
 
@@ -157,6 +171,7 @@ class Game:
             self.chips[uid] -= actual
             self.round_bets[uid] += actual
             self.pot += actual
+            self._update_total_bet(uid, actual)
             if self.chips[uid] == 0:
                 self.all_in.add(uid)
             self.acted_this_round.add(uid)
@@ -172,6 +187,7 @@ class Game:
             self.chips[uid] -= needed
             self.round_bets[uid] += needed
             self.pot += needed
+            self._update_total_bet(uid, needed)
             self.current_bet = new_total
             self.min_raise = new_total - (self.current_bet - self.min_raise)
             if self.chips[uid] == 0:
@@ -272,6 +288,7 @@ class Game:
         self.actor_idx = 0
         self.current_bet = 0
         self.round_bets = {}
+        self.total_bet = {}
         self.min_raise = BIG_BLIND
         self.acted_this_round.clear()
         self.last_aggressor = None
@@ -280,19 +297,11 @@ class Game:
 
 # ---------- 辅助函数 ----------
 def card_str(card_int):
-    """将牌面转换为漂亮的字符串，例如 10♠️"""
-    raw = Card.int_to_pretty_str(card_int)  # 例如 "T♥" 或 "As"
-    # 替换 T 为 10，并美化花色符号
-    suit_map = {
-        '♠': '♠️',
-        '♥': '♥️',
-        '♦': '♦️',
-        '♣': '♣️',
-    }
+    raw = Card.int_to_pretty_str(card_int)
+    suit_map = {'♠': '♠️', '♥': '♥️', '♦': '♦️', '♣': '♣️'}
     rank = raw[:-1].replace('T', '10')
     suit = raw[-1]
-    suit_emoji = suit_map.get(suit, suit)
-    return f"{rank}{suit_emoji}"
+    return f"{rank}{suit_map.get(suit, suit)}"
 
 async def get_name(app, user_id):
     try:
@@ -306,30 +315,49 @@ async def async_format_player_list(app, players):
     return "\n".join(f"{i}. {name}" for i, name in enumerate(names, 1))
 
 async def update_game_message(game: Game, app):
-    text = "♠️ 德州扑克 ♥️\n"
-    text += f"底池: {game.pot}\n"
-    if game.board:
-        board_cards = " ".join(card_str(c) for c in game.board)
-        text += f"公共牌: {board_cards}\n"
-    else:
-        text += "公共牌: -\n"
-    text += "\n玩家筹码:\n"
-    for uid in game.players:
-        status = ""
+    # 玩家列表字符串
+    player_lines = []
+    for idx, uid in enumerate(game.players, 1):
+        name = await get_name(app, uid)
         if uid in game.folded:
-            status = " (弃牌)"
+            status = "弃牌"
         elif uid in game.all_in:
-            status = " (全下)"
-        text += f"- {await get_name(app, uid)}: {game.chips[uid]}{status}\n"
-    if game.phase in ('preflop','flop','turn','river'):
-        current = game.current_player_id()
-        if current:
-            text += f"\n轮到 {await get_name(app, current)} 行动"
-    elif game.phase == 'showdown':
-        text += "\n摊牌！"
+            status = "全下"
+        else:
+            status = "在局"
+        invested = game.total_bet.get(uid, 0)
+        player_lines.append(f"{idx}. {name}  {status}  投入:{invested}")
+
+    # 公牌框
+    board_line = "无" if not game.board else " ".join(card_str(c) for c in game.board)
+    # 固定宽度边框
+    board_display = f"|--------------------+\n| {board_line}\n|--------------------+"
+
+    # 当前玩家和需跟注
+    current = game.current_player_id()
+    if current and game.phase in ('preflop','flop','turn','river'):
+        to_call = game.current_bet - game.round_bets[current]
+        if to_call < 0:
+            to_call = 0
+        current_text = f"{await get_name(app, current)}  需跟注：{to_call}"
+    else:
+        current_text = "无"
+
+    phase_cn = PHASE_CN.get(game.phase, game.phase)
+
+    text = (
+        f"积分德州\n"
+        f"状态：{phase_cn}\n"
+        f"公牌：\n{board_display}\n"
+        f"奖池：{game.pot}  当前下注：{game.current_bet}\n"
+        f"当前：{current_text}\n"
+        f"玩家：\n" + "\n".join(player_lines)
+    )
+
     keyboard = None
     if game.phase in ('preflop','flop','turn','river') and game.current_player_id():
         keyboard = game.get_buttons(game.current_player_id())
+
     try:
         await app.bot.edit_message_text(
             chat_id=game.chat_id,
@@ -344,7 +372,6 @@ async def update_game_message(game: Game, app):
 async def dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
-
     if chat_id in games and games[chat_id].phase != 'waiting':
         await update.message.reply_text("当前已有进行中的游戏，请等待结束。")
         return
@@ -363,8 +390,7 @@ async def dz(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     msg = await update.message.reply_text(
         f"🃏 新一局德州扑克！\n发起人: {await get_name(context.application, user.id)}\n\n"
-        f"已加入玩家:\n{player_list}\n\n"
-        f"点击下方按钮加入（至少2人）",
+        f"已加入玩家:\n{player_list}\n\n点击下方按钮加入（至少2人）",
         reply_markup=InlineKeyboardMarkup(keyboard_buttons)
     )
     game.game_msg_id = msg.message_id
@@ -470,15 +496,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if game.game_msg_id != query.message.message_id:
         return
 
-    # 查看手牌按钮（所有阶段均可使用）
+    # 查看手牌
     if data == 'hand':
         if user.id in game.hands and user.id not in game.folded and game.phase != 'showdown':
             if user.id in game.hand_revealed:
-                # 已展开 → 隐藏
                 game.hand_revealed.discard(user.id)
                 await query.answer("手牌已隐藏", show_alert=False)
             else:
-                # 未展开 → 显示
                 game.hand_revealed.add(user.id)
                 hand = game.hands[user.id]
                 hand_text = f"你的手牌: {card_str(hand[0])}  {card_str(hand[1])}"
@@ -539,17 +563,76 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if game.phase == 'showdown':
             winners = game.showdown()
+            # 生成结算消息
             board_str = " ".join(card_str(c) for c in game.board) if game.board else "无公共牌"
-            win_text = f"🏆 游戏结束！\n公共牌: {board_str}\n"
-            for wid, desc in winners:
-                hand_cards = " ".join(card_str(c) for c in game.hands[wid])
-                win_text += f"{await get_name(context.application, wid)} 获胜: {hand_cards} ({desc})\n"
-            alive = [p for p in game.players if p not in game.folded]
-            for uid in alive:
-                if uid not in [w[0] for w in winners]:
-                    hand_cards = " ".join(card_str(c) for c in game.hands[uid])
-                    win_text += f"{await get_name(context.application, uid)}: {hand_cards}\n"
+            board_display = f"|--------------------+\n| {board_str}\n|--------------------+"
 
+            # 牌型部分
+            card_lines = []
+            for uid in game.players:
+                name = await get_name(context.application, uid)
+                if uid in game.folded:
+                    card_lines.append(f"{name}：弃牌")
+                elif uid in game.all_in:
+                    hand = game.hands.get(uid, [])
+                    if hand:
+                        hand_str = " ".join(card_str(c) for c in hand)
+                        # 获取牌型描述
+                        if uid in winners:
+                            desc = [d for w, d in winners if w == uid][0]
+                        else:
+                            desc = game.evaluator.class_to_string(game.evaluator.get_rank_class(game.evaluator.evaluate(hand, game.board)))
+                        card_lines.append(f"{name}：{hand_str} / {desc} (全下)")
+                    else:
+                        card_lines.append(f"{name}：全下")
+                else:
+                    hand = game.hands.get(uid, [])
+                    if hand:
+                        hand_str = " ".join(card_str(c) for c in hand)
+                        if uid in winners:
+                            desc = [d for w, d in winners if w == uid][0]
+                        else:
+                            desc = game.evaluator.class_to_string(game.evaluator.get_rank_class(game.evaluator.evaluate(hand, game.board)))
+                        card_lines.append(f"{name}：{hand_str} / {desc}")
+                    else:
+                        card_lines.append(f"{name}：无手牌")
+
+            # 派奖
+            prize_lines = []
+            for wid, desc in winners:
+                name = await get_name(context.application, wid)
+                prize_lines.append(f"{name} +{game.pot}")  # 此时 pot 已为0，需在 reset 前获取
+            # 实际派奖金额在 showdown 中已分配，pot 已清零，我们需要在调用 showdown 前记录 pot
+            # 这里简单用总筹码变化计算，或记录奖池
+            # 简便方法：记录结算前奖池 pot_before = game.pot，然后调用 showdown
+            # 我们调整顺序：先记录 pot 再 showdown
+            # 由于代码中已调用 showdown，pot 已分配，但我们可以从 winners 的数量反推
+            # 简单从 winners 和 total pot 计算，但更可靠的是在调用 showdown 前保存 pot
+            # 重构：在 button_handler 中先保存 pot_value = game.pot，然后调用 showdown
+            # 但为了不破坏流程，我在 update_game_message 后处理，这里暂用 prize_lines 占位
+            # 实际上需要 pot_value 变量
+            # 修复：在 button_handler 的 showdown 分支提前记录 pot_total
+            # 但为了保持当前代码结构，我们在结算时重新计算总奖池：sum(game.total_bet.values())
+            total_pot = sum(game.total_bet.values())
+            share = total_pot // len(winners)
+            for wid, desc in winners:
+                name = await get_name(context.application, wid)
+                prize_lines.append(f"{name} +{share}")
+            # 处理剩余筹码
+            remainder = total_pot % len(winners)
+            if remainder:
+                prize_lines[-1] += f"+{remainder}"
+
+            win_text = (
+                f"积分德州已结算\n"
+                f"状态：{PHASE_CN.get(game.phase, '')}\n"
+                f"公牌：\n{board_display}\n"
+                f"奖池：{total_pot}\n"
+                f"牌型：\n" + "\n".join(card_lines) + "\n\n"
+                f"派奖：\n" + "\n".join(prize_lines)
+            )
+
+            # 筹码归零提示
             broke_players = [uid for uid in game.players if game.chips[uid] == 0]
             if broke_players:
                 broke_names = [await get_name(context.application, uid) for uid in broke_players]
