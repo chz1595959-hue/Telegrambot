@@ -11,8 +11,8 @@ logger = logging.getLogger(__name__)
 
 # ---------- 配置 ----------
 STARTING_CHIPS = 10000
-SMALL_BLIND = 100
-BIG_BLIND = 200
+SMALL_BLIND = 200
+BIG_BLIND = 300
 TURN_TIMEOUT = 60
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
@@ -233,7 +233,6 @@ class TexasGame:
         to_call = self.current_bet - self.round_bets[uid]
         if to_call < 0: to_call = 0
 
-        # 第一行：弃牌 + 过牌/跟注
         row1 = [InlineKeyboardButton("❌ 弃牌", callback_data="texas_fold")]
         if to_call == 0:
             row1.append(InlineKeyboardButton("✅ 过牌", callback_data="texas_check"))
@@ -242,7 +241,6 @@ class TexasGame:
 
         buttons = [[InlineKeyboardButton("🂠 查看手牌", callback_data="texas_hand")], row1]
 
-        # 加注按钮（每行两个）
         if self.chips[uid] > to_call:
             raise_buttons = []
             min_raise_total = self.current_bet + self.min_raise
@@ -876,7 +874,6 @@ async def button_handler(update, context):
                 await query.answer(desc, show_alert=True)
                 return
 
-            # 发送临时提示
             await send_action_notification(game.chat_id, context.application, user.id, desc)
 
             if game.phase == 'showdown':
