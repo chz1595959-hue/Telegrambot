@@ -11,8 +11,8 @@ logger = logging.getLogger(__name__)
 
 # ---------- 配置 ----------
 STARTING_CHIPS = 10000
-SMALL_BLIND = 200
-BIG_BLIND = 300
+SMALL_BLIND = 100
+BIG_BLIND = 200
 TURN_TIMEOUT = 60
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
@@ -45,7 +45,6 @@ async def init_db():
                     id SERIAL PRIMARY KEY,
                     chat_id BIGINT, user_id BIGINT,
                     game_time TIMESTAMP DEFAULT NOW(),
-                    game_type TEXT DEFAULT '德州',
                     net_profit INT, final_chips INT
                 );
             ''')
@@ -241,7 +240,6 @@ class TexasGame:
         else:
             row1.append(InlineKeyboardButton(f"✅ 跟注 {to_call}", callback_data="texas_call"))
 
-        # 手牌按钮（单独一行）
         buttons = [[InlineKeyboardButton("🂠 查看手牌", callback_data="texas_hand")], row1]
 
         # 加注按钮（每行两个）
@@ -264,11 +262,9 @@ class TexasGame:
             if all_in > to_call:
                 raise_buttons.append(InlineKeyboardButton(f"🔥 全下 {all_in}", callback_data=f"texas_raise_{all_in}"))
 
-            # 将加注按钮每两个一组
             for i in range(0, len(raise_buttons), 2):
                 buttons.append(raise_buttons[i:i+2])
 
-            # 自定义加注提示（单独一行）
             buttons.append([InlineKeyboardButton("✏️ 自定义加注", callback_data="texas_custom_raise")])
 
         return InlineKeyboardMarkup(buttons)
@@ -804,20 +800,21 @@ async def button_handler(update, context):
         await query.edit_message_text("游戏不存在。")
         return
 
-    await query.answer()  # 统一应答（hand 会单独处理）
+    # 手牌弹窗 - 单独处理，不预先应答
+    if data == 'texas_hand':
+        user = query.from_user
+        if user.id in game.hands and user.id not in game.folded and game.phase != 'showdown':
+            hand = game.hands[user.id]
+            hand_text = f"你的手牌: {card_str(hand[0])}  {card_str(hand[1])}"
+            await query.answer(hand_text, show_alert=True)
+        else:
+            await query.answer("你已弃牌或游戏已结束", show_alert=True)
+        return
+
+    await query.answer()  # 其他按钮的统一应答
     user = query.from_user
 
     if isinstance(game, TexasGame):
-        # 查看手牌
-        if data == 'texas_hand':
-            if user.id in game.hands and user.id not in game.folded and game.phase != 'showdown':
-                hand = game.hands[user.id]
-                hand_text = f"你的手牌: {card_str(hand[0])}  {card_str(hand[1])}"
-                await query.answer(hand_text, show_alert=True)
-            else:
-                await query.answer("你已弃牌或游戏已结束", show_alert=True)
-            return
-
         # 等待阶段
         if game.phase == 'waiting':
             if data == 'texas_join':
@@ -879,11 +876,12 @@ async def button_handler(update, context):
                 await query.answer(desc, show_alert=True)
                 return
 
+            # 发送临时提示
             await send_action_notification(game.chat_id, context.application, user.id, desc)
 
             if game.phase == 'showdown':
                 await finish_texas(game, context.application)
-                active_games.pop(chat_id, None)  # 删除游戏
+                active_games.pop(chat_id, None)
                 return
             await update_texas_message(game, context.application)
             await start_texas_timer(game, context.application)
