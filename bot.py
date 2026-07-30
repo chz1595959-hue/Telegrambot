@@ -1,5 +1,4 @@
 import random
-import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from treys import Card, Evaluator
@@ -238,7 +237,6 @@ class Game:
         return [(uid, desc) for uid in winners]
 
     def reset_to_waiting(self):
-        """将游戏重置回等待状态，保留玩家列表和筹码"""
         self.phase = 'waiting'
         self.hands = {}
         self.folded.clear()
@@ -376,13 +374,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("至少需要2名玩家", show_alert=True)
                 return
             if game.start_game():
-                # 检测哪些人收不到私信
                 failed = []
                 for uid in game.players:
                     if not await send_private_hand(context.application, uid, game.hands[uid]):
                         failed.append(uid)
                 if failed:
-                    # 有人无法接收，重置游戏并提醒
                     game.reset_to_waiting()
                     failed_names = [await get_name(context.application, uid) for uid in failed]
                     await query.edit_message_text(
@@ -393,7 +389,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         ]) if len(game.players) >= 2 else None
                     )
                     return
-                # 所有人都能收到，正常开始
                 await update_game_message(game, context.application)
             else:
                 await query.edit_message_text("游戏开始失败")
@@ -418,6 +413,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if game.phase == 'showdown':
             winners = game.showdown()
+            # 关键修正：确保结算时显示完整的五张公共牌
             board_str = " ".join(card_str(c) for c in game.board) if game.board else "无公共牌"
             win_text = f"🏆 游戏结束！\n公共牌: {board_str}\n"
             for wid, desc in winners:
@@ -448,8 +444,8 @@ def main():
         return
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start_private))
-    app.add_handler(CommandHandler("德州", dezhou))           # 开始游戏
-    app.add_handler(CommandHandler("结束", end_game))        # 中断游戏
+    app.add_handler(CommandHandler("德州", dezhou))            # 现在需要用 /德州 创建
+    app.add_handler(CommandHandler("结束", end_game))         # /结束 强制终止
     app.add_handler(CallbackQueryHandler(button_handler))
     print("Bot 已启动...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
