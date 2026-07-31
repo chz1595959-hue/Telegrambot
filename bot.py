@@ -325,7 +325,6 @@ class TexasGame:
             self.chips[winner] += self.pot
             self.pot = 0
             self._save_chips_to_memory()
-            # 唯一幸存者，手牌保密
             return [(winner, "最后赢家", self.pot, {})]
 
         scores = {}
@@ -442,6 +441,10 @@ async def start_texas_timer(game, app):
     game.cancel_timer()
     uid = game.current_player_id()
     if not uid:
+        # 如果没有当前玩家，可能已经结束了，检查是否摊牌
+        if game.phase == 'showdown':
+            await finish_texas(game, app)
+            active_games.pop(game.chat_id, None)
         return
 
     if game.action_msg_id:
@@ -499,7 +502,6 @@ async def finish_texas(game, app):
         return
     hand_types = result[0][3] if len(result[0]) > 3 else {}
 
-    # 判断是否唯一幸存者（全员弃牌）
     only_survivor = (len(result) == 1 and result[0][1] == "最后赢家")
 
     board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
@@ -516,7 +518,6 @@ async def finish_texas(game, app):
             card_lines.append(f"{name}：{hand_str} (全下)")
         else:
             if only_survivor:
-                # 唯一幸存者，手牌保密
                 card_lines.append(f"{name}：未亮牌")
             else:
                 hand = game.hands.get(uid, [])
@@ -532,7 +533,6 @@ async def finish_texas(game, app):
     for wid, desc_cn, amount, _ in result:
         name = await get_name(app, wid)
         if only_survivor:
-            # 唯一幸存者赢家，不显示牌型描述
             prize_lines.append(f"{name} +{amount}")
         else:
             prize_lines.append(f"{name} +{amount} ({desc_cn})")
@@ -564,7 +564,6 @@ async def finish_texas(game, app):
         f"投入/盈亏：\n" + "\n".join(profit_lines) + broke_text
     )
 
-    # 发送新结算消息，不自动删除
     await app.bot.send_message(chat_id=game.chat_id, text=win_text)
 
 # ---------- 全局管理 ----------
@@ -801,6 +800,7 @@ async def button_handler(update, context):
         await query.edit_message_text("游戏不存在。")
         return
 
+    # 如果游戏处于摊牌状态，直接结算并移除游戏
     if game.phase == 'showdown':
         await finish_texas(game, context.application)
         active_games.pop(chat_id, None)
