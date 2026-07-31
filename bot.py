@@ -101,10 +101,10 @@ class PokerGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.players = []
-        self.chips = {}
-        self.initial_chips = {}
-        self.total_bet = {}
+        self.players = []            # 座位顺序
+        self.chips = {}              # 当前局筹码
+        self.initial_chips = {}      # 开局前筹码
+        self.total_bet = {}          # 本局总投入
         self.hands = {}
         self.folded = set()
         self.all_in = set()
@@ -112,7 +112,7 @@ class PokerGame:
         self.board = []
         self.pot = 0
         self.phase = 'waiting'
-        self.active_players = []
+        self.active_players = []     # 未弃牌玩家（按座位顺序）
         self.actor_idx = 0
         self.current_bet = 0
         self.round_bets = {}
@@ -230,13 +230,25 @@ class PokerGame:
                 self.all_in.add(uid)
             self.acted_this_round.add(uid)
             desc = f"跟注 {actual}"
+        elif action == 'allin':
+            # 直接投入所有筹码
+            total = self.chips[uid]
+            self.chips[uid] = 0
+            self.round_bets[uid] += total
+            self.pot += total
+            self.total_bet[uid] += total
+            if total > self.current_bet:
+                self.current_bet = self.round_bets[uid]
+            self.all_in.add(uid)
+            self.acted_this_round.add(uid)
+            desc = f"全下 {total}"
         elif action == 'raise':
-            # amount 为用户希望额外加注的筹码数
-            call_amt = self.current_bet - self.round_bets[uid]  # 需要先跟注的筹码
-            total_raise = call_amt + amount                     # 总加注额 = 跟注部分 + 额外加注
+            # amount 为额外加注额（不含跟注部分）
+            call_amt = self.current_bet - self.round_bets[uid]
+            total_raise = call_amt + amount
             if total_raise <= 0 or total_raise > self.chips[uid]:
                 return False, "筹码不足或无效加注额"
-            new_total = self.round_bets[uid] + total_raise      # 本轮总共投入
+            new_total = self.round_bets[uid] + total_raise
             if new_total <= self.current_bet:
                 return False, f"加注后总额必须大于当前下注 {self.current_bet}"
             if new_total - self.current_bet < FIXED_MIN_RAISE:
@@ -479,14 +491,14 @@ def get_buttons(game, uid):
 
     btns = [[InlineKeyboardButton("🂠 查看手牌", callback_data="hand")], row1]
 
-    if game.chips[uid] > to_call:
+    if game.chips[uid] > 0:
         raise_btns = []
-        # 最小加注按钮：显示需要额外加注的金额（即总加注额 - 已下注）
+        # 最小加注按钮（额外加注额 = 当前下注 + 最小加注 - 已下注）
         needed = (game.current_bet + FIXED_MIN_RAISE) - game.round_bets.get(uid, 0)
         if needed > 0 and game.chips[uid] >= needed:
             raise_btns.append(InlineKeyboardButton(f"🔼 加注 {needed}", callback_data=f"raise_{needed}"))
-        if game.chips[uid] > to_call:
-            raise_btns.append(InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data=f"raise_{game.chips[uid]}"))
+        # 全下按钮（独立动作）
+        raise_btns.append(InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data="allin"))
         for i in range(0, len(raise_btns), 2):
             btns.append(raise_btns[i:i+2])
         btns.append([InlineKeyboardButton("✏️ 自定义加注", callback_data="custom_raise")])
@@ -735,8 +747,9 @@ async def on_button(update, context):
             ok, desc = game.handle_action(user.id, 'check')
         elif data == 'call':
             ok, desc = game.handle_action(user.id, 'call')
+        elif data == 'allin':
+            ok, desc = game.handle_action(user.id, 'allin')
         elif data.startswith('raise_'):
-            # 从按钮传来的 amount 是额外加注额
             try:
                 amt = int(data.split('_')[1])
                 ok, desc = game.handle_action(user.id, 'raise', amount=amt)
@@ -762,7 +775,7 @@ async def on_button(update, context):
         await update_table_msg(game, context.application)
         await start_turn_timer(game, context.application)
 
-# ---------- 文字加注（改进：amount 为额外加注） ----------
+# ---------- 文字加注 ----------
 async def on_text(update, context):
     msg = update.effective_message
     if not msg or not msg.text: return
