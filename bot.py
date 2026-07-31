@@ -212,7 +212,7 @@ class TexasGame:
     def current_player_id(self):
         if not self.players_in_hand or self.actor_idx >= len(self.players_in_hand):
             return None
-        # 如果所有存活玩家都全下，则视为无当前玩家，应强制结算
+        # 如果所有存活玩家都全下，则返回 None，表示无人可行动
         alive = [p for p in self.players_in_hand if p not in self.folded]
         if all(uid in self.all_in for uid in alive):
             return None
@@ -287,12 +287,8 @@ class TexasGame:
             return False, "未知操作"
 
         alive = [p for p in self.players_in_hand if p not in self.folded]
-        if len(alive) == 1:
-            self.phase = 'showdown'
-            return True, desc
-
-        # 全员全下则直接摊牌
-        if all(uid in self.all_in for uid in alive):
+        # 唯一幸存者或全员全下则进入摊牌
+        if len(alive) == 1 or all(uid in self.all_in for uid in alive):
             self.phase = 'showdown'
             return True, desc
 
@@ -325,6 +321,7 @@ class TexasGame:
             self.phase = 'showdown'
             return
 
+        # 非河牌圈，设置下一个行动玩家
         start_idx = (self.dealer_idx + 1) % len(self.players)
         for i in range(len(self.players)):
             test_uid = self.players[(start_idx + i) % len(self.players)]
@@ -477,12 +474,13 @@ async def start_texas_timer(game, app):
     game.cancel_timer()
     uid = game.current_player_id()
     if not uid:
-        # 无当前玩家，检查是否应结算
+        # 无当前玩家，如果已进入摊牌则直接结算
         if game.phase == 'showdown':
             await finish_texas(game, app)
             active_games.pop(game.chat_id, None)
         return
 
+    # 清理旧操作消息
     if game.action_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.action_msg_id)
@@ -519,18 +517,13 @@ async def start_texas_timer(game, app):
     game.turn_task = asyncio.create_task(timeout())
 
 async def start_auto_start_timer(game, app):
-    """等待阶段自动开局倒计时"""
     game.cancel_auto_start()
     async def auto_start():
         await asyncio.sleep(AUTO_START_TIMEOUT)
         if game.phase == 'waiting' and len(game.players) >= 2:
-            # 自动开始
             if game.start_game():
                 await update_texas_message(game, app)
                 await start_texas_timer(game, app)
-            else:
-                # 理论上不会失败
-                pass
     game.auto_start_task = asyncio.create_task(auto_start())
 
 async def finish_texas(game, app):
@@ -835,12 +828,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_action_notification(chat_id, context.application, user.id, desc)
 
+    # 检查是否进入摊牌
     if game.phase == 'showdown':
         await finish_texas(game, context.application)
         active_games.pop(chat_id, None)
-    else:
-        await update_texas_message(game, context.application)
-        await start_texas_timer(game, context.application)
+        return
+
+    await update_texas_message(game, context.application)
+    await start_texas_timer(game, context.application)
 
 # ---------- 按钮回调 ----------
 async def button_handler(update, context):
@@ -856,12 +851,13 @@ async def button_handler(update, context):
         await query.edit_message_text("游戏不存在。")
         return
 
-    # 强制结算检查
+    # 任何时候如果游戏已经进入摊牌，直接结算
     if game.phase == 'showdown':
         await finish_texas(game, context.application)
         active_games.pop(chat_id, None)
         return
 
+    # 查看手牌
     if data == 'texas_hand':
         user = query.from_user
         if user.id in game.hands and user.id not in game.folded and game.phase != 'showdown':
@@ -888,7 +884,6 @@ async def button_handler(update, context):
                         f"已加入玩家:\n" + "\n".join(player_list) + "\n\n点击按钮加入或开始",
                         reply_markup=InlineKeyboardMarkup(keyboard)
                     )
-                    # 启动自动开局计时器
                     if len(game.players) >= 2:
                         await start_auto_start_timer(game, context.application)
                 else:
@@ -940,6 +935,7 @@ async def button_handler(update, context):
                 await query.answer(desc, show_alert=True)
                 return
 
+            # 删除当前操作消息
             if game.action_msg_id:
                 try:
                     await context.bot.delete_message(chat_id, game.action_msg_id)
@@ -949,11 +945,12 @@ async def button_handler(update, context):
 
             await send_action_notification(chat_id, context.application, user.id, desc)
 
-            # 再次检查，如果行动后进入摊牌，直接结算
+            # 行动后检查是否进入摊牌
             if game.phase == 'showdown':
                 await finish_texas(game, context.application)
                 active_games.pop(chat_id, None)
                 return
+
             await update_texas_message(game, context.application)
             await start_texas_timer(game, context.application)
 
