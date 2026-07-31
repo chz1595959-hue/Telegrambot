@@ -17,7 +17,7 @@ FIXED_MIN_RAISE = 100
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
 
-# ---------- 牌型中英文映射（扩展） ----------
+# ---------- 牌型中英文映射 ----------
 HAND_NAME_CN = {
     "High Card": "高牌",
     "Pair": "一对",
@@ -472,6 +472,8 @@ async def start_texas_timer(game, app):
                     pass
             if game.phase == 'showdown':
                 await finish_texas(game, app)
+                # 确保游戏被移除
+                active_games.pop(game.chat_id, None)
             else:
                 await update_texas_message(game, app)
                 await start_texas_timer(game, app)
@@ -780,6 +782,13 @@ async def button_handler(update, context):
         await query.edit_message_text("游戏不存在。")
         return
 
+    # 如果游戏已进入摊牌但未结算，主动结算
+    if game.phase == 'showdown':
+        await finish_texas(game, context.application)
+        active_games.pop(chat_id, None)
+        return
+
+    # 手牌弹窗
     if data == 'texas_hand':
         user = query.from_user
         if user.id in game.hands and user.id not in game.folded and game.phase != 'showdown':
