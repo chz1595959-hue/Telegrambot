@@ -528,7 +528,7 @@ async def settle_game(game, app):
     )
     await app.bot.send_message(game.chat_id, win_text)
 
-# ==================== 赛马（赛道长度14） ====================
+# ==================== 赛马（修正筹码结算） ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
@@ -687,6 +687,8 @@ class HorseRace:
         else:
             lines.append("💰 获胜玩家:")
             for uid, share, bet in result['payouts']:
+                # 关键修复：将赢得的筹码加回玩家余额
+                group_chips[self.chat_id][uid] += share
                 name = await get_name(self.app, uid)
                 profit = share - bet
                 lines.append(f"{name}: 投注{bet} → 获得{share} (+{profit})")
@@ -717,12 +719,13 @@ class HorseRace:
                 pass
         active_games.pop(self.chat_id, None)
 
-    def payout(self):
+        def payout(self):
         if self.phase != 'finished':
             return None
         total_win_bets = self.total_bets[self.winner]
         pool = self.pool
         if total_win_bets == 0:
+            # 无人押中，不退还玩家，直接滚入下一期彩池
             return {
                 'winner': self.winner,
                 'winner_name': HORSE_NAMES[self.winner],
@@ -736,7 +739,6 @@ class HorseRace:
             if self.winner in bets_per_user:
                 user_win_bet = bets_per_user[self.winner]
                 share = pool * (user_win_bet / total_win_bets)
-                group_chips[self.chat_id][uid] += int(share)
                 payouts.append((uid, int(share), user_win_bet))
         return {
             'winner': self.winner,
