@@ -18,8 +18,8 @@ DAILY_RESET_TIME = (0, 0)
 RESET_TO_CHIPS = 20000
 
 # ---------- 德州配置 ----------
-SMALL_BLIND = 200
-BIG_BLIND = 500
+SMALL_BLIND = 100
+BIG_BLIND = 200
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
 AUTO_START_TIMEOUT = 60
@@ -32,7 +32,7 @@ FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
 RACE_AUTO_START = 60           # 开赛倒计时（秒）
 RACE_UPDATE_INTERVAL = 10      # 界面刷新间隔（秒）
 RACE_ANIMATION_INTERVAL = 1.5  # 动画更新间隔（秒）
-RACE_TRACK_LENGTH = 14         # 赛道长度，适配手机屏幕
+RACE_TRACK_LENGTH = 14         # 赛道长度
 
 # ---------- 牌型中英文映射 ----------
 HAND_NAME_CN = {
@@ -687,7 +687,6 @@ class HorseRace:
         else:
             lines.append("💰 获胜玩家:")
             for uid, share, bet in result['payouts']:
-                # 将赢得的筹码加回玩家余额
                 group_chips[self.chat_id][uid] += share
                 name = await get_name(self.app, uid)
                 profit = share - bet
@@ -711,7 +710,11 @@ class HorseRace:
                 else:
                     lines.append(f"{idx}. {name}: +{profit} 积分 ({percentage:.2f}%)")
 
-        await self.app.bot.send_message(self.chat_id, "\n".join(lines))
+        try:
+            await self.app.bot.send_message(self.chat_id, "\n".join(lines))
+        except Exception as e:
+            logger.error(f"发送结算消息失败: {e}")
+
         if self.animation_msg_id:
             try:
                 await self.app.bot.delete_message(self.chat_id, self.animation_msg_id)
@@ -725,7 +728,6 @@ class HorseRace:
         total_win_bets = self.total_bets[self.winner]
         pool = self.pool
         if total_win_bets == 0:
-            # 无人押中，不退还，滚入下一期
             return {
                 'winner': self.winner,
                 'winner_name': HORSE_NAMES[self.winner],
