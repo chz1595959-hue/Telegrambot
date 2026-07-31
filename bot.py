@@ -37,12 +37,13 @@ HAND_NAME_CN = {
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
 
-# ---------- 卡牌美化（花色在前，数字在后） ----------
+# ---------- 卡牌美化（修正方括号问题，花色在前） ----------
 def card_str(card_int):
-    raw = Card.int_to_pretty_str(card_int)  # 例如 "6♦"
+    raw = Card.int_to_pretty_str(card_int)      # 例如 "[K♦]"
+    inner = raw.strip('[]')                     # "K♦" 或 "10♦"
     suit_map = {'♠': '♠️', '♥': '♥️', '♦': '♦️', '♣': '♣️'}
-    rank = raw[:-1].replace('T', '10')
-    suit = raw[-1]
+    rank = inner[:-1].replace('T', '10')        # 将 T 替换为 10（treys 内部用 T 表示10）
+    suit = inner[-1]
     return f"{suit_map.get(suit, suit)}{rank}"
 
 async def get_name(app, user_id):
@@ -52,7 +53,7 @@ async def get_name(app, user_id):
     except:
         return str(user_id)
 
-# ---------- 边池计算（含弃牌玩家） ----------
+# ---------- 边池计算 ----------
 def compute_side_pots(all_bets):
     if not all_bets: return []
     sorted_bets = sorted(all_bets.items(), key=lambda x: x[1])
@@ -172,16 +173,14 @@ class PokerGame:
             self.all_in.add(uid)
 
     def current_player(self):
-        """返回当前应行动的玩家，自动跳过全下玩家"""
         if not self.active_players or self.actor_idx >= len(self.active_players):
             return None
-        # 从当前位置开始寻找第一个未弃牌且未全下的玩家
         for _ in range(len(self.active_players)):
             uid = self.active_players[self.actor_idx]
             if uid not in self.folded and uid not in self.all_in:
                 return uid
             self.actor_idx = (self.actor_idx + 1) % len(self.active_players)
-        return None  # 所有人都全下或弃牌
+        return None
 
     def next_player(self):
         start = self.actor_idx
@@ -307,7 +306,7 @@ class PokerGame:
         idx = alive.index(start)
         self.showdown_order = alive[idx:] + alive[:idx]
 
-        # 唯一幸存者（手牌保密）
+        # 唯一幸存者
         if len(alive) == 1:
             winner = alive[0]
             pot_amount = self.pot
@@ -333,7 +332,7 @@ class PokerGame:
         best = min(scores.values())
         overall_winners = {uid for uid in alive if scores[uid] == best}
 
-        # 边池分配（包含弃牌玩家投入）
+        # 边池分配
         all_bets = {uid: self.total_bet[uid] for uid in self.players}
         layers = compute_side_pots(all_bets)
         dist = distribute_side_pots(layers, scores, overall_winners)
