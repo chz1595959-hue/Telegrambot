@@ -37,13 +37,13 @@ HAND_NAME_CN = {
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
 
-# ---------- 卡牌美化 ----------
+# ---------- 卡牌美化（花色在前，数字在后） ----------
 def card_str(card_int):
-    raw = Card.int_to_pretty_str(card_int)
+    raw = Card.int_to_pretty_str(card_int)  # 例如 "6♦"
     suit_map = {'♠': '♠️', '♥': '♥️', '♦': '♦️', '♣': '♣️'}
     rank = raw[:-1].replace('T', '10')
     suit = raw[-1]
-    return f"{rank}{suit_map.get(suit, suit)}"
+    return f"{suit_map.get(suit, suit)}{rank}"
 
 async def get_name(app, user_id):
     try:
@@ -172,12 +172,16 @@ class PokerGame:
             self.all_in.add(uid)
 
     def current_player(self):
+        """返回当前应行动的玩家，自动跳过全下玩家"""
         if not self.active_players or self.actor_idx >= len(self.active_players):
             return None
-        alive = [p for p in self.active_players if p not in self.folded]
-        if all(p in self.all_in for p in alive):
-            return None
-        return self.active_players[self.actor_idx]
+        # 从当前位置开始寻找第一个未弃牌且未全下的玩家
+        for _ in range(len(self.active_players)):
+            uid = self.active_players[self.actor_idx]
+            if uid not in self.folded and uid not in self.all_in:
+                return uid
+            self.actor_idx = (self.actor_idx + 1) % len(self.active_players)
+        return None  # 所有人都全下或弃牌
 
     def next_player(self):
         start = self.actor_idx
@@ -201,6 +205,8 @@ class PokerGame:
             return False, "还没轮到你"
         if uid in self.acted_this_round:
             return False, "本轮已行动"
+        if uid in self.all_in:
+            return False, "已全下，无法行动"
 
         if action == 'fold':
             self.folded.add(uid)
