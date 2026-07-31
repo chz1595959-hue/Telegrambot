@@ -13,7 +13,7 @@ STARTING_CHIPS = 10000
 SMALL_BLIND = 100
 BIG_BLIND = 200
 TURN_TIMEOUT = 60
-FIXED_MIN_RAISE = 100          # 固定最小加注额
+FIXED_MIN_RAISE = 100
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
 
@@ -31,7 +31,7 @@ HAND_NAME_CN = {
     "Royal Flush": "皇家同花顺",
 }
 
-# ---------- 内存存储（重启丢失） ----------
+# ---------- 内存存储 ----------
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
 
@@ -117,6 +117,7 @@ class TexasGame:
         self.last_aggressor = None
         self.dealer_idx = 0
         self.game_msg_id = None
+        self.action_msg_id = None      # 新增加：当前操作按钮消息ID
         self.evaluator = Evaluator()
         self.turn_task = None
 
@@ -403,27 +404,47 @@ async def build_texas_text(game, app):
 
 async def update_texas_message(game, app):
     text = await build_texas_text(game, app)
-    keyboard = None
-    if game.phase in ('preflop','flop','turn','river') and game.current_player_id():
-        keyboard = game.get_buttons(game.current_player_id())
     try:
-        await app.bot.edit_message_text(chat_id=game.chat_id, message_id=game.game_msg_id, text=text, reply_markup=keyboard)
+        await app.bot.edit_message_text(chat_id=game.chat_id, message_id=game.game_msg_id, text=text)
     except Exception as e:
         logger.error(f"德州更新错误: {e}")
 
 async def start_texas_timer(game, app):
     game.cancel_timer()
     uid = game.current_player_id()
-    if not uid: return
+    if not uid:
+        return
 
-    await send_action_notification(game.chat_id, app, uid, "请行动")
+    # 删除旧的行动消息
+    if game.action_msg_id:
+        try:
+            await app.bot.delete_message(game.chat_id, game.action_msg_id)
+        except:
+            pass
+        game.action_msg_id = None
 
+    # 发送新的行动消息，附带操作按钮
+    keyboard = game.get_buttons(uid)
+    name = await get_name(app, uid)
+    msg = await app.bot.send_message(
+        chat_id=game.chat_id,
+        text=f"🎲 轮到 {name} 行动",
+        reply_markup=keyboard
+    )
+    game.action_msg_id = msg.message_id
+
+    # 超时计时
     async def timeout():
         await asyncio.sleep(TURN_TIMEOUT)
         if game.phase in ('preflop','flop','turn','river') and game.current_player_id() == uid:
             game.handle_action(uid, 'fold')
             name = await get_name(app, uid)
             await app.bot.send_message(game.chat_id, f"⏰ {name} 超时未操作，自动弃牌")
+            if game.action_msg_id:
+                try:
+                    await app.bot.delete_message(game.chat_id, game.action_msg_id)
+                except:
+                    pass
             if game.phase == 'showdown':
                 await finish_texas(game, app)
             else:
@@ -433,6 +454,12 @@ async def start_texas_timer(game, app):
 
 async def finish_texas(game, app):
     game.cancel_timer()
+    # 删除行动消息
+    if game.action_msg_id:
+        try:
+            await app.bot.delete_message(game.chat_id, game.action_msg_id)
+        except:
+            pass
     result = game.showdown()
     if not result:
         return
@@ -453,7 +480,6 @@ async def finish_texas(game, app):
         else:
             hand = game.hands.get(uid, [])
             hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
-            # 获取中文牌型
             hand_en = hand_types.get(uid, "")
             hand_cn = HAND_NAME_CN.get(hand_en, hand_en)
             if hand_cn:
@@ -544,6 +570,11 @@ async def end_game(update, context):
         await update.message.reply_text("当前没有进行中的游戏。")
         return
     game.cancel_timer()
+    if game.action_msg_id:
+        try:
+            await context.bot.delete_message(chat_id, game.action_msg_id)
+        except:
+            pass
     await update.message.reply_text("游戏已被手动终止。")
     try:
         await context.bot.edit_message_text(chat_id=chat_id, message_id=game.game_msg_id, text="游戏已被手动终止。")
@@ -696,6 +727,14 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ {desc}")
         return
 
+    # 成功加注后，删除操作消息并推进回合
+    if game.action_msg_id:
+        try:
+            await context.bot.delete_message(chat_id, game.action_msg_id)
+        except:
+            pass
+        game.action_msg_id = None
+
     await send_action_notification(chat_id, context.application, user.id, desc)
 
     if game.phase == 'showdown':
@@ -734,6 +773,7 @@ async def button_handler(update, context):
     user = query.from_user
 
     if isinstance(game, TexasGame):
+        # 等待阶段
         if game.phase == 'waiting':
             if data == 'texas_join':
                 if game.add_player(user.id):
@@ -766,10 +806,13 @@ async def button_handler(update, context):
                     await query.edit_message_text("游戏开始失败")
             return
 
+        # 游戏进行中，所有操作都在 action_msg 上，但可能玩家从旧消息点了按钮，我们仍处理
         if game.phase in ('preflop','flop','turn','river'):
             if user.id != game.current_player_id():
                 await query.answer("还没轮到你", show_alert=True)
                 return
+
+            # 根据回调数据处理
             if data == 'texas_fold':
                 success, desc = game.handle_action(user.id, 'fold')
             elif data == 'texas_check':
@@ -793,7 +836,15 @@ async def button_handler(update, context):
                 await query.answer(desc, show_alert=True)
                 return
 
-            await send_action_notification(game.chat_id, context.application, user.id, desc)
+            # 删除当前操作消息
+            if game.action_msg_id:
+                try:
+                    await context.bot.delete_message(chat_id, game.action_msg_id)
+                except:
+                    pass
+                game.action_msg_id = None
+
+            await send_action_notification(chat_id, context.application, user.id, desc)
 
             if game.phase == 'showdown':
                 await finish_texas(game, context.application)
