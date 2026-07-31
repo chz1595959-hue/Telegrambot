@@ -13,9 +13,23 @@ STARTING_CHIPS = 10000
 SMALL_BLIND = 100
 BIG_BLIND = 200
 TURN_TIMEOUT = 60
-FIXED_MIN_RAISE = 100
+FIXED_MIN_RAISE = 100          # 固定最小加注额
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
+
+# ---------- 牌型中英文映射 ----------
+HAND_NAME_CN = {
+    "High Card": "高牌",
+    "One Pair": "一对",
+    "Two Pair": "两对",
+    "Three of a Kind": "三条",
+    "Straight": "顺子",
+    "Flush": "同花",
+    "Full House": "葫芦",
+    "Four of a Kind": "四条",
+    "Straight Flush": "同花顺",
+    "Royal Flush": "皇家同花顺",
+}
 
 # ---------- 内存存储（重启丢失） ----------
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
@@ -171,9 +185,10 @@ class TexasGame:
 
         if self.chips[uid] > to_call:
             raise_buttons = []
-            min_needed = (self.current_bet + FIXED_MIN_RAISE) - self.round_bets[uid]
-            if self.chips[uid] >= min_needed:
-                raise_buttons.append(InlineKeyboardButton(f"🔼 加注 100", callback_data=f"texas_raise_{min_needed}"))
+            total_needed = self.current_bet + FIXED_MIN_RAISE
+            needed = total_needed - self.round_bets[uid]
+            if needed > 0 and self.chips[uid] >= needed:
+                raise_buttons.append(InlineKeyboardButton(f"🔼 加注 {needed}", callback_data=f"texas_raise_{needed}"))
 
             all_in = self.chips[uid]
             if all_in > to_call:
@@ -292,9 +307,8 @@ class TexasGame:
             self.board.append(self.deck.pop())
         elif self.phase == 'river':
             self.phase = 'showdown'
-            return  # 河牌圈结束，直接进入摊牌
+            return
 
-        # 非河牌圈，寻找下一轮先手玩家
         start_idx = (self.dealer_idx + 1) % len(self.players)
         for i in range(len(self.players)):
             test_uid = self.players[(start_idx + i) % len(self.players)]
@@ -309,15 +323,21 @@ class TexasGame:
             self.chips[winner] += self.pot
             self.pot = 0
             self._save_chips_to_memory()
-            return [(winner, "最后赢家", self.pot)]
+            return [(winner, "最后赢家", self.pot, {})]
 
         scores = {}
+        hand_types = {}
         for uid in alive:
             hand = self.hands[uid]
             if self.board:
-                scores[uid] = self.evaluator.evaluate(hand, self.board)
+                score = self.evaluator.evaluate(hand, self.board)
+                scores[uid] = score
+                rank_class = self.evaluator.get_rank_class(score)
+                hand_types[uid] = self.evaluator.class_to_string(rank_class)
             else:
-                scores[uid] = self.evaluator.evaluate(hand, [])
+                score = self.evaluator.evaluate(hand, [])
+                rank_class = self.evaluator.get_rank_class(score)
+                hand_types[uid] = self.evaluator.class_to_string(rank_class)
 
         best_score = min(scores.values())
         overall_winners = {uid for uid in alive if scores[uid] == best_score}
@@ -330,8 +350,10 @@ class TexasGame:
             self.pot -= distribution[uid]
         self.pot = 0
         self._save_chips_to_memory()
-        desc = self.evaluator.class_to_string(self.evaluator.get_rank_class(best_score))
-        return [(uid, desc, distribution[uid]) for uid in overall_winners]
+
+        desc_en = self.evaluator.class_to_string(self.evaluator.get_rank_class(best_score))
+        desc_cn = HAND_NAME_CN.get(desc_en, desc_en)
+        return [(uid, desc_cn, distribution[uid], hand_types) for uid in overall_winners]
 
     def _save_chips_to_memory(self):
         for uid in self.chips:
@@ -411,9 +433,14 @@ async def start_texas_timer(game, app):
 
 async def finish_texas(game, app):
     game.cancel_timer()
-    winners = game.showdown()
+    result = game.showdown()
+    if not result:
+        return
+    hand_types = result[0][3] if len(result[0]) > 3 else {}
+
     board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
     board_display = f"|--------------------+\n| {board_str}\n|--------------------+"
+
     card_lines = []
     for uid in game.players:
         name = await get_name(app, uid)
@@ -426,12 +453,20 @@ async def finish_texas(game, app):
         else:
             hand = game.hands.get(uid, [])
             hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
-            card_lines.append(f"{name}：{hand_str}")
+            # 获取中文牌型
+            hand_en = hand_types.get(uid, "")
+            hand_cn = HAND_NAME_CN.get(hand_en, hand_en)
+            if hand_cn:
+                card_lines.append(f"{name}：{hand_str} / {hand_cn}")
+            else:
+                card_lines.append(f"{name}：{hand_str}")
+
     total_pot = sum(game.total_bet.values())
     prize_lines = []
-    for wid, desc, amount in winners:
+    for wid, desc_cn, amount, _ in result:
         name = await get_name(app, wid)
-        prize_lines.append(f"{name} +{amount} ({desc})")
+        prize_lines.append(f"{name} +{amount} ({desc_cn})")
+
     profit_lines = []
     for uid in game.players:
         name = await get_name(app, uid)
@@ -440,11 +475,13 @@ async def finish_texas(game, app):
         net = end - start
         invested = game.total_bet.get(uid, 0)
         profit_lines.append(f"{name}  投入:{invested}  盈亏:{net:+d}")
+
     broke = [uid for uid in game.players if game.chips[uid] == 0]
     broke_text = ""
     if broke:
         names = [await get_name(app, uid) for uid in broke]
         broke_text = f"\n⚠️ 以下玩家筹码归零: {', '.join(names)}，使用 /add 补充"
+
     win_text = (
         f"积分德州已结算\n\n"
         f"|- 积分德州牌桌\n\n"
