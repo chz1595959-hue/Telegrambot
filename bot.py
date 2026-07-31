@@ -14,6 +14,7 @@ SMALL_BLIND = 100
 BIG_BLIND = 200
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
+AUTO_START_TIMEOUT = 60  # 自动开局倒计时
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
 
@@ -121,6 +122,7 @@ class TexasGame:
         self.action_msg_id = None
         self.evaluator = Evaluator()
         self.turn_task = None
+        self.auto_start_task = None
         self.showdown_order = []
 
     def add_player(self, user_id):
@@ -159,6 +161,7 @@ class TexasGame:
         self.acted_this_round = set()
         self.last_aggressor = None
         self.showdown_order = []
+        self.cancel_auto_start()
         return True
 
     def _update_total_bet(self, uid, amount):
@@ -208,6 +211,10 @@ class TexasGame:
 
     def current_player_id(self):
         if not self.players_in_hand or self.actor_idx >= len(self.players_in_hand):
+            return None
+        # 如果所有存活玩家都全下，则视为无当前玩家，应强制结算
+        alive = [p for p in self.players_in_hand if p not in self.folded]
+        if all(uid in self.all_in for uid in alive):
             return None
         return self.players_in_hand[self.actor_idx]
 
@@ -281,6 +288,11 @@ class TexasGame:
 
         alive = [p for p in self.players_in_hand if p not in self.folded]
         if len(alive) == 1:
+            self.phase = 'showdown'
+            return True, desc
+
+        # 全员全下则直接摊牌
+        if all(uid in self.all_in for uid in alive):
             self.phase = 'showdown'
             return True, desc
 
@@ -386,6 +398,11 @@ class TexasGame:
             self.turn_task.cancel()
             self.turn_task = None
 
+    def cancel_auto_start(self):
+        if self.auto_start_task:
+            self.auto_start_task.cancel()
+            self.auto_start_task = None
+
 # ---------- 界面构建 ----------
 async def build_action_text(game, app, uid):
     board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
@@ -460,6 +477,7 @@ async def start_texas_timer(game, app):
     game.cancel_timer()
     uid = game.current_player_id()
     if not uid:
+        # 无当前玩家，检查是否应结算
         if game.phase == 'showdown':
             await finish_texas(game, app)
             active_games.pop(game.chat_id, None)
@@ -500,8 +518,24 @@ async def start_texas_timer(game, app):
                 await start_texas_timer(game, app)
     game.turn_task = asyncio.create_task(timeout())
 
+async def start_auto_start_timer(game, app):
+    """等待阶段自动开局倒计时"""
+    game.cancel_auto_start()
+    async def auto_start():
+        await asyncio.sleep(AUTO_START_TIMEOUT)
+        if game.phase == 'waiting' and len(game.players) >= 2:
+            # 自动开始
+            if game.start_game():
+                await update_texas_message(game, app)
+                await start_texas_timer(game, app)
+            else:
+                # 理论上不会失败
+                pass
+    game.auto_start_task = asyncio.create_task(auto_start())
+
 async def finish_texas(game, app):
     game.cancel_timer()
+    game.cancel_auto_start()
     if game.action_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.action_msg_id)
@@ -633,6 +667,7 @@ async def end_game(update, context):
         await update.message.reply_text("当前没有进行中的游戏。")
         return
     game.cancel_timer()
+    game.cancel_auto_start()
     if game.action_msg_id:
         try:
             await context.bot.delete_message(chat_id, game.action_msg_id)
@@ -841,6 +876,7 @@ async def button_handler(update, context):
     user = query.from_user
 
     if isinstance(game, TexasGame):
+        # 等待阶段
         if game.phase == 'waiting':
             if data == 'texas_join':
                 if game.add_player(user.id):
@@ -852,6 +888,9 @@ async def button_handler(update, context):
                         f"已加入玩家:\n" + "\n".join(player_list) + "\n\n点击按钮加入或开始",
                         reply_markup=InlineKeyboardMarkup(keyboard)
                     )
+                    # 启动自动开局计时器
+                    if len(game.players) >= 2:
+                        await start_auto_start_timer(game, context.application)
                 else:
                     await query.answer("加入失败", show_alert=True)
             elif data == 'texas_start':
@@ -873,6 +912,7 @@ async def button_handler(update, context):
                     await query.edit_message_text("游戏开始失败")
             return
 
+        # 游戏进行中
         if game.phase in ('preflop','flop','turn','river'):
             if user.id != game.current_player_id():
                 await query.answer("还没轮到你", show_alert=True)
