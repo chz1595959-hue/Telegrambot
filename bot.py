@@ -1,4 +1,4 @@
-import random, os, asyncio, logging, traceback, re
+import random, os, asyncio, logging, traceback, re, time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -47,7 +47,7 @@ AUTHORIZED_GROUPS = set()
 race_history = defaultdict(list)
 race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
 horse_profit = defaultdict(lambda: defaultdict(int))
-race_jackpot = defaultdict(int)          # 累积彩池
+race_jackpot = defaultdict(int)
 
 # ---------- 卡牌美化 ----------
 def card_str(card_int):
@@ -528,20 +528,20 @@ async def settle_game(game, app):
     )
     await app.bot.send_message(game.chat_id, win_text)
 
-# ==================== 赛马（完全重写，独立倒计时，赔率动态更新） ====================
+# ==================== 赛马（重写，绝对时间调度，显示格式符合要求） ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.bets = {}                 # {user_id: {horse_idx: amount}}
+        self.bets = {}
         self.total_bets = [0] * HORSE_COUNT
         self.pool = initial_pool
-        self.phase = 'betting'         # 'betting' -> 'racing' -> 'finished'
+        self.phase = 'betting'
         self.game_msg_id = None
-        self.create_time = datetime.now()
-        self.update_task = None        # 界面刷新任务
-        self.countdown_task = None     # 倒计时任务
-        self.animation_task = None     # 动画任务
+        self.create_time = time.time()          # 使用 time.time() 精确计时
+        self.update_task = None
+        self.schedule_task = None               # 调度任务（倒计时+推送）
+        self.animation_task = None
         self.positions = [0] * HORSE_COUNT
         self.arrival_order = []
         self.app = None
@@ -577,7 +577,6 @@ class HorseRace:
         return True, f"成功下注 {amount} 筹码于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}"
 
     def get_odds(self):
-        """实时赔率：总池 / 该马下注额，若下注为0则返回无穷大"""
         odds = []
         for i in range(HORSE_COUNT):
             if self.total_bets[i] > 0:
@@ -587,18 +586,18 @@ class HorseRace:
         return odds
 
     def start_race(self):
-        """开始比赛，由倒计时任务或手动触发"""
         if self.phase != 'betting':
             return False
         self.phase = 'racing'
         self.winner = -1
         self.positions = [0] * HORSE_COUNT
         self.arrival_order = []
-        # 取消界面刷新任务（倒计时任务已自行结束）
         if self.update_task:
             self.update_task.cancel()
             self.update_task = None
-        # 启动动画任务
+        if self.schedule_task:
+            self.schedule_task.cancel()
+            self.schedule_task = None
         if self.app:
             asyncio.create_task(self.app.bot.send_message(
                 self.chat_id,
@@ -611,14 +610,12 @@ class HorseRace:
         if not self.app:
             return
         while self.phase == 'racing':
-            # 每匹马前进随机步长
             for i in range(HORSE_COUNT):
                 if self.positions[i] < RACE_TRACK_LENGTH:
                     step = random.randint(1, 3)
                     self.positions[i] = min(RACE_TRACK_LENGTH, self.positions[i] + step)
                     if self.positions[i] >= RACE_TRACK_LENGTH and i not in self.arrival_order:
                         self.arrival_order.append(i)
-            # 更新动画消息
             try:
                 await self.app.bot.edit_message_text(
                     chat_id=self.chat_id,
@@ -627,7 +624,6 @@ class HorseRace:
                 )
             except Exception:
                 pass
-            # 检查是否所有马匹都已到达
             if len(self.arrival_order) == HORSE_COUNT:
                 self.winner = self.arrival_order[0]
                 race_daily_stats[self.chat_id][self.winner] += 1
@@ -636,13 +632,12 @@ class HorseRace:
                 if len(history) > 10:
                     race_history[self.chat_id] = history[-10:]
                 self.phase = 'finished'
-                # 异步结算
                 asyncio.create_task(settle_race(self, self.app, self.chat_id))
                 return
             await asyncio.sleep(RACE_ANIMATION_INTERVAL)
 
     def _build_animation_view(self):
-        race_id = self.create_time.strftime("%Y%m%d-%H%M")
+        race_id = datetime.fromtimestamp(self.create_time).strftime("%Y%m%d-%H%M")
         lines = [f"🏇 {race_id} 实况", "━" * 20]
         for i in range(HORSE_COUNT):
             pos = self.positions[i]
@@ -658,13 +653,11 @@ class HorseRace:
         return "\n".join(lines)
 
     def payout(self):
-        """结算奖金，返回结果字典"""
         if self.phase != 'finished':
             return None
         total_win_bets = self.total_bets[self.winner]
         pool = self.pool
         if total_win_bets == 0:
-            # 无人押中，退还所有下注？这里我们改为滚入累积彩池（在settle_race中处理）
             return {
                 'winner': self.winner,
                 'winner_name': HORSE_NAMES[self.winner],
@@ -690,25 +683,24 @@ class HorseRace:
         }
 
     def cancel_tasks(self):
-        """取消所有后台任务"""
         if self.update_task:
             self.update_task.cancel()
             self.update_task = None
-        if self.countdown_task:
-            self.countdown_task.cancel()
-            self.countdown_task = None
+        if self.schedule_task:
+            self.schedule_task.cancel()
+            self.schedule_task = None
         if self.animation_task:
             self.animation_task.cancel()
             self.animation_task = None
 
-# ---------- 赛马界面 ----------
+# ---------- 赛马界面（显示格式：下注 | 胜率 | 赔率） ----------
 def build_race_view(race):
-    now = datetime.now()
-    elapsed = (now - race.create_time).total_seconds()
+    now = time.time()
+    elapsed = now - race.create_time
     remaining = max(0, RACE_AUTO_START - elapsed)
     minutes = int(remaining // 60)
     seconds = int(remaining % 60)
-    race_id = race.create_time.strftime("%Y%m%d-%H%M")
+    race_id = datetime.fromtimestamp(race.create_time).strftime("%Y%m%d-%H%M")
     odds = race.get_odds()
     history = race_history.get(race.chat_id, [])[-10:]
     daily_stats = race_daily_stats[race.chat_id]
@@ -732,19 +724,14 @@ def build_race_view(race):
         hist_lines.append(f"  {HORSE_EMOJI[i]} {wins}胜 | {rate:.0f}%")
     lines.append("📜 历史胜率:\n" + "\n".join(hist_lines))
 
-    # 显示实时赔率（动态更新）
-    lines.append("📊 实时赔率 (总池/下注额):")
+    # 综合显示：下注 | 固定胜率 | 实时赔率
+    lines.append("📊 综合数据 (下注 | 胜率 | 赔率):")
     for i in range(HORSE_COUNT):
         bet = race.total_bets[i]
+        fixed_rate = race.fixed_rates[i] * 100
         odd = odds[i]
         odd_str = f"{odd:.2f}x" if odd != float('inf') else "∞"
-        lines.append(f"{HORSE_EMOJI[i]} {HORSE_NAMES[i]}: 下注 {bet} 积分 | 赔率 {odd_str}")
-
-    # 显示固定胜率（仅供参考）
-    lines.append("📊 本局固定胜率:")
-    for i in range(HORSE_COUNT):
-        fixed_rate = race.fixed_rates[i] * 100
-        lines.append(f"{HORSE_EMOJI[i]}: {fixed_rate:.0f}%")
+        lines.append(f"{HORSE_EMOJI[i]} {HORSE_NAMES[i]}: 下注 {bet} | 胜率 {fixed_rate:.0f}% | 赔率 {odd_str}")
 
     if race.phase == 'betting':
         if remaining > 0:
@@ -764,16 +751,15 @@ def get_race_buttons():
     btns.append([InlineKeyboardButton("🏁 开始比赛", callback_data="horse_start")])
     return InlineKeyboardMarkup(btns)
 
-# ---------- 赛马后台任务（全新） ----------
+# ---------- 赛马后台任务（绝对时间调度） ----------
 async def start_race_tasks(race, app):
-    """启动赛马的界面刷新和倒计时任务"""
     race.cancel_tasks()
     race.set_app(app)
     race._sent_30 = False
     race._sent_20 = False
     race._sent_10 = False
 
-    # 1. 界面刷新任务（每10秒）
+    # 界面刷新任务（每10秒）
     async def update_loop():
         while race.phase == 'betting':
             view = build_race_view(race)
@@ -788,36 +774,43 @@ async def start_race_tasks(race, app):
                 pass
             await asyncio.sleep(RACE_UPDATE_INTERVAL)
 
-    # 2. 倒计时任务（每秒检查，独立推送）
-    async def countdown_loop():
-        while race.phase == 'betting':
-            elapsed = (datetime.now() - race.create_time).total_seconds()
-            remaining = RACE_AUTO_START - elapsed
+    # 精准调度任务：绝对时间
+    async def schedule_loop():
+        start_time = race.create_time
+        now = time.time()
+        t_30 = start_time + (RACE_AUTO_START - 30)
+        t_20 = start_time + (RACE_AUTO_START - 20)
+        t_10 = start_time + (RACE_AUTO_START - 10)
+        t_start = start_time + RACE_AUTO_START
 
-            # 推送提醒（仅当 remaining > 0 时）
-            if 0 < remaining <= 30 and not race._sent_30:
+        if t_30 > now:
+            await asyncio.sleep(t_30 - now)
+            if race.phase == 'betting' and not race._sent_30:
                 await app.bot.send_message(race.chat_id, "⏰ 赛马即将在 30 秒后开始，开赛后无法押注！")
                 race._sent_30 = True
-            if 0 < remaining <= 20 and not race._sent_20:
+        now = time.time()
+        if t_20 > now:
+            await asyncio.sleep(t_20 - now)
+            if race.phase == 'betting' and not race._sent_20:
                 await app.bot.send_message(race.chat_id, "⏰ 赛马即将在 20 秒后开始，开赛后无法押注！")
                 race._sent_20 = True
-            if 0 < remaining <= 10 and not race._sent_10:
+        now = time.time()
+        if t_10 > now:
+            await asyncio.sleep(t_10 - now)
+            if race.phase == 'betting' and not race._sent_10:
                 await app.bot.send_message(race.chat_id, "⏰ 赛马即将在 10 秒后开始，开赛后无法押注！")
                 race._sent_10 = True
-
-            # 倒计时归零，强制开始
-            if remaining <= 0:
-                if race.phase == 'betting':
-                    await app.bot.send_message(race.chat_id, "⏰ 倒计时结束，比赛自动开始！")
-                    race.start_race()
-                break
-
-            await asyncio.sleep(1)  # 每秒检查
+        now = time.time()
+        if t_start > now:
+            await asyncio.sleep(t_start - now)
+        if race.phase == 'betting':
+            await app.bot.send_message(race.chat_id, "⏰ 倒计时结束，比赛自动开始！")
+            race.start_race()
 
     race.update_task = asyncio.create_task(update_loop())
-    race.countdown_task = asyncio.create_task(countdown_loop())
+    race.schedule_task = asyncio.create_task(schedule_loop())
 
-# ---------- 赛马结算（无人押中时滚入下一期） ----------
+# ---------- 赛马结算（无人押中滚入下一期） ----------
 async def settle_race(race, app, chat_id):
     race.cancel_tasks()
     try:
@@ -827,7 +820,7 @@ async def settle_race(race, app, chat_id):
     result = race.payout()
     if not result:
         return
-    race_id = race.create_time.strftime("%Y%m%d-%H%M")
+    race_id = datetime.fromtimestamp(race.create_time).strftime("%Y%m%d-%H%M")
     lines = [f"🏆 赛马大赛 {race_id} 结果 🏆", "━" * 20]
     order = race.arrival_order if race.arrival_order else sorted(range(HORSE_COUNT), key=lambda i: race.total_bets[i], reverse=True)
     medals = ["🥇", "🥈", "🥉"]
@@ -1156,7 +1149,6 @@ async def on_text(update, context):
     chat_id = update.effective_chat.id
     game = active_games.get(chat_id)
 
-    # 赛马文字下注
     if isinstance(game, HorseRace) and game.phase == 'betting':
         m = re.match(r'^下注\s+(\d+)\s+(\d+)$', msg.text.strip())
         if not m:
@@ -1173,7 +1165,6 @@ async def on_text(update, context):
         await action_notify(chat_id, context.application, user.id, f"下注 {amt} 于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
         return
 
-    # 德州加注文字命令
     if isinstance(game, PokerGame) and game.phase in ('preflop','flop','turn','river'):
         if user.id != game.current_player():
             return
