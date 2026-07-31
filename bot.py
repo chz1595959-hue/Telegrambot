@@ -29,10 +29,11 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START = 60
-RACE_UPDATE_INTERVAL = 1
-RACE_ANIMATION_INTERVAL = 1.5
-RACE_TRACK_LENGTH = 20
+RACE_AUTO_START = 60           # 开赛倒计时（秒）
+RACE_UPDATE_INTERVAL = 10      # 界面刷新间隔（秒），避免过快
+RACE_ANIMATION_INTERVAL = 1.5  # 动画更新间隔（秒）
+RACE_TRACK_LENGTH = 20         # 赛道长度
+INITIAL_WEIGHT = 1000          # 赔率计算中的初始权重（信任胜率的程度）
 
 # ---------- 牌型中英文映射 ----------
 HAND_NAME_CN = {
@@ -123,7 +124,7 @@ async def daily_reset_chips():
             race_daily_stats[chat_id] = [0] * HORSE_COUNT
         logger.info("每日筹码重置完成")
 
-# ==================== 德州扑克 ====================
+# ==================== 德州扑克（完全不变） ====================
 class PokerGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
@@ -528,7 +529,7 @@ async def settle_game(game, app):
     )
     await app.bot.send_message(game.chat_id, win_text)
 
-# ==================== 赛马 ====================
+# ==================== 赛马（优化赔率 + 10秒刷新） ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
@@ -574,17 +575,23 @@ class HorseRace:
         return True, f"成功下注 {amount} 筹码于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}"
 
     def get_odds(self):
+        """
+        改进赔率计算：结合固定胜率和市场下注。
+        后验概率 = (fixed_rate * INITIAL_WEIGHT + market_share * pool) / (INITIAL_WEIGHT + pool)
+        赔率 = 1 / 后验概率，限制在 1.5 ~ 8.0 之间。
+        """
         odds = []
+        total_bets_sum = self.pool
         for i in range(HORSE_COUNT):
             rate = self.fixed_rates[i]
             if rate <= 0: rate = 0.01
-            base_odds = 1.0 / rate
-            if self.total_bets[i] > 0:
-                market_factor = self.pool / self.total_bets[i]
-                raw = base_odds * market_factor
-            else:
-                raw = base_odds
-            odds.append(max(0.5, min(raw, 10.0)))
+            market_share = self.total_bets[i] / total_bets_sum if total_bets_sum > 0 else 0
+            # 后验概率 = 融合固定胜率和市场比例
+            posterior = (rate * INITIAL_WEIGHT + market_share * total_bets_sum) / (INITIAL_WEIGHT + total_bets_sum)
+            if posterior <= 0: posterior = 0.01
+            raw_odds = 1.0 / posterior
+            # 限制范围，避免过于极端
+            odds.append(max(1.5, min(raw_odds, 8.0)))
         return odds
 
     async def start_race(self):
@@ -805,17 +812,20 @@ def get_race_buttons():
         btns.append(row)
     return InlineKeyboardMarkup(btns)
 
+# ---------- 赛马后台任务 ----------
 def start_race_tasks(race, app):
     race.set_app(app)
     race.update_task = asyncio.create_task(_race_main_loop(race, app))
 
 async def _race_main_loop(race, app):
+    """每 RACE_UPDATE_INTERVAL 秒刷新界面，倒计时结束自动开赛，独立发送提醒"""
     try:
         while race.phase == 'betting':
             now = time.time()
             elapsed = now - race.create_time
             remaining = RACE_AUTO_START - elapsed
 
+            # 倒计时提醒（30/20/10秒各发一次）
             for threshold in [30, 20, 10]:
                 if remaining <= threshold and threshold not in race.notified:
                     race.notified.add(threshold)
@@ -1045,8 +1055,7 @@ async def on_text(update, context):
                 m = re.match(r'^下注\s+(\d+)\s+(\d+)$', msg.text.strip())
             if not m:
                 return
-        horse_idx = int(m.group(1)) - 1
-        amt = int(m.group(2))
+        horse_idx = int(m.group(1)) - 1; amt = int(m.group(2))
         ok, desc = game.place_bet(user.id, horse_idx, amt)
         if not ok:
             await msg.reply_text(f"❌ {desc}")
@@ -1084,9 +1093,7 @@ async def on_text(update, context):
 # ---------- 主函数 ----------
 def main():
     TOKEN = os.environ.get("BOT_TOKEN")
-    if not TOKEN:
-        logger.error("未设置 BOT_TOKEN")
-        return
+    if not TOKEN: logger.error("未设置 BOT_TOKEN"); return
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("dz", cmd_dz))
