@@ -472,7 +472,6 @@ async def start_texas_timer(game, app):
                     pass
             if game.phase == 'showdown':
                 await finish_texas(game, app)
-                # 确保游戏被移除
                 active_games.pop(game.chat_id, None)
             else:
                 await update_texas_message(game, app)
@@ -481,11 +480,19 @@ async def start_texas_timer(game, app):
 
 async def finish_texas(game, app):
     game.cancel_timer()
+    # 删除操作消息
     if game.action_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.action_msg_id)
         except:
             pass
+    # 删除原有游戏消息（避免刷屏）
+    if game.game_msg_id:
+        try:
+            await app.bot.delete_message(game.chat_id, game.game_msg_id)
+        except:
+            pass
+
     result = game.showdown()
     if not result:
         return
@@ -544,10 +551,9 @@ async def finish_texas(game, app):
         f"派奖：\n" + "\n".join(prize_lines) + "\n\n"
         f"投入/盈亏：\n" + "\n".join(profit_lines) + broke_text
     )
-    try:
-        await app.bot.edit_message_text(chat_id=game.chat_id, message_id=game.game_msg_id, text=win_text)
-    except Exception as e:
-        logger.error(f"结算编辑失败: {e}")
+
+    # 发送新结算消息，不自动删除
+    await app.bot.send_message(chat_id=game.chat_id, text=win_text)
 
 # ---------- 全局管理 ----------
 active_games = {}
@@ -600,11 +606,12 @@ async def end_game(update, context):
             await context.bot.delete_message(chat_id, game.action_msg_id)
         except:
             pass
+    if game.game_msg_id:
+        try:
+            await context.bot.delete_message(chat_id, game.game_msg_id)
+        except:
+            pass
     await update.message.reply_text("游戏已被手动终止。")
-    try:
-        await context.bot.edit_message_text(chat_id=chat_id, message_id=game.game_msg_id, text="游戏已被手动终止。")
-    except:
-        pass
 
 async def add_chips(update, context):
     if not await check_auth(update, context): return
