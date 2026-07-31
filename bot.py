@@ -29,10 +29,10 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 999]
-RACE_AUTO_START = 60           # 开赛倒计时（秒）
-RACE_UPDATE_INTERVAL = 10      # 下注阶段更新间隔（秒）
-RACE_ANIMATION_INTERVAL = 1.5  # 动画更新间隔（秒）
-RACE_TRACK_LENGTH = 20         # 赛道长度
+RACE_AUTO_START = 60
+RACE_UPDATE_INTERVAL = 10
+RACE_ANIMATION_INTERVAL = 1.5
+RACE_TRACK_LENGTH = 20
 
 # ---------- 牌型中英文映射 ----------
 HAND_NAME_CN = {
@@ -44,7 +44,6 @@ HAND_NAME_CN = {
 # ---------- 内存存储 ----------
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
-
 race_history = defaultdict(list)
 race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
 
@@ -227,7 +226,8 @@ class PokerGame:
         if uid in self.all_in: return False, "已全下，无法行动"
 
         if action == 'fold':
-            self.folded.add(uid); self.active_players.remove(uid)
+            self.folded.add(uid)
+            self.active_players.remove(uid)
             if self.actor_idx >= len(self.active_players): self.actor_idx = 0
             desc = "弃牌"
         elif action == 'check':
@@ -237,15 +237,22 @@ class PokerGame:
         elif action == 'call':
             call_amt = self.current_bet - self.round_bets[uid]
             actual = min(call_amt, self.chips[uid])
-            self.chips[uid] -= actual; self.round_bets[uid] += actual; self.pot += actual; self.total_bet[uid] += actual
+            self.chips[uid] -= actual
+            self.round_bets[uid] += actual
+            self.pot += actual
+            self.total_bet[uid] += actual
             if self.chips[uid] == 0: self.all_in.add(uid)
             self.acted_this_round.add(uid)
             desc = f"跟注 {actual}"
         elif action == 'allin':
             total = self.chips[uid]
-            self.chips[uid] = 0; self.round_bets[uid] += total; self.pot += total; self.total_bet[uid] += total
+            self.chips[uid] = 0
+            self.round_bets[uid] += total
+            self.pot += total
+            self.total_bet[uid] += total
             if total > self.current_bet: self.current_bet = self.round_bets[uid]
-            self.all_in.add(uid); self.acted_this_round.add(uid)
+            self.all_in.add(uid)
+            self.acted_this_round.add(uid)
             desc = f"全下 {total}"
         elif action == 'raise':
             call_amt = self.current_bet - self.round_bets[uid]
@@ -254,9 +261,13 @@ class PokerGame:
             new_total = self.round_bets[uid] + total_raise
             if new_total <= self.current_bet: return False, f"加注后总额必须大于当前下注 {self.current_bet}"
             if new_total - self.current_bet < FIXED_MIN_RAISE: return False, f"最小加注为 {FIXED_MIN_RAISE}"
-            self.chips[uid] -= total_raise; self.round_bets[uid] += total_raise; self.pot += total_raise; self.total_bet[uid] += total_raise
+            self.chips[uid] -= total_raise
+            self.round_bets[uid] += total_raise
+            self.pot += total_raise
+            self.total_bet[uid] += total_raise
             self.current_bet = new_total
-            self.acted_this_round = {uid}; self.last_aggressor = uid
+            self.acted_this_round = {uid}
+            self.last_aggressor = uid
             desc = f"加注 {total_raise}"
         else: return False, "未知操作"
 
@@ -272,20 +283,26 @@ class PokerGame:
 
     def _end_round(self):
         for uid in self.round_bets: self.round_bets[uid] = 0
-        self.current_bet = 0; self.acted_this_round.clear()
+        self.current_bet = 0
+        self.acted_this_round.clear()
         if self.phase == 'preflop':
-            self.phase = 'flop'; self.board.extend([self.deck.pop() for _ in range(3)])
+            self.phase = 'flop'
+            self.board.extend([self.deck.pop() for _ in range(3)])
         elif self.phase == 'flop':
-            self.phase = 'turn'; self.board.append(self.deck.pop())
+            self.phase = 'turn'
+            self.board.append(self.deck.pop())
         elif self.phase == 'turn':
-            self.phase = 'river'; self.board.append(self.deck.pop())
+            self.phase = 'river'
+            self.board.append(self.deck.pop())
         elif self.phase == 'river':
-            self.phase = 'showdown'; return
+            self.phase = 'showdown'
+            return
         start_idx = (self.dealer_idx + 1) % len(self.players)
         for i in range(len(self.players)):
             uid = self.players[(start_idx + i) % len(self.players)]
             if uid in self.active_players and uid not in self.folded:
-                self.actor_idx = self.active_players.index(uid); break
+                self.actor_idx = self.active_players.index(uid)
+                break
 
     def showdown(self):
         while len(self.board) < 5:
@@ -301,10 +318,13 @@ class PokerGame:
                 uid = self.players[(self.dealer_idx + i) % len(self.players)]
                 if uid in alive: start = uid; break
             if start is None: start = alive[0]
-        idx = alive.index(start); self.showdown_order = alive[idx:] + alive[:idx]
+        idx = alive.index(start)
+        self.showdown_order = alive[idx:] + alive[:idx]
         if len(alive) == 1:
-            winner = alive[0]; pot_amount = self.pot
-            self.chips[winner] += pot_amount; self.pot = 0
+            winner = alive[0]
+            pot_amount = self.pot
+            self.chips[winner] += pot_amount
+            self.pot = 0
             self._save_chips()
             return [(winner, "最后赢家", pot_amount, {})]
         scores, hand_types = {}, {}
@@ -315,12 +335,16 @@ class PokerGame:
             rank_class = self.evaluator.get_rank_class(score)
             hand_en = self.evaluator.class_to_string(rank_class)
             hand_types[uid] = HAND_NAME_CN.get(hand_en, hand_en)
-        best = min(scores.values()); overall_winners = {uid for uid in alive if scores[uid] == best}
+        best = min(scores.values())
+        overall_winners = {uid for uid in alive if scores[uid] == best}
         all_bets = {uid: self.total_bet[uid] for uid in self.players}
-        layers = compute_side_pots(all_bets); dist = distribute_side_pots(layers, scores)
+        layers = compute_side_pots(all_bets)
+        dist = distribute_side_pots(layers, scores)
         for uid in alive: self.chips[uid] += dist[uid]; self.pot -= dist[uid]
         if self.pot > 0:
-            first = next(iter(overall_winners)); self.chips[first] += self.pot; dist[first] += self.pot
+            first = next(iter(overall_winners))
+            self.chips[first] += self.pot
+            dist[first] += self.pot
             self.pot = 0
         self._save_chips()
         desc_en = self.evaluator.class_to_string(self.evaluator.get_rank_class(best))
@@ -329,8 +353,10 @@ class PokerGame:
 
     def _save_chips(self):
         for uid in self.chips: group_chips[self.chat_id][uid] = self.chips[uid]
+
     def cancel_timer(self):
         if self.turn_task: self.turn_task.cancel(); self.turn_task = None
+
     def cancel_auto_start(self):
         if self.auto_start_task: self.auto_start_task.cancel(); self.auto_start_task = None
 
@@ -504,10 +530,17 @@ async def settle_game(game, app):
 # ==================== 赛马 ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id):
-        self.chat_id = chat_id; self.owner_id = owner_id
-        self.bets = {}; self.total_bets = [0] * HORSE_COUNT; self.pool = 0
-        self.phase = 'betting'; self.game_msg_id = None; self.create_time = datetime.now()
-        self.update_task = None; self.positions = [0] * HORSE_COUNT; self.arrival_order = []
+        self.chat_id = chat_id
+        self.owner_id = owner_id
+        self.bets = {}
+        self.total_bets = [0] * HORSE_COUNT
+        self.pool = 0
+        self.phase = 'betting'
+        self.game_msg_id = None
+        self.create_time = datetime.now()
+        self.update_task = None
+        self.positions = [0] * HORSE_COUNT
+        self.arrival_order = []
         self.app = None
 
     def set_app(self, app):
@@ -522,7 +555,8 @@ class HorseRace:
         group_chips[self.chat_id][user_id] -= amount
         if user_id not in self.bets: self.bets[user_id] = {}
         self.bets[user_id][horse_idx] = self.bets[user_id].get(horse_idx, 0) + amount
-        self.total_bets[horse_idx] += amount; self.pool += amount
+        self.total_bets[horse_idx] += amount
+        self.pool += amount
         return True, f"成功下注 {amount} 筹码于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}"
 
     def get_odds(self):
@@ -533,13 +567,17 @@ class HorseRace:
         return odds
 
     def get_win_rate(self):
-        stats = race_daily_stats[self.chat_id]; total_wins = sum(stats)
+        stats = race_daily_stats[self.chat_id]
+        total_wins = sum(stats)
         if total_wins == 0: return [0.25] * HORSE_COUNT
         return [s / total_wins for s in stats]
 
     def start_race(self):
         if self.phase != 'betting': return False
-        self.phase = 'racing'; self.winner = -1; self.positions = [0] * HORSE_COUNT; self.arrival_order = []
+        self.phase = 'racing'
+        self.winner = -1
+        self.positions = [0] * HORSE_COUNT
+        self.arrival_order = []
         self.cancel_update_task()
         self.update_task = asyncio.create_task(self._run_animation())
         return True
@@ -560,7 +598,8 @@ class HorseRace:
             if len(self.arrival_order) == HORSE_COUNT:
                 self.winner = self.arrival_order[0]
                 race_daily_stats[self.chat_id][self.winner] += 1
-                history = race_history[self.chat_id]; history.append(self.winner)
+                history = race_history[self.chat_id]
+                history.append(self.winner)
                 if len(history) > 10: race_history[self.chat_id] = history[-10:]
                 self.phase = 'finished'
                 return
@@ -570,7 +609,8 @@ class HorseRace:
         race_id = self.create_time.strftime("%Y%m%d-%H%M")
         lines = [f"🏇 {race_id} 实况", "━" * 20]
         for i in range(HORSE_COUNT):
-            pos = self.positions[i]; track = '━' * pos + HORSE_EMOJI[i] + '━' * (RACE_TRACK_LENGTH - pos)
+            pos = self.positions[i]
+            track = '━' * pos + HORSE_EMOJI[i] + '━' * (RACE_TRACK_LENGTH - pos)
             lines.append(f"🏁{track}")
         lines.append("━" * 20)
         if self.arrival_order:
@@ -580,7 +620,8 @@ class HorseRace:
 
     def payout(self):
         if self.phase != 'finished': return None
-        total_win_bets = self.total_bets[self.winner]; pool = self.pool
+        total_win_bets = self.total_bets[self.winner]
+        pool = self.pool
         if total_win_bets == 0:
             for uid, bets_per_user in self.bets.items():
                 total_user_bet = sum(bets_per_user.values())
@@ -589,8 +630,10 @@ class HorseRace:
         payouts = []
         for uid, bets_per_user in self.bets.items():
             if self.winner in bets_per_user:
-                user_win_bet = bets_per_user[self.winner]; share = pool * (user_win_bet / total_win_bets)
-                group_chips[self.chat_id][uid] += int(share); payouts.append((uid, int(share), user_win_bet))
+                user_win_bet = bets_per_user[self.winner]
+                share = pool * (user_win_bet / total_win_bets)
+                group_chips[self.chat_id][uid] += int(share)
+                payouts.append((uid, int(share), user_win_bet))
         return {'winner': self.winner, 'winner_name': HORSE_NAMES[self.winner], 'total_pool': pool, 'win_bets': total_win_bets, 'payouts': payouts, 'refund': False}
 
     def cancel_update_task(self):
@@ -598,22 +641,35 @@ class HorseRace:
 
 # ---------- 赛马界面 ----------
 def build_race_view(race):
-    now = datetime.now(); elapsed = (now - race.create_time).total_seconds(); remaining = max(0, RACE_AUTO_START - elapsed)
-    minutes = int(remaining // 60); seconds = int(remaining % 60); race_id = race.create_time.strftime("%Y%m%d-%H%M")
-    odds = race.get_odds(); win_rates = race.get_win_rate()
-    history = race_history.get(race.chat_id, [])[-10:]; daily_stats = race_daily_stats[race.chat_id]; total_wins = sum(daily_stats) or 1
+    now = datetime.now()
+    elapsed = (now - race.create_time).total_seconds()
+    remaining = max(0, RACE_AUTO_START - elapsed)
+    minutes = int(remaining // 60)
+    seconds = int(remaining % 60)
+    race_id = race.create_time.strftime("%Y%m%d-%H%M")
+    odds = race.get_odds()
+    win_rates = race.get_win_rate()
+    history = race_history.get(race.chat_id, [])[-10:]
+    daily_stats = race_daily_stats[race.chat_id]
+    total_wins = sum(daily_stats) or 1
     lines = [f"🏇 赛马大赛 {race_id} 🏇", "━" * 20]
-    lines.append(f"🏁{'━'*10}🐎"); lines.append(f"🏁{'━'*10}🐴"); lines.append(f"🏁{'━'*10}🦄"); lines.append(f"🏁{'━'*10}🦓")
+    lines.append(f"🏁{'━'*10}🐎")
+    lines.append(f"🏁{'━'*10}🐴")
+    lines.append(f"🏁{'━'*10}🦄")
+    lines.append(f"🏁{'━'*10}🦓")
     lines.append("━" * 20)
     if history: lines.append(f"📊 路书\n最近10场: {''.join([HORSE_EMOJI[i] for i in history])}")
     win_rate_lines = []
     for i in range(HORSE_COUNT):
-        wins = daily_stats[i]; rate = (wins / total_wins * 100) if total_wins > 0 else 0
+        wins = daily_stats[i]
+        rate = (wins / total_wins * 100) if total_wins > 0 else 0
         win_rate_lines.append(f"  {HORSE_EMOJI[i]} {wins}胜 | {rate:.0f}%")
     lines.append("当日胜率:\n" + "\n".join(win_rate_lines))
     lines.append("📊 当前投注情况:")
     for i in range(HORSE_COUNT):
-        bet = race.total_bets[i]; odd = odds[i]; odd_str = f"{odd:.2f}x" if odd != float('inf') else "∞"
+        bet = race.total_bets[i]
+        odd = odds[i]
+        odd_str = f"{odd:.2f}x" if odd != float('inf') else "∞"
         rate = win_rates[i] * 100
         lines.append(f"{HORSE_EMOJI[i]} {HORSE_NAMES[i]}: 胜率{rate:.0f}% | {bet}积分 | 赔率 {odd_str}")
     if race.phase == 'betting':
@@ -637,7 +693,8 @@ async def start_race_updates(race, app):
     race.set_app(app)
     async def update_loop():
         while race.phase == 'betting':
-            elapsed = (datetime.now() - race.create_time).total_seconds(); remaining = RACE_AUTO_START - elapsed
+            elapsed = (datetime.now() - race.create_time).total_seconds()
+            remaining = RACE_AUTO_START - elapsed
             if remaining <= 0:
                 if race.start_race():
                     asyncio.create_task(wait_and_settle(race, app, race.chat_id))
@@ -778,7 +835,9 @@ async def cmd_qxshouquan(update, context):
 
 # ---------- 按钮回调 ----------
 async def on_button(update, context):
-    q = update.callback_query; data = q.data; chat_id = q.message.chat.id
+    q = update.callback_query
+    data = q.data
+    chat_id = q.message.chat.id
     if not is_auth(chat_id): await q.answer("未授权", show_alert=True); return
     game = active_games.get(chat_id)
     if not game: await q.edit_message_text("游戏不存在"); return
@@ -834,15 +893,20 @@ async def poker_button(update, context, game, q, data):
 
 # ---------- 赛马按钮 ----------
 async def horse_button(update, context, race, q, data):
-    await q.answer(); user = q.from_user
+    await q.answer()
+    user = q.from_user
     if race.phase != 'betting': await q.answer("当前不是下注阶段", show_alert=True); return
     if data.startswith('horsebet_'):
-        _, horse_idx_str, amt_str = data.split('_'); horse_idx = int(horse_idx_str); amt = int(amt_str)
+        _, horse_idx_str, amt_str = data.split('_')
+        horse_idx = int(horse_idx_str)
+        amt = int(amt_str)
         ok, msg = race.place_bet(user.id, horse_idx, amt)
         if not ok: await q.answer(msg, show_alert=True); return
-        view = build_race_view(race); await q.edit_message_text(view, reply_markup=get_race_buttons())
+        view = build_race_view(race)
+        await q.edit_message_text(view, reply_markup=get_race_buttons())
         await action_notify(race.chat_id, context.application, user.id, f"下注 {amt} 于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
-    elif data == 'horse_custom': await q.answer("请回复此消息输入“下注 马号 金额”", show_alert=True)
+    elif data == 'horse_custom':
+        await q.answer("请回复此消息输入“下注 马号 金额”", show_alert=True)
     elif data == 'horse_start':
         if user.id != race.owner_id: await q.answer("只有发起人可以开始比赛", show_alert=True); return
         race.set_app(context.application)
@@ -853,35 +917,57 @@ async def horse_button(update, context, race, q, data):
 
 # ---------- 文字命令 ----------
 async def on_text(update, context):
-    msg = update.effective_message; if not msg or not msg.text: return
-    user = update.effective_user; if user.is_bot: return
-    chat_id = update.effective_chat.id; game = active_games.get(chat_id)
+    msg = update.effective_message
+    if not msg or not msg.text:
+        return
+    user = update.effective_user
+    if user.is_bot:
+        return
+    chat_id = update.effective_chat.id
+    game = active_games.get(chat_id)
+
     if isinstance(game, HorseRace) and game.phase == 'betting':
         m = re.match(r'^下注\s+(\d+)\s+(\d+)$', msg.text.strip())
         if not m:
             if msg.reply_to_message and msg.reply_to_message.message_id == game.game_msg_id:
                 m = re.match(r'^下注\s+(\d+)\s+(\d+)$', msg.text.strip())
-            if not m: return
-        horse_idx = int(m.group(1)) - 1; amt = int(m.group(2))
+            if not m:
+                return
+        horse_idx = int(m.group(1)) - 1
+        amt = int(m.group(2))
         ok, desc = game.place_bet(user.id, horse_idx, amt)
-        if not ok: await msg.reply_text(f"❌ {desc}"); return
+        if not ok:
+            await msg.reply_text(f"❌ {desc}")
+            return
         await action_notify(chat_id, context.application, user.id, f"下注 {amt} 于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
         return
+
     if isinstance(game, PokerGame) and game.phase in ('preflop','flop','turn','river'):
-        if user.id != game.current_player(): return
+        if user.id != game.current_player():
+            return
         m = re.match(r'^加注\s*(\d+)$', msg.text.strip())
         if not m:
             if msg.reply_to_message and msg.reply_to_message.message_id == game.game_msg_id:
                 m = re.match(r'^加注\s*(\d+)$', msg.text.strip())
-            if not m: return
-        amt = int(m.group(1)); ok, desc = game.handle_action(user.id, 'raise', amount=amt)
-        if not ok: await msg.reply_text(f"❌ {desc}"); return
+            if not m:
+                return
+        amt = int(m.group(1))
+        ok, desc = game.handle_action(user.id, 'raise', amount=amt)
+        if not ok:
+            await msg.reply_text(f"❌ {desc}")
+            return
         if game.action_msg_id:
-            try: await context.bot.delete_message(chat_id, game.action_msg_id)
-            except: pass
+            try:
+                await context.bot.delete_message(chat_id, game.action_msg_id)
+            except:
+                pass
         await action_notify(chat_id, context.application, user.id, desc)
-        if game.phase == 'showdown': await settle_game(game, context.application); active_games.pop(chat_id, None); return
-        await update_table_msg(game, context.application); await start_turn_timer(game, context.application)
+        if game.phase == 'showdown':
+            await settle_game(game, context.application)
+            active_games.pop(chat_id, None)
+            return
+        await update_table_msg(game, context.application)
+        await start_turn_timer(game, context.application)
 
 # ---------- 主函数 ----------
 def main():
