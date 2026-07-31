@@ -30,10 +30,9 @@ HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
 RACE_AUTO_START = 60           # 开赛倒计时（秒）
-RACE_UPDATE_INTERVAL = 10      # 界面刷新间隔（秒），避免过快
+RACE_UPDATE_INTERVAL = 10      # 界面刷新间隔（秒）
 RACE_ANIMATION_INTERVAL = 1.5  # 动画更新间隔（秒）
-RACE_TRACK_LENGTH = 20         # 赛道长度
-INITIAL_WEIGHT = 1000          # 赔率计算中的初始权重（信任胜率的程度）
+RACE_TRACK_LENGTH = 14         # 赛道长度，适配手机屏幕
 
 # ---------- 牌型中英文映射 ----------
 HAND_NAME_CN = {
@@ -529,7 +528,7 @@ async def settle_game(game, app):
     )
     await app.bot.send_message(game.chat_id, win_text)
 
-# ==================== 赛马（优化赔率 + 10秒刷新） ====================
+# ==================== 赛马（赛道长度14） ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
@@ -549,9 +548,13 @@ class HorseRace:
         self.notified = set()
 
     def _generate_balanced_rates(self):
-        rates = [random.randint(10, 40) for _ in range(HORSE_COUNT)]
-        total = sum(rates)
-        return [r / total for r in rates]
+        min_rate = 0.18
+        max_rate = 0.35
+        while True:
+            rates = [random.uniform(min_rate, max_rate) for _ in range(HORSE_COUNT)]
+            total = sum(rates)
+            if 0.99 <= total <= 1.01:
+                return [r / total for r in rates]
 
     def set_app(self, app):
         self.app = app
@@ -575,23 +578,19 @@ class HorseRace:
         return True, f"成功下注 {amount} 筹码于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}"
 
     def get_odds(self):
-        """
-        改进赔率计算：结合固定胜率和市场下注。
-        后验概率 = (fixed_rate * INITIAL_WEIGHT + market_share * pool) / (INITIAL_WEIGHT + pool)
-        赔率 = 1 / 后验概率，限制在 1.5 ~ 8.0 之间。
-        """
         odds = []
-        total_bets_sum = self.pool
+        total_bets = self.pool
         for i in range(HORSE_COUNT):
-            rate = self.fixed_rates[i]
-            if rate <= 0: rate = 0.01
-            market_share = self.total_bets[i] / total_bets_sum if total_bets_sum > 0 else 0
-            # 后验概率 = 融合固定胜率和市场比例
-            posterior = (rate * INITIAL_WEIGHT + market_share * total_bets_sum) / (INITIAL_WEIGHT + total_bets_sum)
+            prior = self.fixed_rates[i]
+            if total_bets > 0:
+                likelihood = self.total_bets[i] / total_bets
+            else:
+                likelihood = 0.25
+            w = 1000.0
+            posterior = (prior * w + likelihood * total_bets) / (w + total_bets)
             if posterior <= 0: posterior = 0.01
             raw_odds = 1.0 / posterior
-            # 限制范围，避免过于极端
-            odds.append(max(1.5, min(raw_odds, 8.0)))
+            odds.append(max(1.6, min(raw_odds, 8.0)))
         return odds
 
     async def start_race(self):
@@ -818,14 +817,12 @@ def start_race_tasks(race, app):
     race.update_task = asyncio.create_task(_race_main_loop(race, app))
 
 async def _race_main_loop(race, app):
-    """每 RACE_UPDATE_INTERVAL 秒刷新界面，倒计时结束自动开赛，独立发送提醒"""
     try:
         while race.phase == 'betting':
             now = time.time()
             elapsed = now - race.create_time
             remaining = RACE_AUTO_START - elapsed
 
-            # 倒计时提醒（30/20/10秒各发一次）
             for threshold in [30, 20, 10]:
                 if remaining <= threshold and threshold not in race.notified:
                     race.notified.add(threshold)
