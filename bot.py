@@ -30,7 +30,7 @@ HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
 RACE_AUTO_START = 60           # 开赛倒计时（秒）
-RACE_UPDATE_INTERVAL = 1       # 界面每秒刷新一次（保证倒计时可见）
+RACE_UPDATE_INTERVAL = 2       # 界面每2秒刷新一次（避免限流）
 RACE_ANIMATION_INTERVAL = 1.5  # 动画更新间隔（秒）
 RACE_TRACK_LENGTH = 20         # 赛道长度
 
@@ -606,7 +606,7 @@ class HorseRace:
             # 发送动画消息
             msg = await self.app.bot.send_message(self.chat_id, "🏇 比赛开始！正在奔跑中……")
             self.animation_msg_id = msg.message_id
-            # 编辑原下注消息为“比赛进行中”，移除按钮
+            # 编辑原下注消息为"比赛进行中"，移除按钮
             try:
                 await self.app.bot.edit_message_text(
                     chat_id=self.chat_id,
@@ -812,20 +812,34 @@ def get_race_buttons():
         for i in range(HORSE_COUNT):
             row.append(InlineKeyboardButton(f"{HORSE_EMOJI[i]} {amt}", callback_data=f"horsebet_{i}_{amt}"))
         btns.append(row)
-    btns.append([InlineKeyboardButton("🏁 开始比赛", callback_data="horse_start")])
+    # 已移除"开始比赛"按钮，倒计时归0自动开赛
     return InlineKeyboardMarkup(btns)
 
 # ---------- 赛马后台任务（每秒刷新界面并检查倒计时） ----------
-async def start_race_tasks(race, app):
+def start_race_tasks(race, app):
     race.set_app(app)
     race.update_task = asyncio.create_task(_race_main_loop(race, app))
 
 async def _race_main_loop(race, app):
     """每秒刷新下注界面，倒计时结束自动开赛"""
+    notified = set()  # 记录已推送过的提醒时间点
     try:
         while race.phase == 'betting':
             elapsed = time.time() - race.create_time
             remaining = RACE_AUTO_START - elapsed
+
+            # 倒计时提醒推送（30s / 20s / 10s）
+            for threshold in [30, 20, 10]:
+                if remaining <= threshold and threshold not in notified:
+                    notified.add(threshold)
+                    try:
+                        await app.bot.send_message(
+                            race.chat_id,
+                            f"⏰ 赛马大赛即将开始！还有 {threshold} 秒，抓紧下注！"
+                        )
+                    except:
+                        pass
+
             if remaining <= 0:
                 # 自动开赛
                 await race.start_race()
