@@ -101,10 +101,10 @@ class PokerGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.players = []            # 座位顺序
-        self.chips = {}              # 当前局筹码
-        self.initial_chips = {}      # 开局前筹码
-        self.total_bet = {}          # 本局总投入
+        self.players = []
+        self.chips = {}
+        self.initial_chips = {}
+        self.total_bet = {}
         self.hands = {}
         self.folded = set()
         self.all_in = set()
@@ -112,7 +112,7 @@ class PokerGame:
         self.board = []
         self.pot = 0
         self.phase = 'waiting'
-        self.active_players = []     # 未弃牌玩家（按座位顺序）
+        self.active_players = []
         self.actor_idx = 0
         self.current_bet = 0
         self.round_bets = {}
@@ -231,21 +231,24 @@ class PokerGame:
             self.acted_this_round.add(uid)
             desc = f"跟注 {actual}"
         elif action == 'raise':
-            if amount <= 0 or amount > self.chips[uid]:
-                return False, "无效加注额"
-            new_total = self.round_bets[uid] + amount
+            # amount 为用户希望额外加注的筹码数
+            call_amt = self.current_bet - self.round_bets[uid]  # 需要先跟注的筹码
+            total_raise = call_amt + amount                     # 总加注额 = 跟注部分 + 额外加注
+            if total_raise <= 0 or total_raise > self.chips[uid]:
+                return False, "筹码不足或无效加注额"
+            new_total = self.round_bets[uid] + total_raise      # 本轮总共投入
             if new_total <= self.current_bet:
-                return False, f"加注必须大于 {self.current_bet}"
+                return False, f"加注后总额必须大于当前下注 {self.current_bet}"
             if new_total - self.current_bet < FIXED_MIN_RAISE:
-                return False, f"最小加注 {FIXED_MIN_RAISE}"
-            self.chips[uid] -= amount
-            self.round_bets[uid] += amount
-            self.pot += amount
-            self.total_bet[uid] += amount
+                return False, f"最小加注为 {FIXED_MIN_RAISE}，请至少加注 {call_amt + FIXED_MIN_RAISE}"
+            self.chips[uid] -= total_raise
+            self.round_bets[uid] += total_raise
+            self.pot += total_raise
+            self.total_bet[uid] += total_raise
             self.current_bet = new_total
             self.acted_this_round = {uid}
             self.last_aggressor = uid
-            desc = f"加注 {amount}"
+            desc = f"加注 {total_raise}"
         else:
             return False, "未知操作"
 
@@ -292,7 +295,6 @@ class PokerGame:
     def showdown(self):
         alive = [p for p in self.active_players if p not in self.folded]
 
-        # 亮牌顺序
         if self.last_aggressor and self.last_aggressor in alive:
             start = self.last_aggressor
         else:
@@ -307,7 +309,6 @@ class PokerGame:
         idx = alive.index(start)
         self.showdown_order = alive[idx:] + alive[:idx]
 
-        # 唯一幸存者
         if len(alive) == 1:
             winner = alive[0]
             pot_amount = self.pot
@@ -316,7 +317,6 @@ class PokerGame:
             self._save_chips()
             return [(winner, "最后赢家", pot_amount, {})]
 
-        # 多人比牌
         scores = {}
         hand_types = {}
         for uid in alive:
@@ -333,16 +333,13 @@ class PokerGame:
         best = min(scores.values())
         overall_winners = {uid for uid in alive if scores[uid] == best}
 
-        # 边池分配（包含所有玩家投入）
         all_bets = {uid: self.total_bet[uid] for uid in self.players}
         layers = compute_side_pots(all_bets)
         dist = distribute_side_pots(layers, scores)
 
-        # 将分配金额从pot中转给玩家
         for uid in alive:
             self.chips[uid] += dist[uid]
             self.pot -= dist[uid]
-        # 如果有未分配完的pot（理论上不会），全部给赢家
         if self.pot > 0:
             first = next(iter(overall_winners))
             self.chips[first] += self.pot
@@ -484,6 +481,7 @@ def get_buttons(game, uid):
 
     if game.chips[uid] > to_call:
         raise_btns = []
+        # 最小加注按钮：显示需要额外加注的金额（即总加注额 - 已下注）
         needed = (game.current_bet + FIXED_MIN_RAISE) - game.round_bets.get(uid, 0)
         if needed > 0 and game.chips[uid] >= needed:
             raise_btns.append(InlineKeyboardButton(f"🔼 加注 {needed}", callback_data=f"raise_{needed}"))
@@ -545,7 +543,6 @@ async def settle_game(game, app):
         name = await get_name(app, wid)
         prize_lines.append(f"{name} +{amt}" if only_survivor else f"{name} +{amt} ({desc})")
 
-    # 投入/盈亏（包含边池返还后的净收益）
     profit_lines = []
     for uid in game.players:
         name = await get_name(app, uid)
@@ -739,13 +736,14 @@ async def on_button(update, context):
         elif data == 'call':
             ok, desc = game.handle_action(user.id, 'call')
         elif data.startswith('raise_'):
+            # 从按钮传来的 amount 是额外加注额
             try:
                 amt = int(data.split('_')[1])
                 ok, desc = game.handle_action(user.id, 'raise', amount=amt)
             except:
                 await q.answer("无效加注额", show_alert=True); return
         elif data == 'custom_raise':
-            await q.answer("请回复此消息输入“加注XXX”来下注", show_alert=True); return
+            await q.answer("请回复此消息输入“加注XXX”来额外加注", show_alert=True); return
         else:
             return
 
@@ -764,7 +762,7 @@ async def on_button(update, context):
         await update_table_msg(game, context.application)
         await start_turn_timer(game, context.application)
 
-# ---------- 文字加注 ----------
+# ---------- 文字加注（改进：amount 为额外加注） ----------
 async def on_text(update, context):
     msg = update.effective_message
     if not msg or not msg.text: return
