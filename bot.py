@@ -386,7 +386,7 @@ async def start_turn_timer(game, app):
             game.phase = 'showdown'
             await settle_game(game, app)
         return
-    if game.action_msg_id: 
+    if game.action_msg_id:
         try: await app.bot.delete_message(game.chat_id, game.action_msg_id)
         except: pass
         game.action_msg_id = None
@@ -399,7 +399,9 @@ async def start_turn_timer(game, app):
         if game.phase in ('preflop','flop','turn','river') and game.current_player() == uid:
             game.handle_action(uid, 'fold')
             await app.bot.send_message(game.chat_id, f"⏰ {await get_name(app, uid)} 超时未操作，自动弃牌")
-            if game.action_msg_id: await app.bot.delete_message(game.chat_id, game.action_msg_id)
+            if game.action_msg_id:
+                try: await app.bot.delete_message(game.chat_id, game.action_msg_id)
+                except: pass
             if game.phase == 'showdown': await settle_game(game, app)
             else: await update_table_msg(game, app); await start_turn_timer(game, app)
     game.turn_task = asyncio.create_task(timeout())
@@ -434,10 +436,12 @@ def get_buttons(game, uid):
 
 async def settle_game(game, app):
     game.cancel_timer(); game.cancel_auto_start()
-    if game.action_msg_id: try: await app.bot.delete_message(game.chat_id, game.action_msg_id)
-    except: pass
-    if game.game_msg_id: try: await app.bot.delete_message(game.chat_id, game.game_msg_id)
-    except: pass
+    if game.action_msg_id:
+        try: await app.bot.delete_message(game.chat_id, game.action_msg_id)
+        except: pass
+    if game.game_msg_id:
+        try: await app.bot.delete_message(game.chat_id, game.game_msg_id)
+        except: pass
     result = game.showdown()
     if not result: return
     hand_types = result[0][3] if len(result[0]) > 3 else {}
@@ -658,8 +662,9 @@ async def start_zjh_turn_timer(game, app):
         if game.phase == 'playing' and game.current_player_id() == uid:
             game.handle_action(uid, 'fold')
             await app.bot.send_message(game.chat_id, f"⏰ {await get_name(app, uid)} 超时未操作，自动弃牌")
-            if game.action_msg_id: try: await app.bot.delete_message(game.chat_id, game.action_msg_id)
-            except: pass
+            if game.action_msg_id:
+                try: await app.bot.delete_message(game.chat_id, game.action_msg_id)
+                except: pass
             if game.phase == 'showdown': await settle_zjh(game, app)
             else: await update_zjh_msg(game, app); await start_zjh_turn_timer(game, app)
     game.turn_task = asyncio.create_task(timeout())
@@ -678,8 +683,9 @@ async def update_zjh_msg(game, app):
 
 async def settle_zjh(game, app):
     game.cancel_timer()
-    if game.action_msg_id: try: await app.bot.delete_message(game.chat_id, game.action_msg_id)
-    except: pass
+    if game.action_msg_id:
+        try: await app.bot.delete_message(game.chat_id, game.action_msg_id)
+        except: pass
     result = game.showdown()
     if not result: return
     winner_id, _ = result[0]; name = await get_name(app, winner_id)
@@ -828,8 +834,9 @@ async def on_button(update, context):
                 await q.answer("请回复此消息输入“加注XXX”来额外加注", show_alert=True); return
             else: return
             if not ok: await q.answer(desc, show_alert=True); return
-            if game.action_msg_id: try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
-            except: pass
+            if game.action_msg_id:
+                try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
+                except: pass
             await action_notify(game.chat_id, context.application, user.id, desc)
             if game.phase == 'showdown':
                 await settle_game(game, context.application); active_games.pop(chat_id, None); return
@@ -863,23 +870,26 @@ async def on_button(update, context):
                 ok, info = game.handle_action(user.id, 'see')
                 if not ok: await q.answer(info, show_alert=True)
                 else:
-                    if game.action_msg_id: try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
-                    except: pass
+                    if game.action_msg_id:
+                        try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
+                        except: pass
                     await update_zjh_msg(game, context.application); await start_zjh_turn_timer(game, context.application)
             elif data == 'zjh_fold':
                 ok, info = game.handle_action(user.id, 'fold')
                 if not ok: await q.answer(info, show_alert=True)
                 else:
-                    if game.action_msg_id: try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
-                    except: pass
+                    if game.action_msg_id:
+                        try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
+                        except: pass
                     if game.phase == 'showdown': await settle_zjh(game, context.application); active_games.pop(game.chat_id, None); return
                     await update_zjh_msg(game, context.application); await start_zjh_turn_timer(game, context.application)
             elif data == 'zjh_call':
                 ok, info = game.handle_action(user.id, 'call')
                 if not ok: await q.answer(info, show_alert=True)
                 else:
-                    if game.action_msg_id: try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
-                    except: pass
+                    if game.action_msg_id:
+                        try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
+                        except: pass
                     if game.phase == 'showdown': await settle_zjh(game, context.application); active_games.pop(game.chat_id, None); return
                     await update_zjh_msg(game, context.application); await start_zjh_turn_timer(game, context.application)
             elif data == 'zjh_raise_menu':
@@ -898,8 +908,9 @@ async def on_button(update, context):
                 ok, info = game.handle_action(user.id, 'raise', amount=amt)
                 if not ok: await q.answer(info, show_alert=True)
                 else:
-                    if game.action_msg_id: try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
-                    except: pass
+                    if game.action_msg_id:
+                        try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
+                        except: pass
                     if game.phase == 'showdown': await settle_zjh(game, context.application); active_games.pop(game.chat_id, None); return
                     await update_zjh_msg(game, context.application); await start_zjh_turn_timer(game, context.application)
             elif data.startswith('zjh_compare_'):
@@ -908,8 +919,9 @@ async def on_button(update, context):
                 if not ok: await q.answer(info, show_alert=True)
                 else:
                     await q.answer(f"比牌结果：{await get_name(context.application, info)} 出局", show_alert=True)
-                    if game.action_msg_id: try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
-                    except: pass
+                    if game.action_msg_id:
+                        try: await context.bot.delete_message(game.chat_id, game.action_msg_id)
+                        except: pass
                     if game.phase == 'showdown': await settle_zjh(game, context.application); active_games.pop(game.chat_id, None); return
                     await update_zjh_msg(game, context.application); await start_zjh_turn_timer(game, context.application)
             elif data == 'zjh_cancel':
@@ -934,8 +946,9 @@ async def on_text(update, context):
             if not m: return
         amt = int(m.group(1)); ok, desc = game.handle_action(user.id, 'raise', amount=amt)
         if not ok: await msg.reply_text(f"❌ {desc}"); return
-        if game.action_msg_id: try: await context.bot.delete_message(chat_id, game.action_msg_id)
-        except: pass
+        if game.action_msg_id:
+            try: await context.bot.delete_message(chat_id, game.action_msg_id)
+            except: pass
         await action_notify(chat_id, context.application, user.id, desc)
         if game.phase == 'showdown': await settle_game(game, context.application); active_games.pop(chat_id, None); return
         await update_table_msg(game, context.application); await start_turn_timer(game, context.application)
