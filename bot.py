@@ -14,7 +14,7 @@ SMALL_BLIND = 100
 BIG_BLIND = 200
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
-AUTO_START_TIMEOUT = 60  # 自动开局倒计时
+AUTO_START_TIMEOUT = 60
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
 
@@ -52,25 +52,31 @@ async def get_name(app, user_id):
     except:
         return str(user_id)
 
-# ---------- 边池计算 ----------
-def compute_side_pots(players_total_bet):
-    if not players_total_bet: return []
-    sorted_bets = sorted(players_total_bet.items(), key=lambda x: x[1])
+# ---------- 边池计算（包含所有玩家，不只是存活玩家） ----------
+def compute_side_pots(all_players_total_bet):
+    """all_players_total_bet: 所有玩家（含弃牌）的投入字典 {uid: total_bet}"""
+    if not all_players_total_bet:
+        return []
+    sorted_bets = sorted(all_players_total_bet.items(), key=lambda x: x[1])
     layers = []
     prev = 0
     for uid, bet in sorted_bets:
         if bet > prev:
             layer_contribution = bet - prev
+            # 该层所有投入 >= bet 的玩家都有资格（包括弃牌玩家，但他们在分配时会被过滤）
             eligible = [u for u, b in sorted_bets if b >= bet]
             layers.append({'amount': layer_contribution * len(eligible), 'eligible': eligible})
             prev = bet
     return layers
 
 def distribute_side_pots(side_pots, scores, winners_set):
+    """scores: 存活玩家的手牌评分；只给存活玩家分配"""
     distribution = {uid: 0 for uid in scores}
     for layer in side_pots:
+        # 过滤出该层有资格且还在存活中的玩家
         eligible_scores = {uid: scores[uid] for uid in layer['eligible'] if uid in scores}
-        if not eligible_scores: continue
+        if not eligible_scores:
+            continue
         best_score = min(eligible_scores.values())
         layer_winners = [uid for uid, s in eligible_scores.items() if s == best_score]
         share = layer['amount'] // len(layer_winners)
@@ -99,10 +105,10 @@ class TexasGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.players = []
+        self.players = []          # 加入顺序（座位）
         self.chips = {}
         self.starting_chips_snapshot = {}
-        self.total_bet = {}
+        self.total_bet = {}        # 每个玩家的总投入
         self.hands = {}
         self.folded = set()
         self.all_in = set()
@@ -110,7 +116,7 @@ class TexasGame:
         self.board = []
         self.pot = 0
         self.phase = 'waiting'
-        self.players_in_hand = []
+        self.players_in_hand = []  # 未弃牌玩家（按座位顺序）
         self.actor_idx = 0
         self.current_bet = 0
         self.round_bets = {}
@@ -212,7 +218,6 @@ class TexasGame:
     def current_player_id(self):
         if not self.players_in_hand or self.actor_idx >= len(self.players_in_hand):
             return None
-        # 如果所有存活玩家都全下，则返回 None，表示无人可行动
         alive = [p for p in self.players_in_hand if p not in self.folded]
         if all(uid in self.all_in for uid in alive):
             return None
@@ -287,7 +292,7 @@ class TexasGame:
             return False, "未知操作"
 
         alive = [p for p in self.players_in_hand if p not in self.folded]
-        # 唯一幸存者或全员全下则进入摊牌
+        # 唯一幸存者或全员全下 -> 立即摊牌
         if len(alive) == 1 or all(uid in self.all_in for uid in alive):
             self.phase = 'showdown'
             return True, desc
@@ -319,7 +324,7 @@ class TexasGame:
             self.board.append(self.deck.pop())
         elif self.phase == 'river':
             self.phase = 'showdown'
-            return
+            return  # 河牌圈结束后直接进入摊牌，不设置下一个玩家
 
         # 非河牌圈，设置下一个行动玩家
         start_idx = (self.dealer_idx + 1) % len(self.players)
@@ -348,13 +353,16 @@ class TexasGame:
         start_index = alive.index(start_uid)
         self.showdown_order = alive[start_index:] + alive[:start_index]
 
+        # ---------- 修复：唯一幸存者时，先保存 pot 金额 ----------
         if len(alive) == 1:
             winner = alive[0]
+            pot_amount = self.pot          # 保存当前底池
             self.chips[winner] += self.pot
             self.pot = 0
             self._save_chips_to_memory()
-            return [(winner, "最后赢家", self.pot, {})]
+            return [(winner, "最后赢家", pot_amount, {})]
 
+        # ---------- 多人比牌 ----------
         scores = {}
         hand_types = {}
         for uid in alive:
@@ -372,16 +380,26 @@ class TexasGame:
 
         best_score = min(scores.values())
         overall_winners = {uid for uid in alive if scores[uid] == best_score}
-        total_bets = {uid: self.total_bet[uid] for uid in alive}
-        side_pots = compute_side_pots(total_bets)
+
+        # ---------- 修复：使用所有玩家（含弃牌）的投入计算边池 ----------
+        all_total_bets = {uid: self.total_bet[uid] for uid in self.players}
+        side_pots = compute_side_pots(all_total_bets)
         distribution = distribute_side_pots(side_pots, scores, overall_winners)
 
+        # 分配筹码（pot 中已经包含所有人的投入，这里直接把对应金额移给赢家）
         for uid in alive:
             self.chips[uid] += distribution[uid]
             self.pot -= distribution[uid]
-        self.pot = 0
+        # pot 应为 0，但以防有未分配的部分（极少情况），剩余的都给了 overall winner
+        if self.pot > 0:
+            first_winner = next(iter(overall_winners))
+            self.chips[first_winner] += self.pot
+            distribution[first_winner] += self.pot
+            self.pot = 0
+
         self._save_chips_to_memory()
 
+        # 返回中文描述
         desc_en = self.evaluator.class_to_string(self.evaluator.get_rank_class(best_score))
         desc_cn = HAND_NAME_CN.get(desc_en, desc_en)
         return [(uid, desc_cn, distribution[uid], hand_types) for uid in overall_winners]
@@ -474,13 +492,10 @@ async def start_texas_timer(game, app):
     game.cancel_timer()
     uid = game.current_player_id()
     if not uid:
-        # 无当前玩家，如果已进入摊牌则直接结算
         if game.phase == 'showdown':
             await finish_texas(game, app)
-            active_games.pop(game.chat_id, None)
         return
 
-    # 清理旧操作消息
     if game.action_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.action_msg_id)
@@ -510,7 +525,6 @@ async def start_texas_timer(game, app):
                     pass
             if game.phase == 'showdown':
                 await finish_texas(game, app)
-                active_games.pop(game.chat_id, None)
             else:
                 await update_texas_message(game, app)
                 await start_texas_timer(game, app)
@@ -828,7 +842,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await send_action_notification(chat_id, context.application, user.id, desc)
 
-    # 检查是否进入摊牌
     if game.phase == 'showdown':
         await finish_texas(game, context.application)
         active_games.pop(chat_id, None)
@@ -935,7 +948,6 @@ async def button_handler(update, context):
                 await query.answer(desc, show_alert=True)
                 return
 
-            # 删除当前操作消息
             if game.action_msg_id:
                 try:
                     await context.bot.delete_message(chat_id, game.action_msg_id)
@@ -945,7 +957,6 @@ async def button_handler(update, context):
 
             await send_action_notification(chat_id, context.application, user.id, desc)
 
-            # 行动后检查是否进入摊牌
             if game.phase == 'showdown':
                 await finish_texas(game, context.application)
                 active_games.pop(chat_id, None)
