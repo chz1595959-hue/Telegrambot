@@ -98,7 +98,7 @@ class TexasGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.players = []
+        self.players = []                 # 座位顺序（加入顺序）
         self.chips = {}
         self.starting_chips_snapshot = {}
         self.total_bet = {}
@@ -109,18 +109,19 @@ class TexasGame:
         self.board = []
         self.pot = 0
         self.phase = 'waiting'
-        self.players_in_hand = []
+        self.players_in_hand = []         # 当前未弃牌玩家（按座位顺序）
         self.actor_idx = 0
         self.current_bet = 0
         self.round_bets = {}
         self.min_raise = FIXED_MIN_RAISE
         self.acted_this_round = set()
-        self.last_aggressor = None
+        self.last_aggressor = None        # 最后一个加注的玩家
         self.dealer_idx = 0
         self.game_msg_id = None
         self.action_msg_id = None
         self.evaluator = Evaluator()
         self.turn_task = None
+        self.showdown_order = []          # 记录亮牌顺序
 
     def add_player(self, user_id):
         if user_id not in self.players and self.phase == 'waiting':
@@ -156,6 +157,8 @@ class TexasGame:
         self.players_in_hand = self.players.copy()
         self.actor_idx = (bb_idx + 1) % len(self.players)
         self.acted_this_round = set()
+        self.last_aggressor = None
+        self.showdown_order = []
         return True
 
     def _update_total_bet(self, uid, amount):
@@ -296,7 +299,6 @@ class TexasGame:
         self.current_bet = 0
         self.min_raise = FIXED_MIN_RAISE
         self.acted_this_round.clear()
-        self.last_aggressor = None
 
         if self.phase == 'preflop':
             self.phase = 'flop'
@@ -320,6 +322,27 @@ class TexasGame:
 
     def showdown(self):
         alive = [p for p in self.players_in_hand if p not in self.folded]
+        # ---------- 确定亮牌顺序 ----------
+        start_uid = None
+        if self.last_aggressor and self.last_aggressor in alive:
+            start_uid = self.last_aggressor
+        else:
+            # 庄家按钮左侧第一个未弃牌玩家
+            for i in range(1, len(self.players)):
+                idx = (self.dealer_idx + i) % len(self.players)
+                uid = self.players[idx]
+                if uid in alive:
+                    start_uid = uid
+                    break
+            if start_uid is None:
+                start_uid = alive[0]
+
+        # 按顺序排列 alive 列表（顺时针）
+        start_index = alive.index(start_uid)
+        order = alive[start_index:] + alive[:start_index]
+        self.showdown_order = order
+
+        # ---------- 比牌 ----------
         if len(alive) == 1:
             winner = alive[0]
             self.chips[winner] += self.pot
@@ -441,7 +464,6 @@ async def start_texas_timer(game, app):
     game.cancel_timer()
     uid = game.current_player_id()
     if not uid:
-        # 如果没有当前玩家，可能已经结束了，检查是否摊牌
         if game.phase == 'showdown':
             await finish_texas(game, app)
             active_games.pop(game.chat_id, None)
@@ -484,13 +506,12 @@ async def start_texas_timer(game, app):
 
 async def finish_texas(game, app):
     game.cancel_timer()
-    # 删除操作消息
+    # 删除操作消息和旧游戏消息
     if game.action_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.action_msg_id)
         except:
             pass
-    # 删除原有游戏消息
     if game.game_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.game_msg_id)
@@ -507,18 +528,17 @@ async def finish_texas(game, app):
     board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
     board_display = f"|--------------------+\n| {board_str}\n|--------------------+"
 
+    # 按亮牌顺序构建牌型展示
     card_lines = []
-    for uid in game.players:
-        name = await get_name(app, uid)
-        if uid in game.folded:
-            card_lines.append(f"{name}：弃牌")
-        elif uid in game.all_in:
-            hand = game.hands.get(uid, [])
-            hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
-            card_lines.append(f"{name}：{hand_str} (全下)")
-        else:
-            if only_survivor:
-                card_lines.append(f"{name}：未亮牌")
+    shown_uids = set()
+    if not only_survivor:
+        for uid in game.showdown_order:
+            shown_uids.add(uid)
+            name = await get_name(app, uid)
+            if uid in game.all_in:
+                hand = game.hands.get(uid, [])
+                hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
+                card_lines.append(f"{name}：{hand_str} (全下)")
             else:
                 hand = game.hands.get(uid, [])
                 hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
@@ -527,6 +547,18 @@ async def finish_texas(game, app):
                     card_lines.append(f"{name}：{hand_str} / {hand_cn}")
                 else:
                     card_lines.append(f"{name}：{hand_str}")
+    else:
+        # 唯一幸存者
+        uid = game.showdown_order[0] if game.showdown_order else result[0][0]
+        name = await get_name(app, uid)
+        card_lines.append(f"{name}：未亮牌")
+        shown_uids.add(uid)
+
+    # 弃牌玩家
+    for uid in game.players:
+        if uid in game.folded:
+            name = await get_name(app, uid)
+            card_lines.append(f"{name}：弃牌")
 
     total_pot = sum(game.total_bet.values())
     prize_lines = []
@@ -800,7 +832,7 @@ async def button_handler(update, context):
         await query.edit_message_text("游戏不存在。")
         return
 
-    # 如果游戏处于摊牌状态，直接结算并移除游戏
+    # 摊牌状态直接结算
     if game.phase == 'showdown':
         await finish_texas(game, context.application)
         active_games.pop(chat_id, None)
