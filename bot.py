@@ -17,9 +17,10 @@ FIXED_MIN_RAISE = 100
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
 
-# ---------- 牌型中英文映射 ----------
+# ---------- 牌型中英文映射（扩展） ----------
 HAND_NAME_CN = {
     "High Card": "高牌",
+    "Pair": "一对",
     "One Pair": "一对",
     "Two Pair": "两对",
     "Three of a Kind": "三条",
@@ -31,7 +32,7 @@ HAND_NAME_CN = {
     "Royal Flush": "皇家同花顺",
 }
 
-# ---------- 内存存储（重启丢失） ----------
+# ---------- 内存存储 ----------
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
 
@@ -117,7 +118,7 @@ class TexasGame:
         self.last_aggressor = None
         self.dealer_idx = 0
         self.game_msg_id = None
-        self.action_msg_id = None      # 操作按钮消息ID
+        self.action_msg_id = None
         self.evaluator = Evaluator()
         self.turn_task = None
 
@@ -332,13 +333,14 @@ class TexasGame:
             hand = self.hands[uid]
             if self.board:
                 score = self.evaluator.evaluate(hand, self.board)
-                scores[uid] = score
                 rank_class = self.evaluator.get_rank_class(score)
-                hand_types[uid] = self.evaluator.class_to_string(rank_class)
+                hand_en = self.evaluator.class_to_string(rank_class)
+                hand_types[uid] = HAND_NAME_CN.get(hand_en, hand_en)
             else:
                 score = self.evaluator.evaluate(hand, [])
                 rank_class = self.evaluator.get_rank_class(score)
-                hand_types[uid] = self.evaluator.class_to_string(rank_class)
+                hand_en = self.evaluator.class_to_string(rank_class)
+                hand_types[uid] = HAND_NAME_CN.get(hand_en, hand_en)
 
         best_score = min(scores.values())
         overall_winners = {uid for uid in alive if scores[uid] == best_score}
@@ -367,12 +369,7 @@ class TexasGame:
 
 # ---------- 界面构建 ----------
 async def build_action_text(game, app, uid):
-    """生成操作消息的文字部分，包含公牌、奖池、当前下注、玩家列表（带序号）"""
-    # 公牌
     board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
-    board_line = f"公牌: {board_str}"
-    
-    # 玩家列表（带序号、状态、投入）
     player_lines = []
     for idx, player_id in enumerate(game.players, 1):
         name = await get_name(app, player_id)
@@ -384,13 +381,12 @@ async def build_action_text(game, app, uid):
             status = "在局"
         invested = game.total_bet.get(player_id, 0)
         player_lines.append(f"{idx}. {name} {status} 投入:{invested}")
-    
-    # 当前玩家需跟注信息
+
     to_call = game.current_bet - game.round_bets[uid]
     if to_call < 0: to_call = 0
-    
+
     text = (
-        f"{board_line}\n"
+        f"公牌: {board_str}\n"
         f"奖池: {game.pot}  当前下注: {game.current_bet}\n"
         f"你需跟注: {to_call}\n\n"
         f"玩家:\n" + "\n".join(player_lines) + "\n\n"
@@ -399,7 +395,6 @@ async def build_action_text(game, app, uid):
     return text
 
 async def build_texas_text(game, app):
-    """主消息（无按钮）"""
     player_lines = []
     for idx, uid in enumerate(game.players, 1):
         name = await get_name(app, uid)
@@ -448,7 +443,6 @@ async def start_texas_timer(game, app):
     if not uid:
         return
 
-    # 删除旧的行动消息
     if game.action_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.action_msg_id)
@@ -456,7 +450,6 @@ async def start_texas_timer(game, app):
             pass
         game.action_msg_id = None
 
-    # 生成带状态的操作消息
     action_text = await build_action_text(game, app, uid)
     keyboard = game.get_buttons(uid)
     msg = await app.bot.send_message(
@@ -466,7 +459,6 @@ async def start_texas_timer(game, app):
     )
     game.action_msg_id = msg.message_id
 
-    # 超时计时
     async def timeout():
         await asyncio.sleep(TURN_TIMEOUT)
         if game.phase in ('preflop','flop','turn','river') and game.current_player_id() == uid:
@@ -487,7 +479,6 @@ async def start_texas_timer(game, app):
 
 async def finish_texas(game, app):
     game.cancel_timer()
-    # 删除操作消息
     if game.action_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.action_msg_id)
@@ -513,8 +504,7 @@ async def finish_texas(game, app):
         else:
             hand = game.hands.get(uid, [])
             hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
-            hand_en = hand_types.get(uid, "")
-            hand_cn = HAND_NAME_CN.get(hand_en, hand_en)
+            hand_cn = hand_types.get(uid, "")
             if hand_cn:
                 card_lines.append(f"{name}：{hand_str} / {hand_cn}")
             else:
@@ -760,7 +750,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"❌ {desc}")
         return
 
-    # 成功加注后，删除操作消息并推进回合
     if game.action_msg_id:
         try:
             await context.bot.delete_message(chat_id, game.action_msg_id)
@@ -791,7 +780,6 @@ async def button_handler(update, context):
         await query.edit_message_text("游戏不存在。")
         return
 
-    # 手牌弹窗
     if data == 'texas_hand':
         user = query.from_user
         if user.id in game.hands and user.id not in game.folded and game.phase != 'showdown':
@@ -806,7 +794,6 @@ async def button_handler(update, context):
     user = query.from_user
 
     if isinstance(game, TexasGame):
-        # 等待阶段
         if game.phase == 'waiting':
             if data == 'texas_join':
                 if game.add_player(user.id):
@@ -839,7 +826,6 @@ async def button_handler(update, context):
                     await query.edit_message_text("游戏开始失败")
             return
 
-        # 游戏进行中
         if game.phase in ('preflop','flop','turn','river'):
             if user.id != game.current_player_id():
                 await query.answer("还没轮到你", show_alert=True)
@@ -867,7 +853,6 @@ async def button_handler(update, context):
                 await query.answer(desc, show_alert=True)
                 return
 
-            # 删除当前操作消息
             if game.action_msg_id:
                 try:
                     await context.bot.delete_message(chat_id, game.action_msg_id)
