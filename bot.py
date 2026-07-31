@@ -18,8 +18,8 @@ DAILY_RESET_TIME = (0, 0)
 RESET_TO_CHIPS = 20000
 
 # ---------- 德州配置 ----------
-SMALL_BLIND = 100
-BIG_BLIND = 200
+SMALL_BLIND = 200
+BIG_BLIND = 500
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
 AUTO_START_TIMEOUT = 60
@@ -44,8 +44,8 @@ HAND_NAME_CN = {
 # ---------- 内存存储 ----------
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
-race_history = defaultdict(list)               # 最近10场结果（马索引）
-race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)  # 当日每匹马获胜次数
+race_history = defaultdict(list)
+race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
 
 # ---------- 卡牌美化 ----------
 def card_str(card_int):
@@ -569,8 +569,7 @@ class HorseRace:
     def get_win_rate(self):
         """基于当前投注占比的动态胜率"""
         total_bets = sum(self.total_bets)
-        if total_bets == 0:
-            return [0.25] * HORSE_COUNT
+        if total_bets == 0: return [0.25] * HORSE_COUNT
         return [bet / total_bets for bet in self.total_bets]
 
     def start_race(self):
@@ -603,6 +602,8 @@ class HorseRace:
                 history.append(self.winner)
                 if len(history) > 10: race_history[self.chat_id] = history[-10:]
                 self.phase = 'finished'
+                # 动画结束直接结算
+                asyncio.create_task(settle_race(self, self.app, self.chat_id))
                 return
             await asyncio.sleep(RACE_ANIMATION_INTERVAL)
 
@@ -611,9 +612,11 @@ class HorseRace:
         lines = [f"🏇 {race_id} 实况", "━" * 20]
         for i in range(HORSE_COUNT):
             pos = self.positions[i]
-            # 起点在左，终点在右：左边 pos 个横线，马，右边剩余横线
-            track = '━' * pos + HORSE_EMOJI[i] + '━' * (RACE_TRACK_LENGTH - pos)
-            lines.append(f"🏁{track}")
+            if pos < RACE_TRACK_LENGTH:
+                track = '━' * pos + HORSE_EMOJI[i] + '━' * (RACE_TRACK_LENGTH - pos - 1) + '🏁'
+            else:
+                track = '━' * RACE_TRACK_LENGTH + HORSE_EMOJI[i] + '🏁'
+            lines.append(track)
         lines.append("━" * 20)
         if self.arrival_order:
             arrived = [f"{HORSE_EMOJI[i]}{HORSE_NAMES[i]}" for i in self.arrival_order]
@@ -650,21 +653,20 @@ def build_race_view(race):
     seconds = int(remaining % 60)
     race_id = race.create_time.strftime("%Y%m%d-%H%M")
     odds = race.get_odds()
-    market_rates = race.get_win_rate()   # 基于投注的动态胜率
+    market_rates = race.get_win_rate()
     history = race_history.get(race.chat_id, [])[-10:]
     daily_stats = race_daily_stats[race.chat_id]
     total_wins = sum(daily_stats) or 1
 
     lines = [f"🏇 赛马大赛 {race_id} 🏇", "━" * 20]
-    # 马匹起点展示（都在最左侧）
+    # 马匹起点展示（都在最左侧，终点在右）
     for emoji in HORSE_EMOJI:
-        lines.append(f"🏁{emoji}{'━' * RACE_TRACK_LENGTH}")
+        lines.append(f"{emoji}{'━' * (RACE_TRACK_LENGTH - 1)}🏁")
     lines.append("━" * 20)
 
     if history:
         lines.append(f"📊 路书\n最近10场: {''.join([HORSE_EMOJI[i] for i in history])}")
 
-    # 历史胜率（基于实际结果）
     hist_lines = []
     for i in range(HORSE_COUNT):
         wins = daily_stats[i]
@@ -708,7 +710,8 @@ async def start_race_updates(race, app):
             remaining = RACE_AUTO_START - elapsed
             if remaining <= 0:
                 if race.start_race():
-                    asyncio.create_task(wait_and_settle(race, app, race.chat_id))
+                    # 动画结束会自动结算，无需额外等待
+                    pass
                 return
             view = build_race_view(race)
             try:
@@ -717,12 +720,6 @@ async def start_race_updates(race, app):
                 pass
             await asyncio.sleep(RACE_UPDATE_INTERVAL)
     race.update_task = asyncio.create_task(update_loop())
-
-async def wait_and_settle(race, app, chat_id):
-    while race.phase == 'racing':
-        await asyncio.sleep(1)
-    await settle_race(race, app, chat_id)
-    active_games.pop(chat_id, None)
 
 async def settle_race(race, app, chat_id):
     race.cancel_update_task()
@@ -750,6 +747,8 @@ async def settle_race(race, app, chat_id):
             name = await get_name(app, uid)
             lines.append(f"{name}: 投注{bet} → 获得{share} (+{share - bet})")
     await app.bot.send_message(chat_id, "\n".join(lines))
+    # 移除游戏
+    active_games.pop(chat_id, None)
 
 # ---------- 全局游戏管理 ----------
 active_games = {}
@@ -925,7 +924,7 @@ async def horse_button(update, context, race, q, data):
         if user.id != race.owner_id: await q.answer("只有发起人可以开始比赛", show_alert=True); return
         race.set_app(context.application)
         if race.start_race():
-            asyncio.create_task(wait_and_settle(race, context.application, race.chat_id))
+            # 动画会自动结算，无需额外操作
             await q.answer("比赛开始！", show_alert=False)
         else: await q.answer("比赛无法开始", show_alert=True)
 
