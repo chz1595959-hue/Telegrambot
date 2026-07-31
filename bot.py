@@ -67,13 +67,14 @@ def compute_side_pots(all_bets):
             prev = bet
     return layers
 
-def distribute_side_pots(layers, alive_scores, overall_winners):
+def distribute_side_pots(layers, alive_scores):
     dist = {uid: 0 for uid in alive_scores}
     for layer in layers:
-        eligible = {uid: alive_scores[uid] for uid in layer['eligible'] if uid in alive_scores}
-        if not eligible: continue
-        best = min(eligible.values())
-        winners = [uid for uid, s in eligible.items() if s == best]
+        eligible_scores = {uid: alive_scores[uid] for uid in layer['eligible'] if uid in alive_scores}
+        if not eligible_scores:
+            continue
+        best = min(eligible_scores.values())
+        winners = [uid for uid, s in eligible_scores.items() if s == best]
         share = layer['amount'] // len(winners)
         rem = layer['amount'] % len(winners)
         for uid in winners:
@@ -100,10 +101,10 @@ class PokerGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.players = []
-        self.chips = {}
-        self.initial_chips = {}
-        self.total_bet = {}
+        self.players = []            # 座位顺序
+        self.chips = {}              # 当前局筹码
+        self.initial_chips = {}      # 开局前筹码
+        self.total_bet = {}          # 本局总投入
         self.hands = {}
         self.folded = set()
         self.all_in = set()
@@ -111,7 +112,7 @@ class PokerGame:
         self.board = []
         self.pot = 0
         self.phase = 'waiting'
-        self.active_players = []
+        self.active_players = []     # 未弃牌玩家（按座位顺序）
         self.actor_idx = 0
         self.current_bet = 0
         self.round_bets = {}
@@ -291,6 +292,7 @@ class PokerGame:
     def showdown(self):
         alive = [p for p in self.active_players if p not in self.folded]
 
+        # 亮牌顺序
         if self.last_aggressor and self.last_aggressor in alive:
             start = self.last_aggressor
         else:
@@ -305,6 +307,7 @@ class PokerGame:
         idx = alive.index(start)
         self.showdown_order = alive[idx:] + alive[:idx]
 
+        # 唯一幸存者
         if len(alive) == 1:
             winner = alive[0]
             pot_amount = self.pot
@@ -313,6 +316,7 @@ class PokerGame:
             self._save_chips()
             return [(winner, "最后赢家", pot_amount, {})]
 
+        # 多人比牌
         scores = {}
         hand_types = {}
         for uid in alive:
@@ -329,13 +333,16 @@ class PokerGame:
         best = min(scores.values())
         overall_winners = {uid for uid in alive if scores[uid] == best}
 
+        # 边池分配（包含所有玩家投入）
         all_bets = {uid: self.total_bet[uid] for uid in self.players}
         layers = compute_side_pots(all_bets)
-        dist = distribute_side_pots(layers, scores, overall_winners)
+        dist = distribute_side_pots(layers, scores)
 
+        # 将分配金额从pot中转给玩家
         for uid in alive:
             self.chips[uid] += dist[uid]
             self.pot -= dist[uid]
+        # 如果有未分配完的pot（理论上不会），全部给赢家
         if self.pot > 0:
             first = next(iter(overall_winners))
             self.chips[first] += self.pot
@@ -538,6 +545,7 @@ async def settle_game(game, app):
         name = await get_name(app, wid)
         prize_lines.append(f"{name} +{amt}" if only_survivor else f"{name} +{amt} ({desc})")
 
+    # 投入/盈亏（包含边池返还后的净收益）
     profit_lines = []
     for uid in game.players:
         name = await get_name(app, uid)
