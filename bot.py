@@ -18,8 +18,8 @@ DAILY_RESET_TIME = (0, 0)
 RESET_TO_CHIPS = 20000
 
 # ---------- 德州配置 ----------
-SMALL_BLIND = 200
-BIG_BLIND = 500
+SMALL_BLIND = 100
+BIG_BLIND = 200
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
 AUTO_START_TIMEOUT = 60
@@ -28,11 +28,11 @@ AUTO_START_TIMEOUT = 60
 HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
-FIXED_BET_AMOUNTS = [100, 200, 500, 999]
-RACE_AUTO_START = 60
-RACE_UPDATE_INTERVAL = 10
-RACE_ANIMATION_INTERVAL = 1.5
-RACE_TRACK_LENGTH = 20
+FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
+RACE_AUTO_START = 60           # 开赛倒计时（秒）
+RACE_UPDATE_INTERVAL = 10      # 下注阶段更新间隔（秒）
+RACE_ANIMATION_INTERVAL = 1.5  # 动画更新间隔（秒）
+RACE_TRACK_LENGTH = 20         # 赛道长度（横线数量）
 
 # ---------- 牌型中英文映射 ----------
 HAND_NAME_CN = {
@@ -44,8 +44,8 @@ HAND_NAME_CN = {
 # ---------- 内存存储 ----------
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
-race_history = defaultdict(list)
-race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
+race_history = defaultdict(list)               # 最近10场结果（马索引）
+race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)  # 当日每匹马获胜次数
 
 # ---------- 卡牌美化 ----------
 def card_str(card_int):
@@ -567,10 +567,11 @@ class HorseRace:
         return odds
 
     def get_win_rate(self):
-        stats = race_daily_stats[self.chat_id]
-        total_wins = sum(stats)
-        if total_wins == 0: return [0.25] * HORSE_COUNT
-        return [s / total_wins for s in stats]
+        """基于当前投注占比的动态胜率"""
+        total_bets = sum(self.total_bets)
+        if total_bets == 0:
+            return [0.25] * HORSE_COUNT
+        return [bet / total_bets for bet in self.total_bets]
 
     def start_race(self):
         if self.phase != 'betting': return False
@@ -610,6 +611,7 @@ class HorseRace:
         lines = [f"🏇 {race_id} 实况", "━" * 20]
         for i in range(HORSE_COUNT):
             pos = self.positions[i]
+            # 起点在左，终点在右：左边 pos 个横线，马，右边剩余横线
             track = '━' * pos + HORSE_EMOJI[i] + '━' * (RACE_TRACK_LENGTH - pos)
             lines.append(f"🏁{track}")
         lines.append("━" * 20)
@@ -648,33 +650,41 @@ def build_race_view(race):
     seconds = int(remaining % 60)
     race_id = race.create_time.strftime("%Y%m%d-%H%M")
     odds = race.get_odds()
-    win_rates = race.get_win_rate()
+    market_rates = race.get_win_rate()   # 基于投注的动态胜率
     history = race_history.get(race.chat_id, [])[-10:]
     daily_stats = race_daily_stats[race.chat_id]
     total_wins = sum(daily_stats) or 1
+
     lines = [f"🏇 赛马大赛 {race_id} 🏇", "━" * 20]
-    lines.append(f"🏁{'━'*10}🐎")
-    lines.append(f"🏁{'━'*10}🐴")
-    lines.append(f"🏁{'━'*10}🦄")
-    lines.append(f"🏁{'━'*10}🦓")
+    # 马匹起点展示（都在最左侧）
+    for emoji in HORSE_EMOJI:
+        lines.append(f"🏁{emoji}{'━' * RACE_TRACK_LENGTH}")
     lines.append("━" * 20)
-    if history: lines.append(f"📊 路书\n最近10场: {''.join([HORSE_EMOJI[i] for i in history])}")
-    win_rate_lines = []
+
+    if history:
+        lines.append(f"📊 路书\n最近10场: {''.join([HORSE_EMOJI[i] for i in history])}")
+
+    # 历史胜率（基于实际结果）
+    hist_lines = []
     for i in range(HORSE_COUNT):
         wins = daily_stats[i]
         rate = (wins / total_wins * 100) if total_wins > 0 else 0
-        win_rate_lines.append(f"  {HORSE_EMOJI[i]} {wins}胜 | {rate:.0f}%")
-    lines.append("当日胜率:\n" + "\n".join(win_rate_lines))
-    lines.append("📊 当前投注情况:")
+        hist_lines.append(f"  {HORSE_EMOJI[i]} {wins}胜 | {rate:.0f}%")
+    lines.append("📜 历史胜率:\n" + "\n".join(hist_lines))
+
+    lines.append("📊 当前投注情况 (市场胜率):")
     for i in range(HORSE_COUNT):
         bet = race.total_bets[i]
         odd = odds[i]
         odd_str = f"{odd:.2f}x" if odd != float('inf') else "∞"
-        rate = win_rates[i] * 100
-        lines.append(f"{HORSE_EMOJI[i]} {HORSE_NAMES[i]}: 胜率{rate:.0f}% | {bet}积分 | 赔率 {odd_str}")
+        rate = market_rates[i] * 100
+        lines.append(f"{HORSE_EMOJI[i]} {HORSE_NAMES[i]}: 市场胜率{rate:.0f}% | {bet}积分 | 赔率 {odd_str}")
+
     if race.phase == 'betting':
-        if remaining > 0: lines.append(f"\n⏰ 距离开赛还有 {minutes} 分 {seconds} 秒")
-        else: lines.append("\n⏰ 即将开赛...")
+        if remaining > 0:
+            lines.append(f"\n⏰ 距离开赛还有 {minutes} 分 {seconds} 秒")
+        else:
+            lines.append("\n⏰ 即将开赛...")
         lines.append("🔒 开赛后无法投注")
     return "\n".join(lines)
 
@@ -682,7 +692,8 @@ def get_race_buttons():
     btns = []
     for amt in FIXED_BET_AMOUNTS:
         row = []
-        for i in range(HORSE_COUNT): row.append(InlineKeyboardButton(f"{HORSE_EMOJI[i]} {amt}", callback_data=f"horsebet_{i}_{amt}"))
+        for i in range(HORSE_COUNT):
+            row.append(InlineKeyboardButton(f"{HORSE_EMOJI[i]} {amt}", callback_data=f"horsebet_{i}_{amt}"))
         btns.append(row)
     btns.append([InlineKeyboardButton("✏️ 自定义下注", callback_data="horse_custom")])
     btns.append([InlineKeyboardButton("🏁 开始比赛", callback_data="horse_start")])
@@ -726,10 +737,13 @@ async def settle_race(race, app, chat_id):
     order = race.arrival_order if race.arrival_order else sorted(range(HORSE_COUNT), key=lambda i: race.total_bets[i], reverse=True)
     medals = ["🥇", "🥈", "🥉"]
     for idx, horse_idx in enumerate(order):
-        if idx < 3: lines.append(f"{medals[idx]} {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
-        else: lines.append(f"{idx+1}️⃣ {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
+        if idx < 3:
+            lines.append(f"{medals[idx]} {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
+        else:
+            lines.append(f"{idx+1}️⃣ {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
     lines.append("")
-    if result['refund']: lines.append("无人押中，所有下注已退还。")
+    if result['refund']:
+        lines.append("无人押中，所有下注已退还。")
     else:
         lines.append("💰 获胜玩家:")
         for uid, share, bet in result['payouts']:
