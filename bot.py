@@ -325,6 +325,7 @@ class TexasGame:
             self.chips[winner] += self.pot
             self.pot = 0
             self._save_chips_to_memory()
+            # 唯一幸存者，手牌保密
             return [(winner, "最后赢家", self.pot, {})]
 
         scores = {}
@@ -486,7 +487,7 @@ async def finish_texas(game, app):
             await app.bot.delete_message(game.chat_id, game.action_msg_id)
         except:
             pass
-    # 删除原有游戏消息（避免刷屏）
+    # 删除原有游戏消息
     if game.game_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.game_msg_id)
@@ -497,6 +498,9 @@ async def finish_texas(game, app):
     if not result:
         return
     hand_types = result[0][3] if len(result[0]) > 3 else {}
+
+    # 判断是否唯一幸存者（全员弃牌）
+    only_survivor = (len(result) == 1 and result[0][1] == "最后赢家")
 
     board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
     board_display = f"|--------------------+\n| {board_str}\n|--------------------+"
@@ -511,19 +515,27 @@ async def finish_texas(game, app):
             hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
             card_lines.append(f"{name}：{hand_str} (全下)")
         else:
-            hand = game.hands.get(uid, [])
-            hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
-            hand_cn = hand_types.get(uid, "")
-            if hand_cn:
-                card_lines.append(f"{name}：{hand_str} / {hand_cn}")
+            if only_survivor:
+                # 唯一幸存者，手牌保密
+                card_lines.append(f"{name}：未亮牌")
             else:
-                card_lines.append(f"{name}：{hand_str}")
+                hand = game.hands.get(uid, [])
+                hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
+                hand_cn = hand_types.get(uid, "")
+                if hand_cn:
+                    card_lines.append(f"{name}：{hand_str} / {hand_cn}")
+                else:
+                    card_lines.append(f"{name}：{hand_str}")
 
     total_pot = sum(game.total_bet.values())
     prize_lines = []
     for wid, desc_cn, amount, _ in result:
         name = await get_name(app, wid)
-        prize_lines.append(f"{name} +{amount} ({desc_cn})")
+        if only_survivor:
+            # 唯一幸存者赢家，不显示牌型描述
+            prize_lines.append(f"{name} +{amount}")
+        else:
+            prize_lines.append(f"{name} +{amount} ({desc_cn})")
 
     profit_lines = []
     for uid in game.players:
@@ -789,13 +801,11 @@ async def button_handler(update, context):
         await query.edit_message_text("游戏不存在。")
         return
 
-    # 如果游戏已进入摊牌但未结算，主动结算
     if game.phase == 'showdown':
         await finish_texas(game, context.application)
         active_games.pop(chat_id, None)
         return
 
-    # 手牌弹窗
     if data == 'texas_hand':
         user = query.from_user
         if user.id in game.hands and user.id not in game.folded and game.phase != 'showdown':
