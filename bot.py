@@ -14,7 +14,6 @@ STARTING_CHIPS = 20000
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
 
-# 每日重置配置
 DAILY_RESET_TIME = (0, 0)
 RESET_TO_CHIPS = 20000
 
@@ -46,7 +45,6 @@ HAND_NAME_CN = {
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
 
-# 赛马统计
 race_history = defaultdict(list)
 race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
 
@@ -122,7 +120,7 @@ async def daily_reset_chips():
                 group_chips[chat_id][uid] = RESET_TO_CHIPS
         for chat_id in race_daily_stats:
             race_daily_stats[chat_id] = [0] * HORSE_COUNT
-        logger.info("每日筹码重置完成，赛马统计清零")
+        logger.info("每日筹码重置完成")
 
 # ==================== 德州扑克 ====================
 class PokerGame:
@@ -463,13 +461,17 @@ async def settle_game(game, app):
     win_text = f"积分德州已结算\n\n|- 积分德州牌桌\n\n|- 状态：摊牌\n\n|- 公牌：\n{board_display}\n\n|- 奖池：{total_pot}\n\n结果：摊牌结算\n\n牌型：\n" + "\n".join(card_lines) + f"\n\n派奖：\n" + "\n".join(prize_lines) + f"\n\n投入/盈亏：\n" + "\n".join(profit_lines) + broke_text
     await app.bot.send_message(game.chat_id, win_text)
 
-# ==================== 赛马（完整优化版） ====================
+# ==================== 赛马 ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id; self.owner_id = owner_id
         self.bets = {}; self.total_bets = [0] * HORSE_COUNT; self.pool = 0
         self.phase = 'betting'; self.game_msg_id = None; self.create_time = datetime.now()
         self.update_task = None; self.positions = [0] * HORSE_COUNT; self.arrival_order = []
+        self.app = None  # 将通过 set_app 设置
+
+    def set_app(self, app):
+        self.app = app
 
     def place_bet(self, user_id, horse_idx, amount):
         if self.phase != 'betting': return False, "当前不是下注阶段"
@@ -503,8 +505,7 @@ class HorseRace:
         return True
 
     async def _run_animation(self):
-        # 需要 app 实例，通过外部传入或全局变量，这里通过保存的 app 调用，但 HorseRace 没有 app 成员
-        # 我们将在 start_race 被调用时传入 app 并保存
+        if not self.app: return
         while self.phase == 'racing':
             for i in range(HORSE_COUNT):
                 if self.positions[i] < RACE_TRACK_LENGTH:
@@ -554,9 +555,6 @@ class HorseRace:
     def cancel_update_task(self):
         if self.update_task: self.update_task.cancel(); self.update_task = None
 
-    def set_app(self, app):
-        self.app = app
-
 # ---------- 赛马界面 ----------
 def build_race_view(race):
     now = datetime.now(); elapsed = (now - race.create_time).total_seconds(); remaining = max(0, RACE_AUTO_START - elapsed)
@@ -595,13 +593,13 @@ def get_race_buttons():
 
 async def start_race_updates(race, app):
     race.cancel_update_task()
+    race.set_app(app)  # 确保 app 已设置
     async def update_loop():
         while race.phase == 'betting':
             elapsed = (datetime.now() - race.create_time).total_seconds(); remaining = RACE_AUTO_START - elapsed
             if remaining <= 0:
                 if race.start_race():
-                    race.set_app(app)
-                    # 等待动画结束后结算
+                    # 动画已启动，等待结束后结算
                     asyncio.create_task(wait_and_settle(race, app, race.chat_id))
                 return
             view = build_race_view(race)
@@ -645,8 +643,9 @@ async def need_auth(update, context):
         await update.effective_message.reply_text("❌ 此群组未授权，请联系管理员。"); return False
     return True
 
+# ---------- 命令 ----------
 async def cmd_start(update, context):
-    await update.message.reply_text("使用 /DZ 开始德州扑克，/horse 开始赛马")
+    await update.message.reply_text("使用 /DZ 开始德州扑克，/SM 开始赛马")
 
 async def cmd_dz(update, context):
     if not await need_auth(update, context): return
@@ -662,7 +661,7 @@ async def cmd_dz(update, context):
     msg = await update.message.reply_text(f"🃏 新一局德州扑克！\n发起人: {await get_name(context.application, update.effective_user.id)}\n\n已加入玩家:\n" + "\n".join(plist) + "\n\n点击按钮加入或开始", reply_markup=InlineKeyboardMarkup(kb))
     game.game_msg_id = msg.message_id
 
-async def cmd_horse(update, context):
+async def cmd_sm(update, context):
     if not await need_auth(update, context): return
     chat_id = update.effective_chat.id
     if chat_id in active_games and active_games[chat_id].phase not in ('finished', 'waiting'):
@@ -795,9 +794,8 @@ async def horse_button(update, context, race, q, data):
     elif data == 'horse_custom': await q.answer("请回复此消息输入“下注 马号 金额”", show_alert=True)
     elif data == 'horse_start':
         if user.id != race.owner_id: await q.answer("只有发起人可以开始比赛", show_alert=True); return
-        race.set_app(context.application)  # 传递 app 给动画
+        race.set_app(context.application)  # 确保 app 已设置
         if race.start_race():
-            # 动画已启动，等待结束
             asyncio.create_task(wait_and_settle(race, context.application, race.chat_id))
             await q.answer("比赛开始！", show_alert=False)
         else: await q.answer("比赛无法开始", show_alert=True)
@@ -814,7 +812,7 @@ async def on_text(update, context):
                 m = re.match(r'^下注\s+(\d+)\s+(\d+)$', msg.text.strip())
             if not m: return
         horse_idx = int(m.group(1)) - 1; amt = int(m.group(2))
-        ok, desc = race.place_bet(user.id, horse_idx, amt)
+        ok, desc = game.place_bet(user.id, horse_idx, amt)
         if not ok: await msg.reply_text(f"❌ {desc}"); return
         await action_notify(chat_id, context.application, user.id, f"下注 {amt} 于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
         return
@@ -839,7 +837,7 @@ def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("dz", cmd_dz))
-    app.add_handler(CommandHandler("horse", cmd_horse))
+    app.add_handler(CommandHandler("sm", cmd_sm))           # 赛马命令 /SM
     app.add_handler(CommandHandler("end", cmd_end))
     app.add_handler(CommandHandler("add", cmd_add))
     app.add_handler(CommandHandler("ph", cmd_ph))
