@@ -11,9 +11,10 @@ logger = logging.getLogger(__name__)
 
 # ---------- 配置 ----------
 STARTING_CHIPS = 10000
-SMALL_BLIND = 200
-BIG_BLIND = 300
+SMALL_BLIND = 100
+BIG_BLIND = 200
 TURN_TIMEOUT = 60
+FIXED_MIN_RAISE = 100           # 固定最小加注额
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
 
@@ -170,7 +171,7 @@ class TexasGame:
         self.actor_idx = 0
         self.current_bet = 0
         self.round_bets = {}
-        self.min_raise = BIG_BLIND
+        self.min_raise = FIXED_MIN_RAISE      # 固定最小加注
         self.acted_this_round = set()
         self.last_aggressor = None
         self.dealer_idx = 0
@@ -241,21 +242,15 @@ class TexasGame:
 
         buttons = [[InlineKeyboardButton("🂠 查看手牌", callback_data="texas_hand")], row1]
 
+        # 加注按钮：仅保留最小加注、全下、自定义加注（删除了半池、满池）
         if self.chips[uid] > to_call:
             raise_buttons = []
-            min_raise_total = self.current_bet + self.min_raise
-            min_needed = min_raise_total - self.round_bets[uid]
+            # 最小加注（固定100）
+            min_needed = (self.current_bet + FIXED_MIN_RAISE) - self.round_bets[uid]
             if self.chips[uid] >= min_needed:
-                raise_buttons.append(InlineKeyboardButton(f"🔼 加注至 {min_raise_total}", callback_data=f"texas_raise_{min_needed}"))
+                raise_buttons.append(InlineKeyboardButton(f"🔼 加注 100", callback_data=f"texas_raise_{min_needed}"))
 
-            half_pot = (self.pot + to_call) // 2 + to_call
-            if self.chips[uid] >= half_pot and half_pot > to_call:
-                raise_buttons.append(InlineKeyboardButton(f"半池 {half_pot}", callback_data=f"texas_raise_{half_pot}"))
-
-            full_pot = self.pot + to_call * 2
-            if self.chips[uid] >= full_pot and full_pot > to_call:
-                raise_buttons.append(InlineKeyboardButton(f"满池 {full_pot}", callback_data=f"texas_raise_{full_pot}"))
-
+            # 全下
             all_in = self.chips[uid]
             if all_in > to_call:
                 raise_buttons.append(InlineKeyboardButton(f"🔥 全下 {all_in}", callback_data=f"texas_raise_{all_in}"))
@@ -324,14 +319,16 @@ class TexasGame:
             new_total = self.round_bets[uid] + needed
             if new_total <= self.current_bet:
                 return False, f"加注必须大于当前下注 ({self.current_bet})"
-            if new_total - self.current_bet < self.min_raise:
-                return False, f"最小加注为 {self.min_raise}"
+            # 使用固定最小加注检查
+            if new_total - self.current_bet < FIXED_MIN_RAISE:
+                return False, f"最小加注为 {FIXED_MIN_RAISE}"
             self.chips[uid] -= needed
             self.round_bets[uid] += needed
             self.pot += needed
             self._update_total_bet(uid, needed)
             self.current_bet = new_total
-            self.min_raise = new_total - (self.current_bet - self.min_raise)
+            # 简化：最小加注始终保持固定值，不动态变化
+            self.min_raise = FIXED_MIN_RAISE
             if self.chips[uid] == 0:
                 self.all_in.add(uid)
             self.acted_this_round = {uid}
@@ -358,7 +355,7 @@ class TexasGame:
         for uid in self.round_bets:
             self.round_bets[uid] = 0
         self.current_bet = 0
-        self.min_raise = BIG_BLIND
+        self.min_raise = FIXED_MIN_RAISE
         self.acted_this_round.clear()
         self.last_aggressor = None
 
@@ -390,7 +387,7 @@ class TexasGame:
             self.pot = 0
             for uid in self.chips:
                 self.chips_dict[uid] = self.chips[uid]
-            return [(winner, "最后存活", self.pot)]
+            return [(winner, "最后赢家", self.pot)]   # 改称最后赢家
 
         scores = {}
         for uid in alive:
@@ -473,6 +470,11 @@ async def start_texas_timer(game, app):
     game.cancel_timer()
     uid = game.current_player_id()
     if not uid: return
+
+    # 轮到玩家时主动发送提示消息
+    name = await get_name(app, uid)
+    await send_action_notification(game.chat_id, app, uid, "请行动")
+
     async def timeout():
         await asyncio.sleep(TURN_TIMEOUT)
         if game.phase in ('preflop','flop','turn','river') and game.current_player_id() == uid:
