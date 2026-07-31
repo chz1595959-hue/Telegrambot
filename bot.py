@@ -98,7 +98,7 @@ class TexasGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.players = []                 # 座位顺序（加入顺序）
+        self.players = []
         self.chips = {}
         self.starting_chips_snapshot = {}
         self.total_bet = {}
@@ -109,19 +109,19 @@ class TexasGame:
         self.board = []
         self.pot = 0
         self.phase = 'waiting'
-        self.players_in_hand = []         # 当前未弃牌玩家（按座位顺序）
+        self.players_in_hand = []
         self.actor_idx = 0
         self.current_bet = 0
         self.round_bets = {}
         self.min_raise = FIXED_MIN_RAISE
         self.acted_this_round = set()
-        self.last_aggressor = None        # 最后一个加注的玩家
+        self.last_aggressor = None
         self.dealer_idx = 0
         self.game_msg_id = None
         self.action_msg_id = None
         self.evaluator = Evaluator()
         self.turn_task = None
-        self.showdown_order = []          # 记录亮牌顺序
+        self.showdown_order = []
 
     def add_player(self, user_id):
         if user_id not in self.players and self.phase == 'waiting':
@@ -322,12 +322,12 @@ class TexasGame:
 
     def showdown(self):
         alive = [p for p in self.players_in_hand if p not in self.folded]
-        # ---------- 确定亮牌顺序 ----------
-        start_uid = None
+
+        # 确定亮牌顺序
         if self.last_aggressor and self.last_aggressor in alive:
             start_uid = self.last_aggressor
         else:
-            # 庄家按钮左侧第一个未弃牌玩家
+            start_uid = None
             for i in range(1, len(self.players)):
                 idx = (self.dealer_idx + i) % len(self.players)
                 uid = self.players[idx]
@@ -336,13 +336,9 @@ class TexasGame:
                     break
             if start_uid is None:
                 start_uid = alive[0]
-
-        # 按顺序排列 alive 列表（顺时针）
         start_index = alive.index(start_uid)
-        order = alive[start_index:] + alive[:start_index]
-        self.showdown_order = order
+        self.showdown_order = alive[start_index:] + alive[:start_index]
 
-        # ---------- 比牌 ----------
         if len(alive) == 1:
             winner = alive[0]
             self.chips[winner] += self.pot
@@ -506,7 +502,6 @@ async def start_texas_timer(game, app):
 
 async def finish_texas(game, app):
     game.cancel_timer()
-    # 删除操作消息和旧游戏消息
     if game.action_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.action_msg_id)
@@ -528,12 +523,9 @@ async def finish_texas(game, app):
     board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
     board_display = f"|--------------------+\n| {board_str}\n|--------------------+"
 
-    # 按亮牌顺序构建牌型展示
     card_lines = []
-    shown_uids = set()
     if not only_survivor:
         for uid in game.showdown_order:
-            shown_uids.add(uid)
             name = await get_name(app, uid)
             if uid in game.all_in:
                 hand = game.hands.get(uid, [])
@@ -548,13 +540,10 @@ async def finish_texas(game, app):
                 else:
                     card_lines.append(f"{name}：{hand_str}")
     else:
-        # 唯一幸存者
         uid = game.showdown_order[0] if game.showdown_order else result[0][0]
         name = await get_name(app, uid)
         card_lines.append(f"{name}：未亮牌")
-        shown_uids.add(uid)
 
-    # 弃牌玩家
     for uid in game.players:
         if uid in game.folded:
             name = await get_name(app, uid)
@@ -832,7 +821,7 @@ async def button_handler(update, context):
         await query.edit_message_text("游戏不存在。")
         return
 
-    # 摊牌状态直接结算
+    # 强制结算检查
     if game.phase == 'showdown':
         await finish_texas(game, context.application)
         active_games.pop(chat_id, None)
@@ -920,6 +909,7 @@ async def button_handler(update, context):
 
             await send_action_notification(chat_id, context.application, user.id, desc)
 
+            # 再次检查，如果行动后进入摊牌，直接结算
             if game.phase == 'showdown':
                 await finish_texas(game, context.application)
                 active_games.pop(chat_id, None)
