@@ -31,7 +31,7 @@ HAND_NAME_CN = {
     "Royal Flush": "皇家同花顺",
 }
 
-# ---------- 内存存储 ----------
+# ---------- 内存存储（重启丢失） ----------
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
 
@@ -117,7 +117,7 @@ class TexasGame:
         self.last_aggressor = None
         self.dealer_idx = 0
         self.game_msg_id = None
-        self.action_msg_id = None      # 新增加：当前操作按钮消息ID
+        self.action_msg_id = None      # 操作按钮消息ID
         self.evaluator = Evaluator()
         self.turn_task = None
 
@@ -366,7 +366,40 @@ class TexasGame:
             self.turn_task = None
 
 # ---------- 界面构建 ----------
+async def build_action_text(game, app, uid):
+    """生成操作消息的文字部分，包含公牌、奖池、当前下注、玩家列表（带序号）"""
+    # 公牌
+    board_str = " ".join(card_str(c) for c in game.board) if game.board else "无"
+    board_line = f"公牌: {board_str}"
+    
+    # 玩家列表（带序号、状态、投入）
+    player_lines = []
+    for idx, player_id in enumerate(game.players, 1):
+        name = await get_name(app, player_id)
+        if player_id in game.folded:
+            status = "弃牌"
+        elif player_id in game.all_in:
+            status = "全下"
+        else:
+            status = "在局"
+        invested = game.total_bet.get(player_id, 0)
+        player_lines.append(f"{idx}. {name} {status} 投入:{invested}")
+    
+    # 当前玩家需跟注信息
+    to_call = game.current_bet - game.round_bets[uid]
+    if to_call < 0: to_call = 0
+    
+    text = (
+        f"{board_line}\n"
+        f"奖池: {game.pot}  当前下注: {game.current_bet}\n"
+        f"你需跟注: {to_call}\n\n"
+        f"玩家:\n" + "\n".join(player_lines) + "\n\n"
+        f"轮到 {await get_name(app, uid)} 行动"
+    )
+    return text
+
 async def build_texas_text(game, app):
+    """主消息（无按钮）"""
     player_lines = []
     for idx, uid in enumerate(game.players, 1):
         name = await get_name(app, uid)
@@ -423,12 +456,12 @@ async def start_texas_timer(game, app):
             pass
         game.action_msg_id = None
 
-    # 发送新的行动消息，附带操作按钮
+    # 生成带状态的操作消息
+    action_text = await build_action_text(game, app, uid)
     keyboard = game.get_buttons(uid)
-    name = await get_name(app, uid)
     msg = await app.bot.send_message(
         chat_id=game.chat_id,
-        text=f"🎲 轮到 {name} 行动",
+        text=action_text,
         reply_markup=keyboard
     )
     game.action_msg_id = msg.message_id
@@ -454,7 +487,7 @@ async def start_texas_timer(game, app):
 
 async def finish_texas(game, app):
     game.cancel_timer()
-    # 删除行动消息
+    # 删除操作消息
     if game.action_msg_id:
         try:
             await app.bot.delete_message(game.chat_id, game.action_msg_id)
@@ -806,13 +839,11 @@ async def button_handler(update, context):
                     await query.edit_message_text("游戏开始失败")
             return
 
-        # 游戏进行中，所有操作都在 action_msg 上，但可能玩家从旧消息点了按钮，我们仍处理
+        # 游戏进行中
         if game.phase in ('preflop','flop','turn','river'):
             if user.id != game.current_player_id():
                 await query.answer("还没轮到你", show_alert=True)
                 return
-
-            # 根据回调数据处理
             if data == 'texas_fold':
                 success, desc = game.handle_action(user.id, 'fold')
             elif data == 'texas_check':
