@@ -37,12 +37,12 @@ HAND_NAME_CN = {
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
 
-# ---------- 卡牌美化（修正方括号问题，花色在前） ----------
+# ---------- 卡牌美化（花色在前） ----------
 def card_str(card_int):
-    raw = Card.int_to_pretty_str(card_int)      # 例如 "[K♦]"
-    inner = raw.strip('[]')                     # "K♦" 或 "10♦"
+    raw = Card.int_to_pretty_str(card_int)
+    inner = raw.strip('[]')
     suit_map = {'♠': '♠️', '♥': '♥️', '♦': '♦️', '♣': '♣️'}
-    rank = inner[:-1].replace('T', '10')        # 将 T 替换为 10（treys 内部用 T 表示10）
+    rank = inner[:-1].replace('T', '10')
     suit = inner[-1]
     return f"{suit_map.get(suit, suit)}{rank}"
 
@@ -100,10 +100,10 @@ class PokerGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.players = []            # 座位顺序
-        self.chips = {}              # 当前局筹码
-        self.initial_chips = {}      # 开局前筹码
-        self.total_bet = {}          # 本局总投入
+        self.players = []
+        self.chips = {}
+        self.initial_chips = {}
+        self.total_bet = {}
         self.hands = {}
         self.folded = set()
         self.all_in = set()
@@ -111,7 +111,7 @@ class PokerGame:
         self.board = []
         self.pot = 0
         self.phase = 'waiting'
-        self.active_players = []     # 未弃牌玩家（按座位顺序）
+        self.active_players = []
         self.actor_idx = 0
         self.current_bet = 0
         self.round_bets = {}
@@ -291,7 +291,6 @@ class PokerGame:
     def showdown(self):
         alive = [p for p in self.active_players if p not in self.folded]
 
-        # 亮牌顺序
         if self.last_aggressor and self.last_aggressor in alive:
             start = self.last_aggressor
         else:
@@ -306,7 +305,6 @@ class PokerGame:
         idx = alive.index(start)
         self.showdown_order = alive[idx:] + alive[:idx]
 
-        # 唯一幸存者
         if len(alive) == 1:
             winner = alive[0]
             pot_amount = self.pot
@@ -315,7 +313,6 @@ class PokerGame:
             self._save_chips()
             return [(winner, "最后赢家", pot_amount, {})]
 
-        # 多人比牌
         scores = {}
         hand_types = {}
         for uid in alive:
@@ -332,7 +329,6 @@ class PokerGame:
         best = min(scores.values())
         overall_winners = {uid for uid in alive if scores[uid] == best}
 
-        # 边池分配
         all_bets = {uid: self.total_bet[uid] for uid in self.players}
         layers = compute_side_pots(all_bets)
         dist = distribute_side_pots(layers, scores, overall_winners)
@@ -518,7 +514,11 @@ async def settle_game(game, app):
             if uid in game.all_in:
                 hand = game.hands.get(uid, [])
                 hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
-                card_lines.append(f"{name}：{hand_str} (全下)")
+                hand_cn = hand_types.get(uid, "")
+                if hand_cn:
+                    card_lines.append(f"{name}：{hand_str} / {hand_cn} (全下)")
+                else:
+                    card_lines.append(f"{name}：{hand_str} (全下)")
             else:
                 hand = game.hands.get(uid, [])
                 hand_str = " ".join(card_str(c) for c in hand) if hand else "无"
