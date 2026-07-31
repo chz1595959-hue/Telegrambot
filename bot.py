@@ -10,8 +10,8 @@ logger = logging.getLogger(__name__)
 
 # ---------- 配置 ----------
 STARTING_CHIPS = 10000
-SMALL_BLIND = 100
-BIG_BLIND = 200
+SMALL_BLIND = 200
+BIG_BLIND = 500
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
 AUTO_START_TIMEOUT = 60
@@ -53,7 +53,7 @@ async def get_name(app, user_id):
     except:
         return str(user_id)
 
-# ---------- 边池计算 ----------
+# ---------- 边池计算（包含所有玩家） ----------
 def compute_side_pots(all_bets):
     if not all_bets: return []
     sorted_bets = sorted(all_bets.items(), key=lambda x: x[1])
@@ -71,8 +71,7 @@ def distribute_side_pots(layers, alive_scores):
     dist = {uid: 0 for uid in alive_scores}
     for layer in layers:
         eligible_scores = {uid: alive_scores[uid] for uid in layer['eligible'] if uid in alive_scores}
-        if not eligible_scores:
-            continue
+        if not eligible_scores: continue
         best = min(eligible_scores.values())
         winners = [uid for uid, s in eligible_scores.items() if s == best]
         share = layer['amount'] // len(winners)
@@ -263,6 +262,7 @@ class PokerGame:
             return False, "未知操作"
 
         alive = [p for p in self.active_players if p not in self.folded]
+        # 唯一幸存者或全员全下 → 进入摊牌，但需要先补全公牌
         if len(alive) == 1 or all(p in self.all_in for p in alive):
             self.phase = 'showdown'
             return True, desc
@@ -303,8 +303,22 @@ class PokerGame:
                 break
 
     def showdown(self):
+        # 修复：如果公牌不足 5 张（例如翻牌前全下），自动补发直到 5 张
+        while len(self.board) < 5:
+            if len(self.board) == 0:
+                # 翻牌前：发三张
+                self.board.extend([self.deck.pop() for _ in range(3)])
+            elif len(self.board) == 3:
+                self.board.append(self.deck.pop())
+            elif len(self.board) == 4:
+                self.board.append(self.deck.pop())
+            else:
+                # 已经5张则退出
+                break
+
         alive = [p for p in self.active_players if p not in self.folded]
 
+        # 亮牌顺序
         if self.last_aggressor and self.last_aggressor in alive:
             start = self.last_aggressor
         else:
@@ -435,12 +449,10 @@ async def start_turn_timer(game, app):
     game.cancel_timer()
     uid = game.current_player()
     if not uid:
-        # 检查是否所有存活玩家都全下，如果是则结算
         alive = [p for p in game.active_players if p not in game.folded]
         if alive and all(p in game.all_in for p in alive):
             game.phase = 'showdown'
             await settle_game(game, app)
-        # 其他情况可能是没有玩家了（理论上不会）
         return
 
     if game.action_msg_id:
@@ -493,14 +505,11 @@ def get_buttons(game, uid):
 
     btns = [[InlineKeyboardButton("🂠 查看手牌", callback_data="hand")], row1]
 
-    # 加注与全下按钮
     if game.chips[uid] > 0:
-        # 最小加注按钮：额外加注100
         raise_extra = FIXED_MIN_RAISE
         total_need = to_call + raise_extra
         if game.chips[uid] >= total_need:
             btns.append([InlineKeyboardButton(f"🔼 加注 {raise_extra}", callback_data=f"raise_{raise_extra}")])
-        # 全下按钮
         btns.append([InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data="allin")])
         btns.append([InlineKeyboardButton("✏️ 自定义加注", callback_data="custom_raise")])
     return InlineKeyboardMarkup(btns)
@@ -590,7 +599,7 @@ async def need_auth(update, context):
     return True
 
 async def cmd_start(update, context):
-    await update.message.reply_text("使用 /DZ 开始德州扑克")
+    await update.message.reply_text("使用 /DZ 开始德州扑克，/horse 开始赛马")
 
 async def cmd_dz(update, context):
     if not await need_auth(update, context): return
