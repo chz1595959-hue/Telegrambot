@@ -231,7 +231,6 @@ class PokerGame:
             self.acted_this_round.add(uid)
             desc = f"跟注 {actual}"
         elif action == 'allin':
-            # 直接投入所有筹码
             total = self.chips[uid]
             self.chips[uid] = 0
             self.round_bets[uid] += total
@@ -243,7 +242,6 @@ class PokerGame:
             self.acted_this_round.add(uid)
             desc = f"全下 {total}"
         elif action == 'raise':
-            # amount 为额外加注额（不含跟注部分）
             call_amt = self.current_bet - self.round_bets[uid]
             total_raise = call_amt + amount
             if total_raise <= 0 or total_raise > self.chips[uid]:
@@ -437,8 +435,12 @@ async def start_turn_timer(game, app):
     game.cancel_timer()
     uid = game.current_player()
     if not uid:
-        if game.phase == 'showdown':
+        # 检查是否所有存活玩家都全下，如果是则结算
+        alive = [p for p in game.active_players if p not in game.folded]
+        if alive and all(p in game.all_in for p in alive):
+            game.phase = 'showdown'
             await settle_game(game, app)
+        # 其他情况可能是没有玩家了（理论上不会）
         return
 
     if game.action_msg_id:
@@ -491,16 +493,15 @@ def get_buttons(game, uid):
 
     btns = [[InlineKeyboardButton("🂠 查看手牌", callback_data="hand")], row1]
 
+    # 加注与全下按钮
     if game.chips[uid] > 0:
-        raise_btns = []
-        # 最小加注按钮（额外加注额 = 当前下注 + 最小加注 - 已下注）
-        needed = (game.current_bet + FIXED_MIN_RAISE) - game.round_bets.get(uid, 0)
-        if needed > 0 and game.chips[uid] >= needed:
-            raise_btns.append(InlineKeyboardButton(f"🔼 加注 {needed}", callback_data=f"raise_{needed}"))
-        # 全下按钮（独立动作）
-        raise_btns.append(InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data="allin"))
-        for i in range(0, len(raise_btns), 2):
-            btns.append(raise_btns[i:i+2])
+        # 最小加注按钮：额外加注100
+        raise_extra = FIXED_MIN_RAISE
+        total_need = to_call + raise_extra
+        if game.chips[uid] >= total_need:
+            btns.append([InlineKeyboardButton(f"🔼 加注 {raise_extra}", callback_data=f"raise_{raise_extra}")])
+        # 全下按钮
+        btns.append([InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data="allin")])
         btns.append([InlineKeyboardButton("✏️ 自定义加注", callback_data="custom_raise")])
     return InlineKeyboardMarkup(btns)
 
