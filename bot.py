@@ -32,7 +32,7 @@ HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
 RACE_AUTO_START = 9 * 60 + 50       # 下注阶段总时长 = 590秒 = 9分50秒
-RACE_UPDATE_INTERVAL = 35           # 界面刷新间隔（秒），降低频率避免卡顿
+RACE_UPDATE_INTERVAL = 35           # 界面刷新间隔（秒），平衡响应与限频
 RACE_ANIMATION_INTERVAL = 1.5       # 动画更新间隔（秒）
 RACE_TRACK_LENGTH = 14              # 赛道长度
 
@@ -49,7 +49,7 @@ AUTHORIZED_GROUPS = set()
 race_history = defaultdict(list)
 race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
 horse_profit = defaultdict(lambda: defaultdict(int))
-poker_profit = defaultdict(lambda: defaultdict(int))   # 德州全局盈亏
+poker_profit = defaultdict(lambda: defaultdict(int))
 race_jackpot = defaultdict(int)
 hourly_race_enabled = defaultdict(lambda: False)
 
@@ -119,7 +119,7 @@ async def auto_delete(message, delay):
     except:
         pass
 
-# ---------- 每日筹码重置（不足2w补足）----------
+# ---------- 每日筹码重置 ----------
 async def daily_reset_chips():
     while True:
         now = datetime.now()
@@ -167,7 +167,7 @@ async def daily_leaderboard_scheduler(app):
         horse_profit.clear()
         logger.info("每日排行榜发送完成")
 
-# ==================== 德州扑克 ====================
+# ==================== 德州扑克（完整） ====================
 class PokerGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
@@ -581,12 +581,11 @@ async def settle_game(game, app):
         f"\n\n派奖：\n" + "\n".join(prize_lines) + f"\n\n投入/盈亏：\n" + "\n".join(profit_lines) + broke_text
     )
     await app.bot.send_message(game.chat_id, win_text)
-    # 记录德州盈亏到全局
     for uid, net in profits.items():
         poker_profit[game.chat_id][uid] += net
     active_poker_games.pop(game.chat_id, None)
 
-# ==================== 赛马 ====================
+# ==================== 赛马（完整） ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
