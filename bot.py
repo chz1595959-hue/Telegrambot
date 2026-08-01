@@ -514,11 +514,12 @@ async def settle_poker(game, app):
                 else:
                     lines.extend([f"{names[uid]}：{'  '.join(card_str(card) for card in game.hands[uid])}｜{hand_types.get(uid, '')}", ""])
         else:
-            # 其余玩家弃牌时，仅显示弃牌者；赢家不亮牌。
+            # 其余玩家弃牌时，保留牌型区但不公开赢家手牌。
+            lines.append("亮牌牌型：")
             for uid in game.players:
-                if uid in game.folded:
-                    lines.extend([f"{names[uid]}：弃牌", ""])
-            lines.extend(["其余玩家弃牌，剩余玩家直接赢得底池。", ""])
+                status = "弃牌" if uid in game.folded else "未亮牌"
+                lines.append(f"{names[uid]}：{status}")
+            lines.append("")
         lines.append("派奖：")
         for uid, hand, amount, details, _ in sorted(result, key=lambda item: item[2], reverse=True):
             lines.extend([f"{names[uid]}：{hand}｜+{amount}（{'，'.join(f'{pool}+{value}' for pool, value in details)}）", ""])
