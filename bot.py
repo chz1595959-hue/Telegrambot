@@ -519,7 +519,6 @@ async def settle_poker(game, app):
                 if uid in game.folded:
                     lines.extend([f"{names[uid]}：弃牌", ""])
             lines.extend(["其余玩家弃牌，剩余玩家直接赢得底池。", ""])
-    lines.append("")
         lines.append("派奖：")
         for uid, hand, amount, details, _ in sorted(result, key=lambda item: item[2], reverse=True):
             lines.extend([f"{names[uid]}：{hand}｜+{amount}（{'，'.join(f'{pool}+{value}' for pool, value in details)}）", ""])
