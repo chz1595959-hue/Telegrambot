@@ -41,8 +41,11 @@ group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 AUTHORIZED_GROUPS = set()
 race_history = defaultdict(list)
 race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
-# profit_by_date[业务日期][群ID][用户ID] = 德州 + 赛马合并盈亏
+# profit_by_date[业务日期][群ID][用户ID] = 德州 + 赛马合并盈亏（供 /cx 与每日综合榜使用）
 profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+# 以下两份统计仅供各自游戏的局内“当日累计盈利榜”使用。
+poker_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+race_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 race_jackpot = defaultdict(int)
 hourly_race_enabled = defaultdict(lambda: False)
 daily_emergency_used = defaultdict(lambda: defaultdict(bool))
@@ -74,6 +77,8 @@ def save_data():
             data = {
                 "group_chips": {str(cid): dict(users) for cid, users in group_chips.items()},
                 "profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in profit_by_date.items()},
+                "poker_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in poker_profit_by_date.items()},
+                "race_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in race_profit_by_date.items()},
                 "authorized_groups": list(AUTHORIZED_GROUPS),
                 "race_jackpot": {str(cid): value for cid, value in race_jackpot.items()},
                 "hourly_race_enabled": {str(cid): value for cid, value in hourly_race_enabled.items()},
@@ -112,6 +117,8 @@ def load_data():
     try:
         restore_nested(group_chips, data.get("group_chips", {}))
         for date, chats in data.get("profit_by_date", {}).items(): restore_nested(profit_by_date[date], chats)
+        for date, chats in data.get("poker_profit_by_date", {}).items(): restore_nested(poker_profit_by_date[date], chats)
+        for date, chats in data.get("race_profit_by_date", {}).items(): restore_nested(race_profit_by_date[date], chats)
         AUTHORIZED_GROUPS.update(int(cid) for cid in data.get("authorized_groups", []))
         for cid, value in data.get("race_jackpot", {}).items(): race_jackpot[int(cid)] = int(value)
         for cid, value in data.get("hourly_race_enabled", {}).items(): hourly_race_enabled[int(cid)] = bool(value)
@@ -402,19 +409,18 @@ async def poker_table_text(game, app):
         f"🃏 积分德州｜{phase}",
         "",
         "━━━━━━━━━━━━━━━━━━━━",
-        "",
-        f"🂡 公牌：{' '.join(card_str(card) for card in game.board) or '未发牌'}",
-        "",
+        f"🂡 公牌：{'  '.join(card_str(card) for card in game.board) or '未发牌'}",
         f"💰 奖池：{game.pot}｜当前下注：{game.current_bet}",
+        "━━━━━━━━━━━━━━━━━━━━",
     ]
     current = game.current()
     if current:
-        lines.extend(["", f"⏳ 当前行动：{await get_name(app, current)}｜需跟：{max(0, game.current_bet - game.round_bets[current])}"])
-    lines.extend(["", "━━━━━━━━━━━━━━━━━━━━", "", "👥 玩家状态", ""])
+        lines.append(f"⏳ 当前行动：{await get_name(app, current)}｜需跟：{max(0, game.current_bet - game.round_bets[current])}")
+    lines.append("👥 玩家状态")
     for index, uid in enumerate(game.players, 1):
         status = "❌ 弃牌" if uid in game.folded else "🔥 全下" if uid in game.all_in else "🟢 在局"
-        lines.extend([f"{index}. {await get_name(app, uid)}", "", f"   {status}｜投入 {game.total_bet[uid]}｜余筹 {game.chips[uid]}", ""])
-    return "\n".join(lines).rstrip()
+        lines.extend([f"{index}. {await get_name(app, uid)}", f"   {status}｜投入 {game.total_bet[uid]}｜余筹 {game.chips[uid]}"])
+    return "\n".join(lines)
 
 
 def poker_buttons(game, uid):
@@ -484,10 +490,10 @@ async def settle_poker(game, app):
         date, hand_types = business_date(), result[0][4]
         name_ids = set(game.players) | set(game.showdown_order)
         names = {uid: await get_name(app, uid) for uid in name_ids}
-        lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━━━━", f"🂡 公牌：{' '.join(card_str(card) for card in game.board)}", "", "亮牌："]
+        lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━━━━", f"🂡 公牌：{'  '.join(card_str(card) for card in game.board)}", "", "亮牌："]
         for uid in game.showdown_order:
             suffix = "（弃牌）" if uid in game.folded else ""
-            lines.extend([f"{names[uid]}：{' '.join(card_str(card) for card in game.hands[uid])}｜{hand_types.get(uid, '')}{suffix}", ""])
+            lines.extend([f"{names[uid]}：{'  '.join(card_str(card) for card in game.hands[uid])}｜{hand_types.get(uid, '')}{suffix}", ""])
         lines.append("派奖：")
         for uid, hand, amount, details, _ in sorted(result, key=lambda item: item[2], reverse=True):
             lines.extend([f"{names[uid]}：{hand}｜+{amount}（{'，'.join(f'{pool}+{value}' for pool, value in details)}）", ""])
@@ -495,8 +501,9 @@ async def settle_poker(game, app):
         for uid in game.players:
             net = game.chips[uid] - game.initial_chips[uid]
             profit_by_date[date][game.chat_id][uid] += net
+            poker_profit_by_date[date][game.chat_id][uid] += net
             lines.extend([f"{names[uid]}：投入 {game.total_bet[uid]}｜盈亏 {net:+d}", ""])
-        rank = sorted(profit_by_date[date][game.chat_id].items(), key=lambda item: item[1], reverse=True)[:10]
+        rank = sorted(poker_profit_by_date[date][game.chat_id].items(), key=lambda item: item[1], reverse=True)[:10]
         lines.extend(["🏆 当日德州累计盈利榜", *[f"{index}. {names.get(uid) or await get_name(app, uid)}：{amount:+d}" for index, (uid, amount) in enumerate(rank, 1)]])
         delivered = await safe_send_long(app.bot, game.chat_id, "\n".join(lines))
         if delivered is None:
@@ -586,7 +593,7 @@ class HorseRace:
 
     async def run(self, app):
         try:
-            thresholds = [value for value in (300, 180, 60, 30, 10) if value < RACE_AUTO_START]
+            thresholds = [value for value in (300, 180, 60) if value < RACE_AUTO_START]
             while self.phase == "betting" and not self.cancelled:
                 remain = max(0, int(RACE_AUTO_START - (time.time() - self.create_time)))
                 for threshold in thresholds:
@@ -617,27 +624,46 @@ class HorseRace:
         async with self.lock:
             if self.settled or self.cancelled: return
             self.settled, self.phase = True, "settling"
-            payouts_applied = False
             try:
                 if not self.arrivals: raise RuntimeError("赛马未产生到达顺序")
                 winner, odd, date = self.arrivals[0], self.odds()[self.arrivals[0]], business_date()
                 race_daily_stats[self.chat_id][winner] += 1
                 race_history[self.chat_id] = (race_history[self.chat_id] + [winner])[-10:]
-                lines = [f"🏆 赛马结果：{HORSE_EMOJI[winner]} {HORSE_NAMES[winner]}", "━━━━━━━━━━━━━━━━━━━━"]
-                total_payout = 0
+                standings = ["🥇", "🥈", "🥉", "4."]
+                lines = [f"🏆 赛马大赛 {race_id(self.create_time)} 结果 🏆", "━━━━━━━━━━━━━━━━━━━━"]
+                lines.extend(f"{standings[index]} {HORSE_EMOJI[horse]} {HORSE_NAMES[horse]}" for index, horse in enumerate(self.arrivals))
+
+                settlements, total_payout = [], 0
                 for uid, bets in self.bets.items():
                     stake, payout = sum(bets.values()), int(bets.get(winner, 0) * odd)
+                    net = payout - stake
                     group_chips[self.chat_id][uid] += payout; total_payout += payout
-                    profit_by_date[date][self.chat_id][uid] += payout - stake
+                    profit_by_date[date][self.chat_id][uid] += net
+                    race_profit_by_date[date][self.chat_id][uid] += net
                     name = self.name_cache.get(uid) or await get_name(app, uid)
                     self.name_cache[uid] = name
-                    lines.extend([f"{name}：投注 {stake}｜派彩 {payout}｜盈亏 {payout-stake:+d}", ""])
-                race_jackpot[self.chat_id] = self.jackpot + self.pool if not total_payout else max(0, self.jackpot + self.pool - total_payout)
-                payouts_applied = True
-                if not total_payout: lines.append("🔄 无人押中，奖池滚入下一期。")
-                rank = sorted(profit_by_date[date][self.chat_id].items(), key=lambda item: item[1], reverse=True)[:10]
-                lines.extend(["", "🏆 当日赛马累计盈利榜"])
-                for index, (uid, amount) in enumerate(rank, 1):
+                    settlements.append((uid, name, stake, payout, net))
+
+                available_pool = self.jackpot + self.pool
+                supplement = max(0, total_payout - available_pool)
+                race_jackpot[self.chat_id] = max(0, available_pool - total_payout)
+                if supplement:
+                    lines.extend(["", f"⚠️ 奖池不足，系统补充 {supplement} 积分"])
+                elif not total_payout:
+                    lines.extend(["", "🔄 无人押中，奖池滚入下一期。"])
+
+                lines.extend(["", "💰 本局结算："])
+                for _, name, stake, payout, net in settlements:
+                    lines.append(f"{name}：投注 {stake}｜派彩 {payout}｜盈亏 {net:+d}")
+
+                round_rank = sorted(settlements, key=lambda item: item[4], reverse=True)
+                lines.extend(["", "🏆 本局赛马盈利排行榜", "━━━━━━━━━━━━━━━━━━━━"])
+                for index, (_, name, _, _, net) in enumerate(round_rank, 1):
+                    lines.append(f"{index}. {name}：{net:+d} 积分")
+
+                day_rank = sorted(race_profit_by_date[date][self.chat_id].items(), key=lambda item: item[1], reverse=True)[:10]
+                lines.extend(["", "🏆 当日赛马累计盈利榜", "━━━━━━━━━━━━━━━━━━━━"])
+                for index, (uid, amount) in enumerate(day_rank, 1):
                     name = self.name_cache.get(uid) or await get_name(app, uid)
                     self.name_cache[uid] = name
                     lines.append(f"{index}. {name}：{amount:+d}")
@@ -830,7 +856,7 @@ async def on_button(update, context):
         game = active_poker_games.get(cid)
         if not game: await q.answer("德州游戏已结束", show_alert=True); return
         if data == "texas_hand":
-            hand = game.hands.get(uid); await q.answer(f"你的手牌：{card_str(hand[0])} {card_str(hand[1])}" if hand and uid not in game.folded else "当前无法查看手牌", show_alert=True); return
+            hand = game.hands.get(uid); await q.answer(f"你的手牌：{card_str(hand[0])}  {card_str(hand[1])}" if hand and uid not in game.folded else "当前无法查看手牌", show_alert=True); return
         if game.phase == "waiting":
             if data == "texas_join" and game.add(uid):
                 await q.answer("已加入"); await update_poker_waiting(game, context.application)
@@ -914,6 +940,7 @@ async def leaderboard_scheduler(app):
         if target <= now: target += timedelta(days=1)
         await asyncio.sleep((target-now).total_seconds())
         date = now_bj().strftime("%Y-%m-%d"); snapshot = profit_by_date.pop(date, {})
+        poker_profit_by_date.pop(date, None); race_profit_by_date.pop(date, None)
         for cid, data in snapshot.items():
             if not data: continue
             lines = [f"🏆 今日综合排行榜（{date}）", "━"*20]
