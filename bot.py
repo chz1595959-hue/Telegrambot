@@ -77,6 +77,16 @@ async def get_name(app, user_id):
     except Exception:
         return f"玩家{user_id}"
 
+async def safe_send(bot, chat_id, text, **kwargs):
+    try:
+        return await bot.send_message(chat_id, text, **kwargs)
+    except RetryAfter as e:
+        await asyncio.sleep(e.retry_after)
+        return await bot.send_message(chat_id, text, **kwargs)
+    except Exception as e:
+        logger.warning(f"消息发送失败: {e}")
+    return None
+
 def compute_side_pots(all_bets):
     if not all_bets: return []
     sorted_bets = sorted(all_bets.items(), key=lambda x: x[1])
@@ -107,8 +117,9 @@ def distribute_side_pots(layers, alive_scores):
 
 async def action_notify(chat_id, app, user_id, desc):
     name = await get_name(app, user_id)
-    msg = await app.bot.send_message(chat_id, f"🎲 {name} {desc}")
-    asyncio.create_task(auto_delete(msg, 10))
+    msg = await safe_send(app.bot, chat_id, f"🎲 {name} {desc}")
+    if msg:
+        asyncio.create_task(auto_delete(msg, 10))
 
 async def auto_delete(message, delay):
     await asyncio.sleep(delay)
@@ -123,7 +134,7 @@ async def grant_emergency_if_needed(chat_id, uid, app):
         daily_emergency_used[chat_id][uid] = True
         try:
             name = await get_name(app, uid)
-            await app.bot.send_message(chat_id, f"🆘 {name} 筹码用尽，已自动赠送 1000 应急筹码（今日限一次）")
+            await safe_send(app.bot, chat_id, f"🆘 {name} 筹码用尽，已自动赠送 1000 应急筹码（今日限一次）")
         except: pass
 
 # ---------- 每日任务 ----------
@@ -165,7 +176,7 @@ async def daily_leaderboard_scheduler(app):
                 name = await get_name(app, uid)
                 lines.append(f"{idx}. {name}: {'+' if profit >= 0 else ''}{profit} 积分")
             try:
-                await app.bot.send_message(chat_id, "\n".join(lines))
+                await safe_send(app.bot, chat_id, "\n".join(lines))
             except: pass
         poker_profit.clear()
         horse_profit.clear()
@@ -480,13 +491,13 @@ async def start_turn_timer(game, app):
         game.action_msg_id = None
     keyboard = get_buttons(game, uid)
     text = await build_action_view(game, app, uid)
-    msg = await app.bot.send_message(game.chat_id, text, reply_markup=keyboard)
-    game.action_msg_id = msg.message_id
+    msg = await safe_send(app.bot, game.chat_id, text, reply_markup=keyboard)
+    game.action_msg_id = msg.message_id if msg else None
     async def timeout():
         await asyncio.sleep(TURN_TIMEOUT)
         if game.phase in ('preflop','flop','turn','river') and game.current_player() == uid:
             game.handle_action(uid, 'fold')
-            await app.bot.send_message(game.chat_id, f"⏰ {await get_name(app, uid)} 超时未操作，自动弃牌")
+            await safe_send(app.bot, game.chat_id, f"⏰ {await get_name(app, uid)} 超时未操作，自动弃牌")
             if game.action_msg_id:
                 try: await app.bot.delete_message(game.chat_id, game.action_msg_id)
                 except: pass
@@ -598,10 +609,10 @@ async def settle_game(game, app):
         f"\n\n派奖：\n" + "\n".join(prize_lines) + f"\n\n投入/盈亏：\n" + "\n".join(profit_lines) + broke_text +
         ("\n" + "\n".join(rank_lines) if rank_lines else "")
     )
-    await app.bot.send_message(game.chat_id, win_text)
+    await safe_send(app.bot, game.chat_id, win_text)
     active_poker_games.pop(game.chat_id, None)
 
-# ==================== 赛马 ====================
+# ==================== 赛马（修复版） ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
@@ -685,14 +696,13 @@ class HorseRace:
                     chat_id=self.chat_id, message_id=self.game_msg_id,
                     text="🏇 比赛开始！", reply_markup=None)
             except: pass
-            msg = await self.app.bot.send_message(self.chat_id, "🏇 比赛开始！正在奔跑中……")
-            self.animation_msg_id = msg.message_id
+            msg = await safe_send(self.app.bot, self.chat_id, "🏇 比赛开始！正在奔跑中……")
+            self.animation_msg_id = msg.message_id if msg else None
+        # 确保动画任务一定启动（即使发送失败）
         self.animation_task = asyncio.create_task(self._run_animation())
         return True
 
     async def _run_animation(self):
-        if not self.app or not self.animation_msg_id:
-            return
         while self.phase == 'racing':
             for i in range(HORSE_COUNT):
                 if self.positions[i] < RACE_TRACK_LENGTH:
@@ -700,13 +710,14 @@ class HorseRace:
                     self.positions[i] = min(RACE_TRACK_LENGTH, self.positions[i] + step)
                     if self.positions[i] >= RACE_TRACK_LENGTH and i not in self.arrival_order:
                         self.arrival_order.append(i)
-            try:
+            if self.animation_msg_id and self.app:
                 text = self._build_animation_view()
-                await self.app.bot.edit_message_text(
-                    chat_id=self.chat_id, message_id=self.animation_msg_id, text=text)
-            except RetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-            except: pass
+                try:
+                    await self.app.bot.edit_message_text(
+                        chat_id=self.chat_id, message_id=self.animation_msg_id, text=text)
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after)
+                except: pass
             if len(self.arrival_order) == HORSE_COUNT:
                 self.winner = self.arrival_order[0]
                 race_daily_stats[self.chat_id][self.winner] += 1
@@ -737,96 +748,96 @@ class HorseRace:
 
     async def _settle_race(self):
         self.cancel_tasks()
-        if not self.app:
-            logger.error("HorseRace: app 未设置，无法发送结算消息")
-            active_horse_races.pop(self.chat_id, None)
-            return
-
-        async def safe_name(uid):
-            if uid in self.name_cache:
-                return self.name_cache[uid]
-            try:
-                name = await get_name(self.app, uid)
-                self.name_cache[uid] = name
-                return name
-            except:
-                return f"玩家{uid}"
-
-        if len(self.bets) == 1:
-            winner_odds = 1.01
-        else:
-            odds_list = self.get_odds()
-            winner_odds = odds_list[self.winner] if self.winner >= 0 else 1.0
-
-        winner_payouts = []
-        total_prize = 0
-        for uid, bets_per_user in self.bets.items():
-            if self.winner in bets_per_user:
-                bet = bets_per_user[self.winner]
-                prize = int(bet * winner_odds)
-                winner_payouts.append((uid, bet, prize))
-                total_prize += prize
-
-        race_id = datetime.fromtimestamp(self.create_time).strftime("%Y%m%d-%H%M")
-        lines = [f"🏆 赛马大赛 {race_id} 结果 🏆", "━" * 20]
-        order = self.arrival_order if self.arrival_order else sorted(range(HORSE_COUNT), key=lambda i: self.total_bets[i], reverse=True)
-        medals = ["🥇", "🥈", "🥉"]
-        for idx, horse_idx in enumerate(order):
-            if idx < 3:
-                lines.append(f"{medals[idx]} {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
-            else:
-                lines.append(f"{idx+1}️⃣ {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
-        lines.append("")
-
-        if not winner_payouts:
-            race_jackpot[self.chat_id] += self.pool
-            lines.append(f"🔄 无人押中，所有下注 ({self.pool} 积分) 已滚入下一期彩池！")
-        else:
-            pool = self.pool
-            jackpot = race_jackpot.get(self.chat_id, 0)
-            available = pool + jackpot
-            if available >= total_prize:
-                for uid, bet, prize in winner_payouts:
-                    group_chips[self.chat_id][uid] += prize
-                    name = await safe_name(uid)
-                    profit = prize - bet
-                    lines.append(f"{name}: 投注{bet} → 获得{prize} (+{profit}) 赔率{winner_odds:.2f}")
-                    horse_profit[self.chat_id][uid] += profit
-                leftover = pool - total_prize
-                if leftover > 0:
-                    race_jackpot[self.chat_id] = leftover
-                else:
-                    used_jackpot = total_prize - pool
-                    race_jackpot[self.chat_id] = jackpot - used_jackpot
-            else:
-                deficit = total_prize - available
-                for uid, bet, prize in winner_payouts:
-                    group_chips[self.chat_id][uid] += prize
-                    name = await safe_name(uid)
-                    profit = prize - bet
-                    lines.append(f"{name}: 投注{bet} → 获得{prize} (+{profit}) 赔率{winner_odds:.2f}")
-                    horse_profit[self.chat_id][uid] += profit
-                race_jackpot[self.chat_id] = 0
-                lines.append(f"⚠️ 奖池与彩池不足，系统补充 {deficit} 积分")
-
-        if horse_profit[self.chat_id]:
-            sorted_rank = sorted(horse_profit[self.chat_id].items(), key=lambda x: x[1], reverse=True)
-            lines.append("\n🏆 赛马盈利排行榜 🏆")
-            lines.append("━" * 20)
-            for idx, (uid, profit) in enumerate(sorted_rank[:10], 1):
-                name = await safe_name(uid)
-                sign = '+' if profit >= 0 else ''
-                lines.append(f"{idx}. {name}: {sign}{profit} 积分")
-
         try:
-            await self.app.bot.send_message(self.chat_id, "\n".join(lines))
-        except Exception as e:
-            logger.error(f"发送赛马结算消息失败: {e}")
+            if not self.app:
+                logger.error("HorseRace: app 未设置，无法发送结算消息")
+                return
 
-        if self.animation_msg_id:
-            try: await self.app.bot.delete_message(self.chat_id, self.animation_msg_id)
-            except: pass
-        active_horse_races.pop(self.chat_id, None)
+            async def safe_name(uid):
+                if uid in self.name_cache:
+                    return self.name_cache[uid]
+                try:
+                    name = await get_name(self.app, uid)
+                    self.name_cache[uid] = name
+                    return name
+                except:
+                    return f"玩家{uid}"
+
+            if len(self.bets) == 1:
+                winner_odds = 1.01
+            else:
+                odds_list = self.get_odds()
+                winner_odds = odds_list[self.winner] if self.winner >= 0 else 1.0
+
+            winner_payouts = []
+            total_prize = 0
+            for uid, bets_per_user in self.bets.items():
+                if self.winner in bets_per_user:
+                    bet = bets_per_user[self.winner]
+                    prize = int(bet * winner_odds)
+                    winner_payouts.append((uid, bet, prize))
+                    total_prize += prize
+
+            race_id = datetime.fromtimestamp(self.create_time).strftime("%Y%m%d-%H%M")
+            lines = [f"🏆 赛马大赛 {race_id} 结果 🏆", "━" * 20]
+            order = self.arrival_order if self.arrival_order else sorted(range(HORSE_COUNT), key=lambda i: self.total_bets[i], reverse=True)
+            medals = ["🥇", "🥈", "🥉"]
+            for idx, horse_idx in enumerate(order):
+                if idx < 3:
+                    lines.append(f"{medals[idx]} {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
+                else:
+                    lines.append(f"{idx+1}️⃣ {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
+            lines.append("")
+
+            if not winner_payouts:
+                race_jackpot[self.chat_id] += self.pool
+                lines.append(f"🔄 无人押中，所有下注 ({self.pool} 积分) 已滚入下一期彩池！")
+            else:
+                pool = self.pool
+                jackpot = race_jackpot.get(self.chat_id, 0)
+                available = pool + jackpot
+                if available >= total_prize:
+                    for uid, bet, prize in winner_payouts:
+                        group_chips[self.chat_id][uid] += prize
+                        name = await safe_name(uid)
+                        profit = prize - bet
+                        lines.append(f"{name}: 投注{bet} → 获得{prize} (+{profit}) 赔率{winner_odds:.2f}")
+                        horse_profit[self.chat_id][uid] += profit
+                    leftover = pool - total_prize
+                    if leftover > 0:
+                        race_jackpot[self.chat_id] = leftover
+                    else:
+                        used_jackpot = total_prize - pool
+                        race_jackpot[self.chat_id] = jackpot - used_jackpot
+                else:
+                    deficit = total_prize - available
+                    for uid, bet, prize in winner_payouts:
+                        group_chips[self.chat_id][uid] += prize
+                        name = await safe_name(uid)
+                        profit = prize - bet
+                        lines.append(f"{name}: 投注{bet} → 获得{prize} (+{profit}) 赔率{winner_odds:.2f}")
+                        horse_profit[self.chat_id][uid] += profit
+                    race_jackpot[self.chat_id] = 0
+                    lines.append(f"⚠️ 奖池与彩池不足，系统补充 {deficit} 积分")
+
+            if horse_profit[self.chat_id]:
+                sorted_rank = sorted(horse_profit[self.chat_id].items(), key=lambda x: x[1], reverse=True)
+                lines.append("\n🏆 赛马盈利排行榜 🏆")
+                lines.append("━" * 20)
+                for idx, (uid, profit) in enumerate(sorted_rank[:10], 1):
+                    name = await safe_name(uid)
+                    sign = '+' if profit >= 0 else ''
+                    lines.append(f"{idx}. {name}: {sign}{profit} 积分")
+
+            # 使用 safe_send 发送结算消息
+            await safe_send(self.app.bot, self.chat_id, "\n".join(lines))
+
+            if self.animation_msg_id:
+                try: await self.app.bot.delete_message(self.chat_id, self.animation_msg_id)
+                except: pass
+        finally:
+            # 无论如何都要清除游戏，避免残留
+            active_horse_races.pop(self.chat_id, None)
 
     def cancel_tasks(self):
         if self.update_task:
@@ -926,11 +937,11 @@ async def _race_main_loop(race, app):
                     race.notified.add(threshold)
                     time_str = f"{threshold // 60} 分钟" if threshold >= 60 else f"{threshold} 秒"
                     try:
-                        await app.bot.send_message(race.chat_id, f"⏰ 赛马大赛即将开始！还有 {time_str}，抓紧下注！")
+                        await safe_send(app.bot, race.chat_id, f"⏰ 赛马大赛即将开始！还有 {time_str}，抓紧下注！")
                     except: pass
             if remaining <= 0:
                 await race.start_race()
-                break
+                break  # 确保退出循环，不再继续等待
             view = await build_race_view(race, app)
             try:
                 await app.bot.edit_message_text(
@@ -956,8 +967,9 @@ async def hourly_race_scheduler(app):
                         if jackpot > 0: race_jackpot[chat_id] = 0
                         active_horse_races[chat_id] = race
                         view = await build_race_view(race, app)
-                        msg = await app.bot.send_message(chat_id, view, reply_markup=get_race_buttons())
-                        race.game_msg_id = msg.message_id
+                        msg = await safe_send(app.bot, chat_id, view, reply_markup=get_race_buttons())
+                        if msg:
+                            race.game_msg_id = msg.message_id
                         start_race_tasks(race, app)
                         logger.info(f"整点自动发起赛马：chat_id={chat_id}")
                     except Exception as e:
@@ -1023,25 +1035,31 @@ async def cmd_dz(update, context):
     kb = [[InlineKeyboardButton("加入游戏", callback_data="texas_join")]]
     if len(game.players) >= 2:
         kb.append([InlineKeyboardButton("开始游戏", callback_data="texas_start")])
-    msg = await update.message.reply_text(
+    msg = await safe_send(context.bot, chat_id,
         f"🃏 新一局德州扑克！\n发起人: {await get_name(context.application, user.id)}\n\n已加入玩家:\n" + "\n".join(plist) + "\n\n点击按钮加入或开始",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
-    game.game_msg_id = msg.message_id
+        reply_markup=InlineKeyboardMarkup(kb))
+    if msg:
+        game.game_msg_id = msg.message_id
 
 async def cmd_sm(update, context):
     if not await need_auth(update, context): return
     chat_id = update.effective_chat.id
+    # 自动清理已经结束的残留赛马
     if chat_id in active_horse_races:
-        await update.message.reply_text("当前已有进行中的赛马，请等待结束。")
-        return
+        race = active_horse_races[chat_id]
+        if race.phase == 'finished':
+            active_horse_races.pop(chat_id, None)
+        else:
+            await update.message.reply_text("当前已有进行中的赛马，请等待结束。")
+            return
     jackpot = race_jackpot.get(chat_id, 0)
     race = HorseRace(chat_id, update.effective_user.id, initial_pool=jackpot)
     if jackpot > 0: race_jackpot[chat_id] = 0
     active_horse_races[chat_id] = race
     view = await build_race_view(race, context.application)
-    msg = await update.message.reply_text(view, reply_markup=get_race_buttons())
-    race.game_msg_id = msg.message_id
+    msg = await safe_send(context.bot, chat_id, view, reply_markup=get_race_buttons())
+    if msg:
+        race.game_msg_id = msg.message_id
     start_race_tasks(race, context.application)
 
 async def cmd_end(update, context):
