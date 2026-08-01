@@ -18,8 +18,8 @@ DAILY_RESET_TIME = (0, 0)
 RESET_TO_CHIPS = 20000
 
 # ---------- 德州配置 ----------
-SMALL_BLIND = 100
-BIG_BLIND = 200
+SMALL_BLIND = 200
+BIG_BLIND = 400
 ANTE = 100
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
@@ -30,9 +30,9 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START = 20           # 下注阶段总时长（秒）  测试用20秒，正式改为 590
-RACE_UPDATE_INTERVAL = 5       # 界面刷新间隔（秒）  测试用5秒，正式改为 35
-RACE_ANIMATION_INTERVAL = 1.5  # 动画更新间隔
+RACE_AUTO_START = 9 * 60 + 50       # 9分50秒
+RACE_UPDATE_INTERVAL = 35           # 刷新间隔
+RACE_ANIMATION_INTERVAL = 1.5
 RACE_TRACK_LENGTH = 14
 
 # ---------- 牌型中英文映射 ----------
