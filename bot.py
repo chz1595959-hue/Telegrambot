@@ -20,7 +20,7 @@ RESET_TO_CHIPS = 20000
 # ---------- 德州配置 ----------
 SMALL_BLIND = 200
 BIG_BLIND = 400
-ANTE = 100                   # 新增：底注
+ANTE = 100                   # 底注
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
 AUTO_START_TIMEOUT = 60
@@ -30,10 +30,10 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START = 59 * 60       # 下注阶段总时长（秒）= 59分钟
-RACE_UPDATE_INTERVAL = 10       # 界面刷新间隔（秒）
-RACE_ANIMATION_INTERVAL = 1.5   # 动画更新间隔（秒）
-RACE_TRACK_LENGTH = 14          # 赛道长度
+RACE_AUTO_START = 9 * 60 + 50       # 下注阶段总时长 = 590秒 = 9分50秒
+RACE_UPDATE_INTERVAL = 10           # 界面刷新间隔
+RACE_ANIMATION_INTERVAL = 1.5       # 动画更新间隔
+RACE_TRACK_LENGTH = 14              # 赛道长度
 
 # ---------- 牌型中英文映射 ----------
 HAND_NAME_CN = {
@@ -48,8 +48,9 @@ AUTHORIZED_GROUPS = set()
 race_history = defaultdict(list)
 race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
 horse_profit = defaultdict(lambda: defaultdict(int))
+poker_profit = defaultdict(lambda: defaultdict(int))   # 德州全局盈亏
 race_jackpot = defaultdict(int)
-hourly_race_enabled = defaultdict(lambda: False)  # 整点自动赛马开关
+hourly_race_enabled = defaultdict(lambda: False)
 
 # ---------- 卡牌美化 ----------
 def card_str(card_int):
@@ -117,7 +118,7 @@ async def auto_delete(message, delay):
     except:
         pass
 
-# ---------- 每日重置筹码（不足2w补足，超过不变）----------
+# ---------- 每日筹码重置（不足2w补足）----------
 async def daily_reset_chips():
     while True:
         now = datetime.now()
@@ -133,6 +134,37 @@ async def daily_reset_chips():
         for chat_id in race_daily_stats:
             race_daily_stats[chat_id] = [0] * HORSE_COUNT
         logger.info("每日筹码重置完成（不足20000已补足）")
+
+# ---------- 每日23:50综合排行榜 ----------
+async def daily_leaderboard_scheduler(app):
+    while True:
+        now = datetime.now()
+        target = now.replace(hour=23, minute=50, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        wait_seconds = (target - now).total_seconds()
+        await asyncio.sleep(wait_seconds)
+        all_chats = set(list(poker_profit.keys()) + list(horse_profit.keys()))
+        for chat_id in all_chats:
+            merged = defaultdict(int)
+            for uid, profit in poker_profit.get(chat_id, {}).items():
+                merged[uid] += profit
+            for uid, profit in horse_profit.get(chat_id, {}).items():
+                merged[uid] += profit
+            if not merged:
+                continue
+            sorted_rank = sorted(merged.items(), key=lambda x: x[1], reverse=True)
+            lines = ["🏆 今日游戏综合排行榜 🏆", "━" * 20]
+            for idx, (uid, profit) in enumerate(sorted_rank[:10], 1):
+                name = await get_name(app, uid)
+                lines.append(f"{idx}. {name}: {'+' if profit >= 0 else ''}{profit} 积分")
+            try:
+                await app.bot.send_message(chat_id, "\n".join(lines))
+            except:
+                pass
+        poker_profit.clear()
+        horse_profit.clear()
+        logger.info("每日排行榜发送完成")
 
 # ==================== 德州扑克 ====================
 class PokerGame:
@@ -181,7 +213,7 @@ class PokerGame:
             self.chips[uid] = group_chips[self.chat_id].get(uid, STARTING_CHIPS)
             self.total_bet[uid] = 0
         self.initial_chips = self.chips.copy()
-        # ★★★ 新增：所有玩家支付底注100 ★★★
+        # 所有玩家支付底注100
         for uid in self.players:
             ante = min(ANTE, self.chips[uid])
             self.chips[uid] -= ante
@@ -529,11 +561,13 @@ async def settle_game(game, app):
         name = await get_name(app, wid)
         prize_lines.append(f"{name} +{amt}" if only_survivor else f"{name} +{amt} ({desc})")
     profit_lines = []
+    profits = {}
     for uid in game.players:
         name = await get_name(app, uid)
         start = game.initial_chips.get(uid, STARTING_CHIPS)
         end = game.chips.get(uid, 0)
         net = end - start
+        profits[uid] = net
         profit_lines.append(f"{name}  投入:{game.total_bet.get(uid,0)}  盈亏:{net:+d}")
     broke = [uid for uid in game.players if game.chips[uid] == 0]
     broke_text = ""
@@ -546,6 +580,9 @@ async def settle_game(game, app):
         f"\n\n派奖：\n" + "\n".join(prize_lines) + f"\n\n投入/盈亏：\n" + "\n".join(profit_lines) + broke_text
     )
     await app.bot.send_message(game.chat_id, win_text)
+    # 记录德州盈亏到全局
+    for uid, net in profits.items():
+        poker_profit[game.chat_id][uid] += net
     active_poker_games.pop(game.chat_id, None)
 
 # ==================== 赛马 ====================
@@ -675,9 +712,9 @@ class HorseRace:
         for i in range(HORSE_COUNT):
             pos = self.positions[i]
             if pos < RACE_TRACK_LENGTH:
-                track = '━' * pos + HORSE_EMOJI[i] + '━' * (RACE_TRACK_LENGTH - pos - 1) + '🏁'
+                track = '🏁' + '━' * (RACE_TRACK_LENGTH - pos - 1) + HORSE_EMOJI[i] + '━' * pos
             else:
-                track = '━' * RACE_TRACK_LENGTH + HORSE_EMOJI[i] + '🏁'
+                track = '🏁' + HORSE_EMOJI[i] + '━' * RACE_TRACK_LENGTH
             lines.append(track)
         lines.append("━" * 20)
         if self.arrival_order:
@@ -798,7 +835,7 @@ def build_race_view(race):
 
     lines = [f"🏇 赛马大赛 {race_id} 🏇", "━" * 20]
     for emoji in HORSE_EMOJI:
-        lines.append(f"{emoji}{'━' * (RACE_TRACK_LENGTH - 1)}🏁")
+        lines.append(f"🏁{'━' * (RACE_TRACK_LENGTH - 1)}{emoji}")
     lines.append("━" * 20)
 
     jackpot = race_jackpot.get(race.chat_id, 0)
@@ -851,7 +888,7 @@ async def _race_main_loop(race, app):
             elapsed = now - race.create_time
             remaining = RACE_AUTO_START - elapsed
 
-            NOTIFY_THRESHOLDS = [50*60, 40*60, 30*60, 20*60, 10*60, 5*60, 60]
+            NOTIFY_THRESHOLDS = [5*60, 3*60, 60]  # 5分钟、3分钟、1分钟
             for threshold in NOTIFY_THRESHOLDS:
                 if remaining <= threshold and threshold not in race.notified:
                     race.notified.add(threshold)
@@ -1169,6 +1206,7 @@ def main():
     loop = asyncio.get_event_loop()
     loop.create_task(daily_reset_chips())
     loop.create_task(hourly_race_scheduler(app))
+    loop.create_task(daily_leaderboard_scheduler(app))
 
     logger.info("Bot 启动...")
     while True:
