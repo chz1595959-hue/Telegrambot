@@ -32,7 +32,7 @@ HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
 RACE_AUTO_START = 9 * 60 + 50       # 下注阶段总时长 = 590秒 = 9分50秒
-RACE_UPDATE_INTERVAL = 60           # 界面刷新间隔（秒），降低频率避免卡顿
+RACE_UPDATE_INTERVAL = 35           # 界面刷新间隔（秒），降低频率避免卡顿
 RACE_ANIMATION_INTERVAL = 1.5       # 动画更新间隔（秒）
 RACE_TRACK_LENGTH = 14              # 赛道长度
 
