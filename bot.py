@@ -19,7 +19,8 @@ RESET_TO_CHIPS = 20000
 
 # ---------- 德州配置 ----------
 SMALL_BLIND = 200
-BIG_BLIND = 500
+BIG_BLIND = 400
+ANTE = 100                   # 新增：底注
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
 AUTO_START_TIMEOUT = 60
@@ -116,7 +117,7 @@ async def auto_delete(message, delay):
     except:
         pass
 
-# ---------- 每日重置筹码（修改版：仅补足不足20000的）----------
+# ---------- 每日重置筹码（不足2w补足，超过不变）----------
 async def daily_reset_chips():
     while True:
         now = datetime.now()
@@ -133,7 +134,7 @@ async def daily_reset_chips():
             race_daily_stats[chat_id] = [0] * HORSE_COUNT
         logger.info("每日筹码重置完成（不足20000已补足）")
 
-# ==================== 德州扑克（完全不变） ====================
+# ==================== 德州扑克 ====================
 class PokerGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
@@ -180,6 +181,14 @@ class PokerGame:
             self.chips[uid] = group_chips[self.chat_id].get(uid, STARTING_CHIPS)
             self.total_bet[uid] = 0
         self.initial_chips = self.chips.copy()
+        # ★★★ 新增：所有玩家支付底注100 ★★★
+        for uid in self.players:
+            ante = min(ANTE, self.chips[uid])
+            self.chips[uid] -= ante
+            self.pot += ante
+            self.total_bet[uid] += ante
+            if self.chips[uid] == 0:
+                self.all_in.add(uid)
         self.phase = 'preflop'
         self.deck = [Card.new(r + s) for r in "23456789TJQKA" for s in "shdc"]
         random.shuffle(self.deck)
