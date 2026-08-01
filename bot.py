@@ -30,9 +30,9 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START = 9 * 60 + 50
-RACE_UPDATE_INTERVAL = 35
-RACE_ANIMATION_INTERVAL = 1.5
+RACE_AUTO_START = 9 * 60 + 50       # 下注阶段 9 分 50 秒
+RACE_UPDATE_INTERVAL = 35           # 界面刷新间隔
+RACE_ANIMATION_INTERVAL = 1.5       # 动画更新间隔
 RACE_TRACK_LENGTH = 14
 
 # ---------- 牌型中英文映射 ----------
@@ -44,23 +44,14 @@ HAND_NAME_CN = {
 
 # ---------- 内存存储 ----------
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
-chips_lock = asyncio.Lock()
-
 AUTHORIZED_GROUPS = set()
 race_history = defaultdict(list)
 race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
-
 horse_profit = defaultdict(lambda: defaultdict(int))
-horse_profit_lock = asyncio.Lock()
-
 poker_profit = defaultdict(lambda: defaultdict(int))
-poker_profit_lock = asyncio.Lock()
-
 race_jackpot = defaultdict(int)
 hourly_race_enabled = defaultdict(lambda: False)
 daily_emergency_used = defaultdict(lambda: defaultdict(bool))
-
-games_lock = asyncio.Lock()
 
 # ---------- 工具函数 ----------
 def card_str(card_int):
@@ -165,14 +156,13 @@ async def auto_delete(message, delay):
         pass
 
 async def grant_emergency_if_needed(chat_id, uid, app):
-    async with chips_lock:
-        if group_chips[chat_id][uid] == 0 and not daily_emergency_used[chat_id][uid]:
-            group_chips[chat_id][uid] = 1000
-            daily_emergency_used[chat_id][uid] = True
-            name = await get_name(app, uid)
-            await safe_send(app.bot, chat_id, f"🆘 {name} 筹码用尽，已自动赠送 1000 应急筹码（今日限一次）")
-            await safe_send(app.bot, chat_id, f"⚠️ 系统已向 {name} 发放应急筹码 1000，请合理使用")
-            return True
+    if group_chips[chat_id][uid] == 0 and not daily_emergency_used[chat_id][uid]:
+        group_chips[chat_id][uid] = 1000
+        daily_emergency_used[chat_id][uid] = True
+        name = await get_name(app, uid)
+        await safe_send(app.bot, chat_id, f"🆘 {name} 筹码用尽，已自动赠送 1000 应急筹码（今日限一次）")
+        await safe_send(app.bot, chat_id, f"⚠️ 系统已向 {name} 发放应急筹码 1000，请合理使用")
+        return True
     return False
 
 def is_player_in_game(chat_id, uid):
@@ -193,13 +183,12 @@ async def daily_reset_chips():
             target += timedelta(days=1)
         wait_seconds = (target - now).total_seconds()
         await asyncio.sleep(wait_seconds)
-        async with chips_lock:
-            for chat_id in group_chips:
-                for uid in group_chips[chat_id]:
-                    group_chips[chat_id][uid] = RESET_TO_CHIPS
-            daily_emergency_used.clear()
+        for chat_id in group_chips:
+            for uid in group_chips[chat_id]:
+                group_chips[chat_id][uid] = RESET_TO_CHIPS
         for chat_id in race_daily_stats:
             race_daily_stats[chat_id] = [0] * HORSE_COUNT
+        daily_emergency_used.clear()
         logger.info("每日筹码重置完成")
 
 async def daily_leaderboard_scheduler(app):
@@ -213,12 +202,10 @@ async def daily_leaderboard_scheduler(app):
         all_chats = set(list(poker_profit.keys()) + list(horse_profit.keys()))
         for chat_id in all_chats:
             merged = defaultdict(int)
-            async with poker_profit_lock:
-                for uid, profit in poker_profit.get(chat_id, {}).items():
-                    merged[uid] += profit
-            async with horse_profit_lock:
-                for uid, profit in horse_profit.get(chat_id, {}).items():
-                    merged[uid] += profit
+            for uid, profit in poker_profit.get(chat_id, {}).items():
+                merged[uid] += profit
+            for uid, profit in horse_profit.get(chat_id, {}).items():
+                merged[uid] += profit
             if not merged: continue
             sorted_rank = sorted(merged.items(), key=lambda x: x[1], reverse=True)
             lines = ["🏆 今日游戏综合排行榜 🏆", "━" * 20]
@@ -226,10 +213,8 @@ async def daily_leaderboard_scheduler(app):
                 name = await get_name(app, uid)
                 lines.append(f"{idx}. {name}: {'+' if profit >= 0 else ''}{profit} 积分")
             await safe_send(app.bot, chat_id, "\n".join(lines))
-        async with poker_profit_lock:
-            poker_profit.clear()
-        async with horse_profit_lock:
-            horse_profit.clear()
+        poker_profit.clear()
+        horse_profit.clear()
         logger.info("每日排行榜发送完成")
 
 # ==================== 德州扑克 ====================
@@ -238,7 +223,6 @@ class PokerGame:
         self.chat_id = chat_id
         self.owner_id = owner_id
         self.app = None
-        self.lock = asyncio.Lock()
         self.players = []
         self.chips = {}
         self.initial_chips = {}
@@ -274,38 +258,37 @@ class PokerGame:
         return False
 
     async def start_game(self):
-        async with self.lock:
-            if len(self.players) < 2: return False
-            for uid in self.players:
-                self.chips[uid] = group_chips[self.chat_id].get(uid, STARTING_CHIPS)
-                self.total_bet[uid] = 0
-            self.initial_chips = self.chips.copy()
-            for uid in self.players:
-                ante = min(ANTE, self.chips[uid])
-                self.chips[uid] -= ante
-                self.pot += ante
-                self.total_bet[uid] += ante
-                if self.chips[uid] == 0:
-                    self.all_in.add(uid)
-            self.phase = 'preflop'
-            self.deck = [Card.new(r + s) for r in "23456789TJQKA" for s in "shdc"]
-            random.shuffle(self.deck)
-            for uid in self.players:
-                self.hands[uid] = [self.deck.pop(), self.deck.pop()]
-                self.round_bets[uid] = 0
-            self.dealer_idx = len(self.players) - 1
-            sb_idx = (self.dealer_idx + 1) % len(self.players)
-            bb_idx = (self.dealer_idx + 2) % len(self.players)
-            self._post_blind(self.players[sb_idx], SMALL_BLIND)
-            self._post_blind(self.players[bb_idx], BIG_BLIND)
-            self.current_bet = BIG_BLIND
-            self.active_players = self.players.copy()
-            self.actor_idx = (bb_idx + 1) % len(self.players)
-            self.acted_this_round.clear()
-            self.last_aggressor = None
-            self.showdown_order.clear()
-            self.cancel_auto_start()
-            return True
+        if len(self.players) < 2: return False
+        for uid in self.players:
+            self.chips[uid] = group_chips[self.chat_id].get(uid, STARTING_CHIPS)
+            self.total_bet[uid] = 0
+        self.initial_chips = self.chips.copy()
+        for uid in self.players:
+            ante = min(ANTE, self.chips[uid])
+            self.chips[uid] -= ante
+            self.pot += ante
+            self.total_bet[uid] += ante
+            if self.chips[uid] == 0:
+                self.all_in.add(uid)
+        self.phase = 'preflop'
+        self.deck = [Card.new(r + s) for r in "23456789TJQKA" for s in "shdc"]
+        random.shuffle(self.deck)
+        for uid in self.players:
+            self.hands[uid] = [self.deck.pop(), self.deck.pop()]
+            self.round_bets[uid] = 0
+        self.dealer_idx = len(self.players) - 1
+        sb_idx = (self.dealer_idx + 1) % len(self.players)
+        bb_idx = (self.dealer_idx + 2) % len(self.players)
+        self._post_blind(self.players[sb_idx], SMALL_BLIND)
+        self._post_blind(self.players[bb_idx], BIG_BLIND)
+        self.current_bet = BIG_BLIND
+        self.active_players = self.players.copy()
+        self.actor_idx = (bb_idx + 1) % len(self.players)
+        self.acted_this_round.clear()
+        self.last_aggressor = None
+        self.showdown_order.clear()
+        self.cancel_auto_start()
+        return True
 
     def _post_blind(self, uid, amount):
         actual = min(amount, self.chips[uid])
@@ -317,67 +300,66 @@ class PokerGame:
             self.all_in.add(uid)
 
     async def handle_action(self, uid, action, amount=None):
-        async with self.lock:
-            if uid != self.current_player(): return False, "还没轮到你"
-            if uid in self.acted_this_round: return False, "本轮已行动"
-            if uid in self.all_in: return False, "已全下，无法行动"
+        if uid != self.current_player(): return False, "还没轮到你"
+        if uid in self.acted_this_round: return False, "本轮已行动"
+        if uid in self.all_in: return False, "已全下，无法行动"
 
-            if action == 'fold':
-                self.folded.add(uid)
-                self.active_players.remove(uid)
-                if self.actor_idx >= len(self.active_players): self.actor_idx = 0
-                desc = "弃牌"
-            elif action == 'check':
-                if self.current_bet > self.round_bets[uid]: return False, "必须跟注或加注"
-                self.acted_this_round.add(uid)
-                desc = "过牌"
-            elif action == 'call':
-                call_amt = self.current_bet - self.round_bets[uid]
-                actual = min(call_amt, self.chips[uid])
-                self.chips[uid] -= actual
-                self.round_bets[uid] += actual
-                self.pot += actual
-                self.total_bet[uid] += actual
-                if self.chips[uid] == 0: self.all_in.add(uid)
-                self.acted_this_round.add(uid)
-                desc = f"跟注 {actual}"
-            elif action == 'allin':
-                total = self.chips[uid]
-                self.chips[uid] = 0
-                self.round_bets[uid] += total
-                self.pot += total
-                self.total_bet[uid] += total
-                if total > self.current_bet: self.current_bet = self.round_bets[uid]
-                self.all_in.add(uid)
-                self.acted_this_round.add(uid)
-                desc = f"全下 {total}"
-            elif action == 'raise':
-                call_amt = self.current_bet - self.round_bets[uid]
-                total_raise = call_amt + amount
-                if total_raise <= 0 or total_raise > self.chips[uid]: return False, "筹码不足或无效加注额"
-                new_total = self.round_bets[uid] + total_raise
-                if new_total <= self.current_bet: return False, f"加注后总额必须大于当前下注 {self.current_bet}"
-                if new_total - self.current_bet < FIXED_MIN_RAISE: return False, f"最小加注为 {FIXED_MIN_RAISE}"
-                self.chips[uid] -= total_raise
-                self.round_bets[uid] += total_raise
-                self.pot += total_raise
-                self.total_bet[uid] += total_raise
-                self.current_bet = new_total
-                self.acted_this_round = {uid}
-                self.last_aggressor = uid
-                desc = f"加注 {total_raise}"
-            else:
-                return False, "未知操作"
+        if action == 'fold':
+            self.folded.add(uid)
+            self.active_players.remove(uid)
+            if self.actor_idx >= len(self.active_players): self.actor_idx = 0
+            desc = "弃牌"
+        elif action == 'check':
+            if self.current_bet > self.round_bets[uid]: return False, "必须跟注或加注"
+            self.acted_this_round.add(uid)
+            desc = "过牌"
+        elif action == 'call':
+            call_amt = self.current_bet - self.round_bets[uid]
+            actual = min(call_amt, self.chips[uid])
+            self.chips[uid] -= actual
+            self.round_bets[uid] += actual
+            self.pot += actual
+            self.total_bet[uid] += actual
+            if self.chips[uid] == 0: self.all_in.add(uid)
+            self.acted_this_round.add(uid)
+            desc = f"跟注 {actual}"
+        elif action == 'allin':
+            total = self.chips[uid]
+            self.chips[uid] = 0
+            self.round_bets[uid] += total
+            self.pot += total
+            self.total_bet[uid] += total
+            if total > self.current_bet: self.current_bet = self.round_bets[uid]
+            self.all_in.add(uid)
+            self.acted_this_round.add(uid)
+            desc = f"全下 {total}"
+        elif action == 'raise':
+            call_amt = self.current_bet - self.round_bets[uid]
+            total_raise = call_amt + amount
+            if total_raise <= 0 or total_raise > self.chips[uid]: return False, "筹码不足或无效加注额"
+            new_total = self.round_bets[uid] + total_raise
+            if new_total <= self.current_bet: return False, f"加注后总额必须大于当前下注 {self.current_bet}"
+            if new_total - self.current_bet < FIXED_MIN_RAISE: return False, f"最小加注为 {FIXED_MIN_RAISE}"
+            self.chips[uid] -= total_raise
+            self.round_bets[uid] += total_raise
+            self.pot += total_raise
+            self.total_bet[uid] += total_raise
+            self.current_bet = new_total
+            self.acted_this_round = {uid}
+            self.last_aggressor = uid
+            desc = f"加注 {total_raise}"
+        else:
+            return False, "未知操作"
 
-            alive = [p for p in self.active_players if p not in self.folded]
-            if len(alive) == 1 or all(p in self.all_in for p in alive):
-                self.phase = 'showdown'; return True, desc
-            if self.all_acted_or_allin():
-                self._end_round(); return True, desc
-            self.next_player()
-            if self.current_player() is None or self.all_acted_or_allin():
-                self._end_round()
-            return True, desc
+        alive = [p for p in self.active_players if p not in self.folded]
+        if len(alive) == 1 or all(p in self.all_in for p in alive):
+            self.phase = 'showdown'; return True, desc
+        if self.all_acted_or_allin():
+            self._end_round(); return True, desc
+        self.next_player()
+        if self.current_player() is None or self.all_acted_or_allin():
+            self._end_round()
+        return True, desc
 
     def current_player(self):
         if not self.active_players or self.actor_idx >= len(self.active_players): return None
@@ -632,17 +614,13 @@ async def settle_game(game, app):
         names = [await get_name(app, uid) for uid in broke]
         broke_text = f"\n⚠️ 以下玩家筹码归零: {', '.join(names)}，使用 /add 补充"
 
-    async with poker_profit_lock:
-        for uid, net in profits.items():
-            poker_profit[game.chat_id][uid] += net
-    async with chips_lock:
-        game._save_chips()
+    for uid, net in profits.items():
+        poker_profit[game.chat_id][uid] += net
+    game._save_chips()
     for uid in game.players:
         await grant_emergency_if_needed(game.chat_id, uid, app)
 
-    profit_rank = {}
-    async with poker_profit_lock:
-        profit_rank = dict(poker_profit.get(game.chat_id, {}))
+    profit_rank = poker_profit.get(game.chat_id, {})
     rank_lines = []
     if profit_rank:
         sorted_rank = sorted(profit_rank.items(), key=lambda x: x[1], reverse=True)
@@ -658,18 +636,13 @@ async def settle_game(game, app):
         ("\n" + "\n".join(rank_lines) if rank_lines else "")
     )
     await safe_send(app.bot, game.chat_id, win_text)
-    try:
-        async with games_lock:
-            active_poker_games.pop(game.chat_id, None)
-    except:
-        pass
+    active_poker_games.pop(game.chat_id, None)
 
-# ==================== 赛马 ====================
+# ==================== 赛马（完全重写启动逻辑） ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
         self.owner_id = owner_id
-        self.lock = asyncio.Lock()
         self.bets = {}
         self.total_bets = [0] * HORSE_COUNT
         self.pool = initial_pool
@@ -698,26 +671,24 @@ class HorseRace:
         self.app = app
 
     async def place_bet(self, user_id, horse_idx, amount):
-        async with self.lock:
-            if self.phase != 'betting':
-                return False, "当前不是下注阶段"
-            if horse_idx < 0 or horse_idx >= HORSE_COUNT:
-                return False, "无效的马号"
-            async with chips_lock:
-                if user_id not in group_chips[self.chat_id]:
-                    group_chips[self.chat_id][user_id] = STARTING_CHIPS
-                chips = group_chips[self.chat_id][user_id]
-                if amount <= 0 or amount > chips:
-                    return False, f"筹码不足或无效金额（余额:{chips}）"
-                group_chips[self.chat_id][user_id] -= amount
-            if user_id not in self.bets:
-                self.bets[user_id] = {}
-            self.bets[user_id][horse_idx] = self.bets[user_id].get(horse_idx, 0) + amount
-            self.total_bets[horse_idx] += amount
-            self.pool += amount
-            if self.app:
-                await grant_emergency_if_needed(self.chat_id, user_id, self.app)
-            return True, f"成功下注 {amount} 筹码于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}"
+        if self.phase != 'betting':
+            return False, "当前不是下注阶段"
+        if horse_idx < 0 or horse_idx >= HORSE_COUNT:
+            return False, "无效的马号"
+        if user_id not in group_chips[self.chat_id]:
+            group_chips[self.chat_id][user_id] = STARTING_CHIPS
+        chips = group_chips[self.chat_id][user_id]
+        if amount <= 0 or amount > chips:
+            return False, f"筹码不足或无效金额（余额:{chips}）"
+        group_chips[self.chat_id][user_id] -= amount
+        if user_id not in self.bets:
+            self.bets[user_id] = {}
+        self.bets[user_id][horse_idx] = self.bets[user_id].get(horse_idx, 0) + amount
+        self.total_bets[horse_idx] += amount
+        self.pool += amount
+        if self.app:
+            await grant_emergency_if_needed(self.chat_id, user_id, self.app)
+        return True, f"成功下注 {amount} 筹码于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}"
 
     def get_odds(self):
         odds = []
@@ -737,7 +708,6 @@ class HorseRace:
 
     async def start_race(self):
         if self.phase != 'betting':
-            logger.warning(f"start_race 时 phase 不是 betting，当前为 {self.phase}")
             return False
         self.phase = 'racing'
         self.winner = -1
@@ -751,17 +721,11 @@ class HorseRace:
             msg = await safe_send(self.app.bot, self.chat_id, "🏇 比赛开始！正在奔跑中……")
             if msg:
                 self.animation_msg_id = msg.message_id
-            else:
-                logger.warning("赛马动画消息发送失败，但动画将继续进行")
-        # 无论如何启动动画任务
+        # 创建动画任务（无论是否有消息）
         self.animation_task = asyncio.create_task(self._run_animation())
         return True
 
     async def _run_animation(self):
-        if not self.app:
-            logger.error("_run_animation: app 未设置")
-            return
-        logger.info(f"赛马动画开始 chat_id={self.chat_id}")
         while self.phase == 'racing':
             for i in range(HORSE_COUNT):
                 if self.positions[i] < RACE_TRACK_LENGTH:
@@ -769,7 +733,7 @@ class HorseRace:
                     self.positions[i] = min(RACE_TRACK_LENGTH, self.positions[i] + step)
                     if self.positions[i] >= RACE_TRACK_LENGTH and i not in self.arrival_order:
                         self.arrival_order.append(i)
-            if self.animation_msg_id:
+            if self.animation_msg_id and self.app:
                 text = self._build_animation_view()
                 await safe_edit(self.app.bot, self.chat_id, self.animation_msg_id, text)
             if len(self.arrival_order) == HORSE_COUNT:
@@ -780,7 +744,6 @@ class HorseRace:
                 if len(history) > 10:
                     race_history[self.chat_id] = history[-10:]
                 self.phase = 'finished'
-                logger.info(f"赛马动画结束，开始结算 chat_id={self.chat_id}")
                 await self._settle_race()
                 return
             await asyncio.sleep(RACE_ANIMATION_INTERVAL)
@@ -851,35 +814,31 @@ class HorseRace:
             pool = self.pool
             jackpot = race_jackpot.get(self.chat_id, 0)
             available = pool + jackpot
-            async with chips_lock:
-                if available >= total_prize:
-                    for uid, bet, prize in winner_payouts:
-                        group_chips[self.chat_id][uid] += prize
-                        name = await safe_name(uid)
-                        profit = prize - bet
-                        lines.append(f"{name}: 投注{bet} → 获得{prize} (+{profit}) 赔率{winner_odds:.2f}")
-                        async with horse_profit_lock:
-                            horse_profit[self.chat_id][uid] += profit
-                    leftover = pool - total_prize
-                    if leftover > 0:
-                        race_jackpot[self.chat_id] = leftover
-                    else:
-                        used_jackpot = total_prize - pool
-                        race_jackpot[self.chat_id] = jackpot - used_jackpot
+            if available >= total_prize:
+                for uid, bet, prize in winner_payouts:
+                    group_chips[self.chat_id][uid] += prize
+                    name = await safe_name(uid)
+                    profit = prize - bet
+                    lines.append(f"{name}: 投注{bet} → 获得{prize} (+{profit}) 赔率{winner_odds:.2f}")
+                    horse_profit[self.chat_id][uid] += profit
+                leftover = pool - total_prize
+                if leftover > 0:
+                    race_jackpot[self.chat_id] = leftover
                 else:
-                    deficit = total_prize - available
-                    for uid, bet, prize in winner_payouts:
-                        group_chips[self.chat_id][uid] += prize
-                        name = await safe_name(uid)
-                        profit = prize - bet
-                        lines.append(f"{name}: 投注{bet} → 获得{prize} (+{profit}) 赔率{winner_odds:.2f}")
-                        async with horse_profit_lock:
-                            horse_profit[self.chat_id][uid] += profit
-                    race_jackpot[self.chat_id] = 0
-                    lines.append(f"⚠️ 奖池与彩池不足，系统补充 {deficit} 积分")
+                    used_jackpot = total_prize - pool
+                    race_jackpot[self.chat_id] = jackpot - used_jackpot
+            else:
+                deficit = total_prize - available
+                for uid, bet, prize in winner_payouts:
+                    group_chips[self.chat_id][uid] += prize
+                    name = await safe_name(uid)
+                    profit = prize - bet
+                    lines.append(f"{name}: 投注{bet} → 获得{prize} (+{profit}) 赔率{winner_odds:.2f}")
+                    horse_profit[self.chat_id][uid] += profit
+                race_jackpot[self.chat_id] = 0
+                lines.append(f"⚠️ 奖池与彩池不足，系统补充 {deficit} 积分")
 
-        async with horse_profit_lock:
-            profit_rank = dict(horse_profit.get(self.chat_id, {}))
+        profit_rank = horse_profit.get(self.chat_id, {})
         if profit_rank:
             sorted_rank = sorted(profit_rank.items(), key=lambda x: x[1], reverse=True)
             lines.append("\n🏆 赛马盈利排行榜 🏆")
@@ -894,11 +853,7 @@ class HorseRace:
         if self.animation_msg_id:
             try: await self.app.bot.delete_message(self.chat_id, self.animation_msg_id)
             except: pass
-        try:
-            async with games_lock:
-                active_horse_races.pop(self.chat_id, None)
-        except:
-            pass
+        active_horse_races.pop(self.chat_id, None)
 
     def cancel_tasks(self):
         if self.update_task:
@@ -1002,15 +957,9 @@ async def _race_main_loop(race, app):
                     except Exception as e:
                         logger.warning(f"赛马提醒发送失败: {e}")
             if remaining <= 0:
-                try:
-                    logger.info(f"赛马时间到，开始比赛 chat_id={race.chat_id}")
-                    success = await race.start_race()
-                    if not success:
-                        logger.error(f"赛马 start_race 返回 False chat_id={race.chat_id}")
-                except Exception as e:
-                    logger.error(f"调用 start_race 异常: {e}")
-                finally:
-                    break
+                logger.info(f"赛马时间到，开始比赛 chat_id={race.chat_id}")
+                await race.start_race()
+                break
             view = await build_race_view(race, app)
             await safe_edit(app.bot, race.chat_id, race.game_msg_id, view, reply_markup=get_race_buttons())
             await asyncio.sleep(RACE_UPDATE_INTERVAL)
@@ -1030,8 +979,7 @@ async def hourly_race_scheduler(app):
                         jackpot = race_jackpot.get(chat_id, 0)
                         race = HorseRace(chat_id, owner_id=ADMIN_USER_ID, initial_pool=jackpot)
                         if jackpot > 0: race_jackpot[chat_id] = 0
-                        async with games_lock:
-                            active_horse_races[chat_id] = race
+                        active_horse_races[chat_id] = race
                         view = await build_race_view(race, app)
                         msg = await safe_send(app.bot, chat_id, view, reply_markup=get_race_buttons())
                         if msg:
@@ -1067,16 +1015,14 @@ async def cmd_dz(update, context):
         existing = active_poker_games[chat_id]
         if existing.phase == 'waiting' and len(existing.players) < 2:
             existing.cancel_auto_start()
-            async with games_lock:
-                active_poker_games.pop(chat_id, None)
+            active_poker_games.pop(chat_id, None)
         else:
             await update.message.reply_text("当前已有进行中的德州扑克，请等待结束。")
             return
     game = PokerGame(chat_id, update.effective_user.id)
     game.add_player(update.effective_user.id)
     game.app = context.application
-    async with games_lock:
-        active_poker_games[chat_id] = game
+    active_poker_games[chat_id] = game
     plist = [f"{i}. {await get_name(context.application, uid)}" for i, uid in enumerate(game.players, 1)]
     kb = [[InlineKeyboardButton("加入游戏", callback_data="texas_join")]]
     if len(game.players) >= 2: kb.append([InlineKeyboardButton("开始游戏", callback_data="texas_start")])
@@ -1095,8 +1041,7 @@ async def cmd_sm(update, context):
     jackpot = race_jackpot.get(chat_id, 0)
     race = HorseRace(chat_id, update.effective_user.id, initial_pool=jackpot)
     if jackpot > 0: race_jackpot[chat_id] = 0
-    async with games_lock:
-        active_horse_races[chat_id] = race
+    active_horse_races[chat_id] = race
     view = await build_race_view(race, context.application)
     msg = await safe_send(context.bot, chat_id, view, reply_markup=get_race_buttons())
     if msg:
@@ -1106,11 +1051,8 @@ async def cmd_sm(update, context):
 async def cmd_end(update, context):
     if not await need_auth(update, context): return
     chat_id = update.effective_chat.id
-    poker = None
-    race = None
-    async with games_lock:
-        poker = active_poker_games.pop(chat_id, None)
-        race = active_horse_races.pop(chat_id, None)
+    poker = active_poker_games.pop(chat_id, None)
+    race = active_horse_races.pop(chat_id, None)
     if not poker and not race:
         await update.message.reply_text("当前没有进行中的游戏。"); return
     if poker: poker.cancel_timer(); poker.cancel_auto_start()
@@ -1151,8 +1093,7 @@ async def cmd_add(update, context):
     if is_player_in_game(chat_id, target):
         await update.message.reply_text("❌ 该玩家正在游戏中，无法修改筹码")
         return
-    async with chips_lock:
-        group_chips[chat_id][target] = group_chips[chat_id].get(target, STARTING_CHIPS) + amt
+    group_chips[chat_id][target] = group_chips[chat_id].get(target, STARTING_CHIPS) + amt
     await update.message.reply_text(f"✅ 已给 {await get_name(context.application, target)} 增加 {amt} 筹码，当前: {group_chips[chat_id][target]}")
 
 async def cmd_reduce(update, context):
@@ -1183,24 +1124,21 @@ async def cmd_reduce(update, context):
     if is_player_in_game(chat_id, target):
         await update.message.reply_text("❌ 该玩家正在游戏中，无法修改筹码")
         return
-    async with chips_lock:
-        current = group_chips[chat_id].get(target, STARTING_CHIPS)
-        if current < amt:
-            await update.message.reply_text(f"❌ 该玩家筹码不足，当前仅有 {current}")
-            return
-        group_chips[chat_id][target] -= amt
+    current = group_chips[chat_id].get(target, STARTING_CHIPS)
+    if current < amt:
+        await update.message.reply_text(f"❌ 该玩家筹码不足，当前仅有 {current}")
+        return
+    group_chips[chat_id][target] -= amt
     await update.message.reply_text(f"✅ 已扣除 {await get_name(context.application, target)} {amt} 筹码，剩余: {group_chips[chat_id][target]}")
 
 async def cmd_cx(update, context):
     if not await need_auth(update, context): return
     chat_id = update.effective_chat.id
     merged = defaultdict(int)
-    async with poker_profit_lock:
-        for uid, profit in poker_profit.get(chat_id, {}).items():
-            merged[uid] += profit
-    async with horse_profit_lock:
-        for uid, profit in horse_profit.get(chat_id, {}).items():
-            merged[uid] += profit
+    for uid, profit in poker_profit.get(chat_id, {}).items():
+        merged[uid] += profit
+    for uid, profit in horse_profit.get(chat_id, {}).items():
+        merged[uid] += profit
     if not merged:
         await update.message.reply_text("📊 今日暂无游戏盈亏记录")
         return
@@ -1214,8 +1152,7 @@ async def cmd_cx(update, context):
 async def cmd_ph(update, context):
     if not await need_auth(update, context): return
     chat_id = update.effective_chat.id
-    async with chips_lock:
-        chips = dict(group_chips.get(chat_id, {}))
+    chips = group_chips.get(chat_id, {})
     if not chips: await update.message.reply_text("无筹码记录"); return
     sorted_chips = sorted(chips.items(), key=lambda x: x[1], reverse=True)
     lines = [f"{i}. {await get_name(context.application, u)}: {c}" for i, (u, c) in enumerate(sorted_chips, 1)]
