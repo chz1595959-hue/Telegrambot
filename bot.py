@@ -30,10 +30,10 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START = 9 * 60 + 50
-RACE_UPDATE_INTERVAL = 35
-RACE_ANIMATION_INTERVAL = 1.5
-RACE_TRACK_LENGTH = 14
+RACE_AUTO_START = 9 * 60 + 50       # 9分50秒
+RACE_UPDATE_INTERVAL = 35           # 界面刷新间隔
+RACE_ANIMATION_INTERVAL = 1.5       # 动画更新间隔
+RACE_TRACK_LENGTH = 14              # 赛道长度
 
 # ---------- 牌型中英文映射 ----------
 HAND_NAME_CN = {
@@ -42,7 +42,7 @@ HAND_NAME_CN = {
     "Four of a Kind": "四条", "Straight Flush": "同花顺", "Royal Flush": "皇家同花顺",
 }
 
-# ---------- 全局数据及锁 ----------
+# ---------- 内存存储 ----------
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
 chips_lock = asyncio.Lock()
 
@@ -107,6 +107,8 @@ async def safe_send(bot, chat_id, text, **kwargs):
     return None
 
 async def safe_edit(bot, chat_id, message_id, text, **kwargs):
+    if not message_id:
+        return
     try:
         await bot.edit_message_text(chat_id=chat_id, message_id=message_id, text=text, **kwargs)
     except RetryAfter as e:
@@ -162,19 +164,17 @@ async def auto_delete(message, delay):
     except:
         pass
 
-# ---------- 应急筹码（仅操作全局）----------
 async def grant_emergency_if_needed(chat_id, uid, app):
-    """全局筹码为0且当日未领取时，发放1000应急筹码"""
     async with chips_lock:
         if group_chips[chat_id][uid] == 0 and not daily_emergency_used[chat_id][uid]:
             group_chips[chat_id][uid] = 1000
             daily_emergency_used[chat_id][uid] = True
             name = await get_name(app, uid)
             await safe_send(app.bot, chat_id, f"🆘 {name} 筹码用尽，已自动赠送 1000 应急筹码（今日限一次）")
+            await safe_send(app.bot, chat_id, f"⚠️ 系统已向 {name} 发放应急筹码 1000，请合理使用")
             return True
     return False
 
-# 检查玩家是否正在游戏中（防止管理员修改）
 def is_player_in_game(chat_id, uid):
     poker = active_poker_games.get(chat_id)
     if poker and uid in poker.players and poker.phase != 'waiting':
@@ -232,7 +232,7 @@ async def daily_leaderboard_scheduler(app):
             horse_profit.clear()
         logger.info("每日排行榜发送完成")
 
-# ==================== 德州扑克（移除游戏中应急检查）====================
+# ==================== 德州扑克 ====================
 class PokerGame:
     def __init__(self, chat_id, owner_id):
         self.chat_id = chat_id
@@ -632,14 +632,11 @@ async def settle_game(game, app):
         names = [await get_name(app, uid) for uid in broke]
         broke_text = f"\n⚠️ 以下玩家筹码归零: {', '.join(names)}，使用 /add 补充"
 
-    # 更新全局盈利
     async with poker_profit_lock:
         for uid, net in profits.items():
             poker_profit[game.chat_id][uid] += net
-    # 保存筹码到全局
     async with chips_lock:
         game._save_chips()
-    # 检查全局筹码为0的玩家并触发应急（游戏结束后）
     for uid in game.players:
         await grant_emergency_if_needed(game.chat_id, uid, app)
 
@@ -667,7 +664,7 @@ async def settle_game(game, app):
     except:
         pass
 
-# ==================== 赛马（保持不变） ====================
+# ==================== 赛马（修复动画启动） ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
@@ -718,7 +715,6 @@ class HorseRace:
             self.bets[user_id][horse_idx] = self.bets[user_id].get(horse_idx, 0) + amount
             self.total_bets[horse_idx] += amount
             self.pool += amount
-            # 下注后检查全局筹码为0 → 应急
             if self.app:
                 await grant_emergency_if_needed(self.chat_id, user_id, self.app)
             return True, f"成功下注 {amount} 筹码于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}"
@@ -754,11 +750,12 @@ class HorseRace:
             msg = await safe_send(self.app.bot, self.chat_id, "🏇 比赛开始！正在奔跑中……")
             if msg:
                 self.animation_msg_id = msg.message_id
+        # 即使 msg 为 None，也启动动画（动画函数内会跳过消息编辑）
         self.animation_task = asyncio.create_task(self._run_animation())
         return True
 
     async def _run_animation(self):
-        if not self.app or not self.animation_msg_id:
+        if not self.app:
             return
         while self.phase == 'racing':
             for i in range(HORSE_COUNT):
@@ -767,8 +764,10 @@ class HorseRace:
                     self.positions[i] = min(RACE_TRACK_LENGTH, self.positions[i] + step)
                     if self.positions[i] >= RACE_TRACK_LENGTH and i not in self.arrival_order:
                         self.arrival_order.append(i)
-            text = self._build_animation_view()
-            await safe_edit(self.app.bot, self.chat_id, self.animation_msg_id, text)
+            # 有动画消息才编辑
+            if self.animation_msg_id:
+                text = self._build_animation_view()
+                await safe_edit(self.app.bot, self.chat_id, self.animation_msg_id, text)
             if len(self.arrival_order) == HORSE_COUNT:
                 self.winner = self.arrival_order[0]
                 race_daily_stats[self.chat_id][self.winner] += 1
