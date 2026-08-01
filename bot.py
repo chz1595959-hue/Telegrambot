@@ -23,7 +23,7 @@ STARTING_CHIPS = 20000
 # 按用户要求保留该默认管理员 ID 配置，本次不处理该问题。
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
-SMALL_BLIND, BIG_BLIND, ANTE = 200, 400, 100
+SMALL_BLIND, BIG_BLIND, ANTE = 0, 400, 100
 TURN_TIMEOUT, AUTO_START_TIMEOUT, FIXED_MIN_RAISE = 60, 60, 100
 HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
@@ -491,7 +491,7 @@ async def settle_poker(game, app):
         name_ids = set(game.players) | set(game.showdown_order)
         names = {uid: await get_name(app, uid) for uid in name_ids}
         lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━━━━", f"🂡 公牌：{'  '.join(card_str(card) for card in game.board)}", "", "亮牌："]
-        for uid in game.showdown_order:
+        for uid in game.players:
             suffix = "（弃牌）" if uid in game.folded else ""
             lines.extend([f"{names[uid]}：{'  '.join(card_str(card) for card in game.hands[uid])}｜{hand_types.get(uid, '')}{suffix}", ""])
         lines.append("派奖：")
