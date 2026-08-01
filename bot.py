@@ -20,7 +20,7 @@ RESET_TO_CHIPS = 20000
 # ---------- 德州配置 ----------
 SMALL_BLIND = 200
 BIG_BLIND = 400
-ANTE = 100                   # 底注
+ANTE = 100
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
 AUTO_START_TIMEOUT = 60
@@ -30,7 +30,7 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START = 9 * 60 + 50       # 下注阶段 9 分 50 秒
+RACE_AUTO_START = 9 * 60 + 50       # 9分50秒
 RACE_UPDATE_INTERVAL = 35           # 界面刷新间隔（秒）
 RACE_ANIMATION_INTERVAL = 1.5       # 动画更新间隔（秒）
 RACE_TRACK_LENGTH = 14              # 赛道长度
@@ -127,10 +127,11 @@ async def daily_reset_chips():
         await asyncio.sleep(wait_seconds)
         for chat_id in group_chips:
             for uid in list(group_chips[chat_id].keys()):
-                group_chips[chat_id][uid] = RESET_TO_CHIPS   # 直接重置为2万
+                if group_chips[chat_id][uid] < RESET_TO_CHIPS:
+                    group_chips[chat_id][uid] = RESET_TO_CHIPS
         for chat_id in race_daily_stats:
             race_daily_stats[chat_id] = [0] * HORSE_COUNT
-        logger.info("每日筹码重置完成（全部重置为20000）")
+        logger.info("每日筹码重置完成（不足20000已补足）")
 
 async def daily_leaderboard_scheduler(app):
     while True:
@@ -563,11 +564,9 @@ async def settle_game(game, app):
         names = [await get_name(app, uid) for uid in broke]
         broke_text = f"\n⚠️ 以下玩家筹码归零: {', '.join(names)}，使用 /add 补充"
 
-    # 更新全局德州盈亏
     for uid, net in profits.items():
         poker_profit[game.chat_id][uid] += net
 
-    # 构建德州盈利排行榜（基于全局累计）
     profit_rank = poker_profit.get(game.chat_id, {})
     rank_lines = []
     if profit_rank:
@@ -586,7 +585,7 @@ async def settle_game(game, app):
     await app.bot.send_message(game.chat_id, win_text)
     active_poker_games.pop(game.chat_id, None)
 
-# ==================== 赛马 ====================
+# ==================== 赛马（全新界面+玩家下注列表） ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
@@ -604,6 +603,7 @@ class HorseRace:
         self.app = None
         self.fixed_rates = self._generate_balanced_rates()
         self.notified = set()
+        self.name_cache = {}  # 缓存用户名，避免同步获取
 
     def _generate_balanced_rates(self):
         min_rate = 0.18
@@ -703,7 +703,7 @@ class HorseRace:
 
     def _build_animation_view(self):
         race_id = datetime.fromtimestamp(self.create_time).strftime("%Y%m%d-%H%M")
-        lines = [f"🏇 {race_id} 实况", "━" * 20]
+        lines = [f"🏇 赛马大赛 {race_id} 🏇 【比赛进行中】", "━" * 20]
         for i in range(HORSE_COUNT):
             pos = self.positions[i]
             if pos < RACE_TRACK_LENGTH:
@@ -816,8 +816,8 @@ class HorseRace:
             self.animation_task.cancel()
             self.animation_task = None
 
-# ---------- 赛马界面 ----------
-def build_race_view(race):
+# ---------- 赛马界面（新版）----------
+async def build_race_view(race, app):
     now = time.time()
     elapsed = now - race.create_time
     remaining = max(0, RACE_AUTO_START - elapsed)
@@ -829,27 +829,56 @@ def build_race_view(race):
     daily_stats = race_daily_stats[race.chat_id]
     total_wins = sum(daily_stats) or 1
 
-    lines = [f"🏇 赛马大赛 {race_id} 🏇", "━" * 20]
+    status = "【下注中】" if race.phase == 'betting' else "【比赛进行中】"
+    lines = [f"🏇 赛马大赛 {race_id} 🏇 {status}", "━" * 20]
+    # 静态赛道
     for emoji in HORSE_EMOJI:
         lines.append(f"🏁{'━' * (RACE_TRACK_LENGTH - 1)}{emoji}")
     lines.append("━" * 20)
-    jackpot = race_jackpot.get(race.chat_id, 0)
-    lines.append(f"💰 本期总奖池：{race.pool} 积分 (含累积彩池 {jackpot})")
+
+    # 路书
     if history:
         lines.append(f"📊 路书\n最近10场: {''.join([HORSE_EMOJI[i] for i in history])}")
-    hist_lines = []
+
+    # 当日胜率
+    win_lines = []
     for i in range(HORSE_COUNT):
         wins = daily_stats[i]
-        rate = (wins / total_wins * 100) if total_wins > 0 else 0
-        hist_lines.append(f"  {HORSE_EMOJI[i]} {wins}胜 | {rate:.0f}%")
-    lines.append("📜 历史胜率:\n" + "\n".join(hist_lines))
-    lines.append("📊 综合数据 (下注 | 胜率 | 实时赔率):")
+        win_lines.append(f"{HORSE_EMOJI[i]} {wins}胜")
+    rate_lines = []
+    for i in range(HORSE_COUNT):
+        wins = daily_stats[i]
+        rate = int((wins / total_wins) * 100)
+        rate_lines.append(f"{HORSE_EMOJI[i]} {rate}%")
+    lines.append("📜 当日胜率:\n  " + " | ".join(win_lines))
+    lines.append("  " + " | ".join(rate_lines))
+
+    # 投注情况
+    lines.append("📊 投注情况:")
     for i in range(HORSE_COUNT):
         bet = race.total_bets[i]
         fixed_rate = race.fixed_rates[i] * 100
         odd = odds[i]
-        odd_str = f"{odd:.2f}x"
-        lines.append(f"{HORSE_EMOJI[i]} {HORSE_NAMES[i]}: 下注 {bet} | 胜率 {fixed_rate:.0f}% | 赔率 {odd_str}")
+        lines.append(f"{HORSE_EMOJI[i]} {HORSE_NAMES[i]}: 胜率{fixed_rate:.0f}% | {bet}积分 | 赔率 {odd:.2f}x")
+
+    # 玩家下注列表
+    if race.bets:
+        lines.append("━" * 20)
+        lines.append("📋 玩家下注：")
+        for uid, bets_per_user in race.bets.items():
+            # 尝试从缓存获取名字，否则用ID
+            name = race.name_cache.get(uid)
+            if not name and app:
+                try:
+                    name = await get_name(app, uid)
+                    race.name_cache[uid] = name
+                except:
+                    name = str(uid)
+            if not name:
+                name = str(uid)
+            detail = " ".join([f"{HORSE_EMOJI[horse_idx]}{amt}" for horse_idx, amt in bets_per_user.items()])
+            lines.append(f"{name}: {detail}")
+
     if race.phase == 'betting':
         if remaining > 0:
             lines.append(f"\n⏰ 距离开赛还有 {minutes} 分 {seconds} 秒")
@@ -888,7 +917,7 @@ async def _race_main_loop(race, app):
             if remaining <= 0:
                 await race.start_race()
                 break
-            view = build_race_view(race)
+            view = await build_race_view(race, app)
             try:
                 await app.bot.edit_message_text(
                     chat_id=race.chat_id, message_id=race.game_msg_id,
@@ -912,7 +941,7 @@ async def hourly_race_scheduler(app):
                         race = HorseRace(chat_id, owner_id=ADMIN_USER_ID, initial_pool=jackpot)
                         if jackpot > 0: race_jackpot[chat_id] = 0
                         active_horse_races[chat_id] = race
-                        view = build_race_view(race)
+                        view = await build_race_view(race, app)
                         msg = await app.bot.send_message(chat_id, view, reply_markup=get_race_buttons())
                         race.game_msg_id = msg.message_id
                         start_race_tasks(race, app)
@@ -939,9 +968,15 @@ async def cmd_start(update, context):
 async def cmd_dz(update, context):
     if not await need_auth(update, context): return
     chat_id = update.effective_chat.id
+    # 自动清理残留的等待游戏（玩家不足2人）
     if chat_id in active_poker_games:
-        await update.message.reply_text("当前已有进行中的德州扑克，请等待结束。")
-        return
+        existing = active_poker_games[chat_id]
+        if existing.phase == 'waiting' and len(existing.players) < 2:
+            existing.cancel_auto_start()
+            active_poker_games.pop(chat_id, None)
+        else:
+            await update.message.reply_text("当前已有进行中的德州扑克，请等待结束。")
+            return
     game = PokerGame(chat_id, update.effective_user.id)
     game.add_player(update.effective_user.id)
     active_poker_games[chat_id] = game
@@ -963,7 +998,7 @@ async def cmd_sm(update, context):
     race = HorseRace(chat_id, update.effective_user.id, initial_pool=jackpot)
     if jackpot > 0: race_jackpot[chat_id] = 0
     active_horse_races[chat_id] = race
-    view = build_race_view(race)
+    view = await build_race_view(race, context.application)
     msg = await update.message.reply_text(view, reply_markup=get_race_buttons())
     race.game_msg_id = msg.message_id
     start_race_tasks(race, context.application)
@@ -1036,7 +1071,7 @@ async def cmd_autosm(update, context):
     status = "✅ 已开启" if hourly_race_enabled[chat_id] else "❌ 已关闭"
     await update.message.reply_text(f"{status}整点自动赛马（每小时整点发起）")
 
-# ---------- 按钮回调（按前缀隔离） ----------
+# ---------- 按钮回调 ----------
 async def on_button(update, context):
     q = update.callback_query; data = q.data; chat_id = q.message.chat.id
     if not is_auth(chat_id): await q.answer("未授权", show_alert=True); return
@@ -1113,8 +1148,14 @@ async def horse_button(update, context, race, q, data):
         if not ok: await q.answer(msg, show_alert=True); return
         await action_notify(race.chat_id, context.application, user.id,
                             f"下注 {amt} 于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
+        # 同时缓存用户名，用于界面显示
+        try:
+            name = await get_name(context.application, user.id)
+            race.name_cache[user.id] = name
+        except:
+            pass
 
-# ---------- 文字命令（德州/赛马共存） ----------
+# ---------- 文字命令 ----------
 async def on_text(update, context):
     msg = update.effective_message
     if not msg or not msg.text: return
@@ -1133,6 +1174,10 @@ async def on_text(update, context):
             if not ok: await msg.reply_text(f"❌ {desc}"); return
             await action_notify(chat_id, context.application, user.id,
                                 f"下注 {amt} 于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
+            try:
+                name = await get_name(context.application, user.id)
+                horse_race.name_cache[user.id] = name
+            except: pass
             return
 
     poker_game = active_poker_games.get(chat_id)
