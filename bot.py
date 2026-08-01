@@ -32,7 +32,7 @@ HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
 RACE_AUTO_START = 9 * 60 + 50       # 下注阶段总时长 = 590秒 = 9分50秒
-RACE_UPDATE_INTERVAL = 35           # 界面刷新间隔（秒），平衡响应与限频
+RACE_UPDATE_INTERVAL = 35           # 界面刷新间隔（秒）
 RACE_ANIMATION_INTERVAL = 1.5       # 动画更新间隔（秒）
 RACE_TRACK_LENGTH = 14              # 赛道长度
 
@@ -1148,7 +1148,7 @@ async def horse_button(update, context, race, q, data):
         if not ok: await q.answer(msg, show_alert=True); return
         await action_notify(race.chat_id, context.application, user.id, f"下注 {amt} 于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
 
-# ---------- 文字命令 ----------
+# ---------- 文字命令（已修复赛马阻塞德州加注的问题） ----------
 async def on_text(update, context):
     msg = update.effective_message
     if not msg or not msg.text:
@@ -1157,49 +1157,52 @@ async def on_text(update, context):
     if user.is_bot:
         return
     chat_id = update.effective_chat.id
-    game = active_horse_races.get(chat_id)
 
-    if game and isinstance(game, HorseRace) and game.phase == 'betting':
+    # 优先检查赛马下注（但匹配不到时不返回，继续检查德州）
+    horse_race = active_horse_races.get(chat_id)
+    if horse_race and isinstance(horse_race, HorseRace) and horse_race.phase == 'betting':
         m = re.match(r'^下注\s+(\d+)\s+(\d+)$', msg.text.strip())
-        if not m:
-            if msg.reply_to_message and msg.reply_to_message.message_id == game.game_msg_id:
-                m = re.match(r'^下注\s+(\d+)\s+(\d+)$', msg.text.strip())
-            if not m:
+        if not m and msg.reply_to_message and msg.reply_to_message.message_id == horse_race.game_msg_id:
+            m = re.match(r'^下注\s+(\d+)\s+(\d+)$', msg.text.strip())
+        if m:
+            horse_idx = int(m.group(1)) - 1
+            amt = int(m.group(2))
+            ok, desc = horse_race.place_bet(user.id, horse_idx, amt)
+            if not ok:
+                await msg.reply_text(f"❌ {desc}")
                 return
-        horse_idx = int(m.group(1)) - 1; amt = int(m.group(2))
-        ok, desc = game.place_bet(user.id, horse_idx, amt)
-        if not ok:
-            await msg.reply_text(f"❌ {desc}")
+            await action_notify(chat_id, context.application, user.id,
+                                f"下注 {amt} 于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
             return
-        await action_notify(chat_id, context.application, user.id, f"下注 {amt} 于 {HORSE_EMOJI[horse_idx]} {HORSE_NAMES[horse_idx]}")
-        return
+        # 匹配失败：不要返回，继续往下执行德州加注
 
-    game = active_poker_games.get(chat_id)
-    if game and isinstance(game, PokerGame) and game.phase in ('preflop','flop','turn','river'):
-        if user.id != game.current_player():
+    # 德州加注
+    poker_game = active_poker_games.get(chat_id)
+    if poker_game and isinstance(poker_game, PokerGame) and poker_game.phase in ('preflop','flop','turn','river'):
+        if user.id != poker_game.current_player():
             return
         m = re.match(r'^加注\s*(\d+)$', msg.text.strip())
         if not m:
-            if msg.reply_to_message and msg.reply_to_message.message_id == game.game_msg_id:
+            if msg.reply_to_message and msg.reply_to_message.message_id == poker_game.game_msg_id:
                 m = re.match(r'^加注\s*(\d+)$', msg.text.strip())
             if not m:
                 return
         amt = int(m.group(1))
-        ok, desc = game.handle_action(user.id, 'raise', amount=amt)
+        ok, desc = poker_game.handle_action(user.id, 'raise', amount=amt)
         if not ok:
             await msg.reply_text(f"❌ {desc}")
             return
-        if game.action_msg_id:
+        if poker_game.action_msg_id:
             try:
-                await context.bot.delete_message(chat_id, game.action_msg_id)
+                await context.bot.delete_message(chat_id, poker_game.action_msg_id)
             except:
                 pass
         await action_notify(chat_id, context.application, user.id, desc)
-        if game.phase == 'showdown':
-            await settle_game(game, context.application)
+        if poker_game.phase == 'showdown':
+            await settle_game(poker_game, context.application)
             return
-        await update_table_msg(game, context.application)
-        await start_turn_timer(game, context.application)
+        await update_table_msg(poker_game, context.application)
+        await start_turn_timer(poker_game, context.application)
 
 # ---------- 主函数 ----------
 def main():
