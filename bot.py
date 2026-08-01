@@ -29,7 +29,7 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START, RACE_UPDATE_INTERVAL = 600, 30
+RACE_AUTO_START, RACE_UPDATE_INTERVAL = 20, 30
 RACE_ANIMATION_INTERVAL, RACE_TRACK_LENGTH = 1.5, 14
 DATA_FILE = os.environ.get("DATA_FILE", "bot_data.json")
 DATA_BACKUP_FILE, DATA_TEMP_FILE = f"{DATA_FILE}.bak", f"{DATA_FILE}.tmp"
@@ -229,12 +229,13 @@ async def emergency_if_needed(cid, uid, app, poker=None):
 
 # ==================== 德州扑克 ====================
 def side_pots(total_bets):
-    ordered = sorted((uid, value) for uid, value in total_bets.items() if value > 0)
+    """按实际投入额分层生成主池和边池。"""
+    levels = sorted({amount for amount in total_bets.values() if amount > 0})
     result, previous = [], 0
-    for _, level in ordered:
-        if level <= previous: continue
-        contributors = [uid for uid, amount in ordered if amount >= level]
-        result.append(((level - previous) * len(contributors), contributors)); previous = level
+    for level in levels:
+        contributors = [uid for uid, amount in total_bets.items() if amount >= level]
+        result.append(((level - previous) * len(contributors), contributors))
+        previous = level
     return result
 
 
@@ -420,7 +421,7 @@ async def poker_table_text(game, app):
         f"🃏 积分德州｜{phase}",
         "",
         "━━━━━━━━━━━━━━━━━",
-        f"🂡 公牌：{'  '.join(card_str(card) for card in game.board) or '未发牌'}",
+        f"🃏 公牌：{'  '.join(card_str(card) for card in game.board) or '未发牌'}",
         "",
         f"💰 奖池：{game.pot}｜当前下注：{game.current_bet}",
         "━━━━━━━━━━━━━━━━━",
@@ -503,7 +504,7 @@ async def settle_poker(game, app):
         name_ids = set(game.players) | set(game.showdown_order)
         names = {uid: await get_name(app, uid) for uid in name_ids}
         board_text = "  ".join(card_str(card) for card in game.board) or "未发牌"
-        lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━━━━", f"🂡 公牌：{board_text}", ""]
+        lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━━━━", f"🃏 公牌：{board_text}", ""]
 
         # 仅有两名或以上未弃牌玩家时，才属于正常摊牌并亮手牌。
         if len(game.showdown_order) > 1:
