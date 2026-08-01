@@ -748,29 +748,57 @@ async def refund_poker(game, app, notice):
 
 
 async def cmd_end(update, context):
-    if not await need_auth(update): return
-    cid, uid = update.effective_chat.id, update.effective_user.id; poker, race = active_poker_games.get(cid), active_horse_races.get(cid)
-    owner = poker.owner_id if poker else (race.owner_id if race else None)
-    if owner is None: await update.message.reply_text("当前没有进行中的游戏。"); return
-    allowed_users = set()
-if poker:
-    allowed_users.update(poker.players)
-if race:
-    allowed_users.update(race.bets)
+    if not await need_auth(update):
+        return
 
-if uid != ADMIN_USER_ID and uid not in allowed_users:
-    await update.message.reply_text("❌ 仅 Bot 管理员或当前参与玩家可终止。"); return
-    notices = []
+    cid = update.effective_chat.id
+    uid = update.effective_user.id
+    poker = active_poker_games.get(cid)
+    race = active_horse_races.get(cid)
+
+    if not poker and not race:
+        await update.message.reply_text("当前没有进行中的游戏。")
+        return
+
+    # 德州：已加入本局的玩家可以终止。
+    # 赛马：已下注本局的玩家可以终止。
+    allowed_users = set()
     if poker:
-        await refund_poker(poker, context.application, "🛑 德州扑克已终止，已退还本局全部底注、盲注和下注。")
+        allowed_users.update(poker.players)
+    if race:
+        allowed_users.update(race.bets)
+
+    # Bot 管理员始终可终止；其他人必须是当前游戏参与者。
+    if uid != ADMIN_USER_ID and uid not in allowed_users:
+        await update.message.reply_text("❌ 仅 Bot 管理员或当前参与玩家可终止。")
+        return
+
+    notices = []
+
+    if poker:
+        await refund_poker(
+            poker,
+            context.application,
+            "🛑 德州扑克已终止，已退还本局全部底注、盲注和下注。"
+        )
         notices.append("德州已退款")
+
     if race:
         if race.phase == "betting":
-            if race.task and not race.task.done(): race.task.cancel(); await asyncio.gather(race.task, return_exceptions=True)
-            await race.refund(context.application, "🛑 赛马已终止，所有下注已退款。"); notices.append("赛马已退款")
-        else: notices.append("赛马已进入赛跑/结算阶段，为避免半结算，系统将继续完成结算")
-    save_data(); await update.message.reply_text("；".join(notices))
+            if race.task and not race.task.done():
+                race.task.cancel()
+                await asyncio.gather(race.task, return_exceptions=True)
 
+            await race.refund(
+                context.application,
+                "🛑 赛马已终止，所有下注已退款。"
+            )
+            notices.append("赛马已退款")
+        else:
+            notices.append("赛马已进入赛跑/结算阶段，为避免半结算，系统将继续完成结算")
+
+    save_data()
+    await update.message.reply_text("；".join(notices))
 def player_is_busy(cid, uid):
     poker = active_poker_games.get(cid)
     if poker and poker.phase != "waiting" and uid in poker.players:
