@@ -559,9 +559,9 @@ class HorseRace:
         odds = self.odds()
         lines = [
             f"🏇 赛马大赛 {race_id(self.create_time)} 🏇 【下注中】",
-            "━" * 20,
+            "━" * 14,
             *[f"🏁{'━' * 13}{HORSE_EMOJI[i]}" for i in range(HORSE_COUNT)],
-            "━" * 20,
+            "━" * 14,
             "📊 路书",
             f"最近10场: {history}",
             "📜 当日胜率:",
@@ -571,7 +571,7 @@ class HorseRace:
         ]
         for i, odd in enumerate(odds):
             lines.append(f"{HORSE_EMOJI[i]} {HORSE_NAMES[i]}: 胜率{self.rates[i] * 100:.0f}% | {self.total_bets[i]}积分 | 赔率 {odd:.2f}x")
-        lines.append("━" * 20)
+        lines.append("━" * 14)
         if self.bets:
             lines.append("📋 玩家下注：")
             for uid, bets in self.bets.items():
@@ -583,7 +583,7 @@ class HorseRace:
         return "\n".join(lines)
 
     def animation(self):
-        lines = ["🏇 赛马进行中", "━" * 20]
+        lines = ["🏇 赛马进行中", "━" * 14]
         for i, pos in enumerate(self.positions):
             pos = min(pos, RACE_TRACK_LENGTH)
             track = "🏁" + (HORSE_EMOJI[i] + "━" * RACE_TRACK_LENGTH if pos >= RACE_TRACK_LENGTH else "━" * (RACE_TRACK_LENGTH - pos - 1) + HORSE_EMOJI[i] + "━" * pos)
@@ -816,13 +816,13 @@ async def cmd_cx(update, context):
     if not await need_auth(update): return
     cid, data = update.effective_chat.id, profit_by_date[business_date()].get(update.effective_chat.id, {})
     if not data: await update.message.reply_text("当前业务日暂无盈亏记录。"); return
-    lines = ["📊 当日综合盈亏榜", "━"*20]
+    lines = ["📊 当日综合盈亏榜", "━"*14]
     for i, (uid, value) in enumerate(sorted(data.items(), key=lambda x:x[1], reverse=True)[:10], 1): lines.append(f"{i}. {await get_name(context.application, uid)}：{value:+d}")
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
 async def cmd_ph(update, context):
     if not await need_auth(update): return
-    cid = update.effective_chat.id; lines = ["💰 当前筹码榜", "━"*20]
+    cid = update.effective_chat.id; lines = ["💰 当前筹码榜", "━"*14]
     for i, (uid, value) in enumerate(sorted(group_chips[cid].items(), key=lambda x:x[1], reverse=True)[:20], 1): lines.append(f"{i}. {await get_name(context.application, uid)}：{value}")
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
@@ -943,7 +943,7 @@ async def leaderboard_scheduler(app):
         poker_profit_by_date.pop(date, None); race_profit_by_date.pop(date, None)
         for cid, data in snapshot.items():
             if not data: continue
-            lines = [f"🏆 今日综合排行榜（{date}）", "━"*20]
+            lines = [f"🏆 今日综合排行榜（{date}）", "━"*14]
             for i, (uid, amount) in enumerate(sorted(data.items(), key=lambda x:x[1], reverse=True)[:10], 1): lines.append(f"{i}. {await get_name(app, uid)}：{amount:+d}")
             await safe_send_long(app.bot, cid, "\n".join(lines))
         save_data()
