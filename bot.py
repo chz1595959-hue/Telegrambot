@@ -23,13 +23,13 @@ STARTING_CHIPS = 20000
 # 按用户要求保留该默认管理员 ID 配置，本次不处理该问题。
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
-SMALL_BLIND, BIG_BLIND, ANTE = 100, 400, 100
+SMALL_BLIND, BIG_BLIND, ANTE = 200, 400, 100
 TURN_TIMEOUT, AUTO_START_TIMEOUT, FIXED_MIN_RAISE = 60, 60, 100
 HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START, RACE_UPDATE_INTERVAL = 9 * 60 + 50, 35
+RACE_AUTO_START, RACE_UPDATE_INTERVAL = 9 * 60 + 50, 30
 RACE_ANIMATION_INTERVAL, RACE_TRACK_LENGTH = 1.5, 14
 DATA_FILE = os.environ.get("DATA_FILE", "bot_data.json")
 DATA_BACKUP_FILE, DATA_TEMP_FILE = f"{DATA_FILE}.bak", f"{DATA_FILE}.tmp"
@@ -234,6 +234,8 @@ class PokerGame:
         self.players, self.chips, self.initial_chips = [], {}, {}
         self.total_bet, self.round_bets, self.hands = {}, {}, {}
         self.folded, self.all_in, self.acted = set(), set(), set()
+        # 短全下抬高下注额时，已行动者必须补齐或弃牌，但不能再次加注。
+        self.raise_locked = set()
         self.board, self.deck, self.active = [], [], []
         self.pot = self.current_bet = self.actor_idx = self.dealer_idx = 0
         self.game_msg_id = self.action_msg_id = None
@@ -247,7 +249,7 @@ class PokerGame:
 
     def start(self):
         if len(self.players) < 2: return False
-        self.cancel_auto(); self.folded.clear(); self.all_in.clear(); self.acted.clear(); self.board = []; self.pot = 0; self.settled = False
+        self.cancel_auto(); self.folded.clear(); self.all_in.clear(); self.acted.clear(); self.raise_locked.clear(); self.board = []; self.pot = 0; self.settled = False
         for uid in self.players:
             self.chips[uid] = group_chips[self.chat_id][uid]; self.initial_chips[uid] = self.chips[uid]
             self.total_bet[uid] = self.round_bets[uid] = 0
@@ -299,10 +301,16 @@ class PokerGame:
             paid, old_bet = self.chips[uid], self.current_bet; new_total = self.round_bets[uid] + paid
             self.chips[uid] = 0; self.round_bets[uid] = new_total; self.total_bet[uid] += paid; self.pot += paid; self.all_in.add(uid)
             if new_total > old_bet:
+                raise_size = new_total - old_bet
+                prior_actors = self.acted.copy()
                 self.current_bet = new_total
-                # 任意提高当前下注额的全下都必须让其余未弃牌、未全下玩家重新响应。
-                # 不论是否达到最小加注额，已行动玩家都不能因保留 acted 状态而跳过跟注/弃牌。
+                # 任意抬高下注额的全下都要求其余玩家重新响应。
                 self.acted = {uid}
+                if raise_size < FIXED_MIN_RAISE:
+                    # 短全下不重新开放加注：之前已经行动的玩家只能跟注或弃牌。
+                    self.raise_locked.update(prior_actors - {uid})
+                else:
+                    self.raise_locked.clear()
             else: self.acted.add(uid)
             desc = f"全下 {paid}"
         elif kind == "raise":
@@ -310,7 +318,8 @@ class PokerGame:
             except (TypeError, ValueError): return False, "无效加注额"
             to_call = self.current_bet - self.round_bets[uid]; paid = to_call + extra; new_total = self.round_bets[uid] + paid
             if extra < FIXED_MIN_RAISE or paid > self.chips[uid] or new_total <= self.current_bet: return False, "筹码不足或加注无效"
-            self.chips[uid] -= paid; self.round_bets[uid] = new_total; self.total_bet[uid] += paid; self.pot += paid; self.current_bet = new_total; self.acted = {uid}
+            if uid in self.raise_locked: return False, "短全下后已行动玩家只能跟注或弃牌"
+            self.chips[uid] -= paid; self.round_bets[uid] = new_total; self.total_bet[uid] += paid; self.pot += paid; self.current_bet = new_total; self.acted = {uid}; self.raise_locked.clear()
             if not self.chips[uid]: self.all_in.add(uid)
             desc = f"加注 {extra}"
         else: return False, "未知操作"
@@ -321,7 +330,7 @@ class PokerGame:
         return True, desc
 
     def _end_round(self):
-        self.round_bets = {uid: 0 for uid in self.players}; self.current_bet = 0; self.acted.clear()
+        self.round_bets = {uid: 0 for uid in self.players}; self.current_bet = 0; self.acted.clear(); self.raise_locked.clear()
         if self.phase == "preflop": self.deck.pop(); self.board.extend([self.deck.pop() for _ in range(3)]); self.phase = "flop"
         elif self.phase == "flop": self.deck.pop(); self.board.append(self.deck.pop()); self.phase = "turn"
         elif self.phase == "turn": self.deck.pop(); self.board.append(self.deck.pop()); self.phase = "river"
@@ -382,7 +391,8 @@ def poker_buttons(game, uid):
     if uid != game.current() or uid in game.folded or uid in game.all_in: return InlineKeyboardMarkup(rows)
     to_call = max(0, game.current_bet - game.round_bets[uid])
     rows.append([InlineKeyboardButton("❌ 弃牌", callback_data="texas_fold"), InlineKeyboardButton("✅ 过牌" if not to_call else f"✅ 跟注 {to_call}", callback_data="texas_check" if not to_call else "texas_call")])
-    if game.chips[uid] >= to_call + FIXED_MIN_RAISE: rows.append([InlineKeyboardButton(f"🔼 加注 {FIXED_MIN_RAISE}", callback_data=f"texas_raise_{FIXED_MIN_RAISE}")])
+    if uid not in game.raise_locked and game.chips[uid] >= to_call + FIXED_MIN_RAISE:
+        rows.append([InlineKeyboardButton(f"🔼 加注 {FIXED_MIN_RAISE}", callback_data=f"texas_raise_{FIXED_MIN_RAISE}")])
     if game.chips[uid] > 0: rows.append([InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data="texas_allin")])
     return InlineKeyboardMarkup(rows)
 
@@ -694,11 +704,12 @@ async def cmd_ph(update, context):
     for i, (uid, value) in enumerate(sorted(group_chips[cid].items(), key=lambda x:x[1], reverse=True)[:20], 1): lines.append(f"{i}. {await get_name(context.application, uid)}：{value}")
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
-async def cmd_shouquan(update, context):
-    if not is_bot_admin(update.effective_user.id): return
-    try: cid = int(context.args[0])
-    except (IndexError, ValueError): await update.message.reply_text("用法：/shouquan 群ID"); return
-    AUTHORIZED_GROUPS.add(cid); save_data(); await update.message.reply_text(f"✅ 已授权 {cid}")
+async def cmd_sq(update, context):
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    cid = update.effective_chat.id
+    AUTHORIZED_GROUPS.add(cid); save_data()
+    await update.message.reply_text(f"✅ 当前群已授权：{cid}")
 
 async def cmd_qxshouquan(update, context):
     if not is_bot_admin(update.effective_user.id): return
@@ -837,7 +848,7 @@ def main():
     token = os.environ.get("BOT_TOKEN")
     if not token: logger.error("未设置 BOT_TOKEN"); return
     app = Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
-    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("end",cmd_end),("add",cmd_add),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("shouquan",cmd_shouquan),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
+    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("end",cmd_end),("add",cmd_add),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(on_button)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
