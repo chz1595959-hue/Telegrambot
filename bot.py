@@ -18,8 +18,8 @@ DAILY_RESET_TIME = (0, 0)
 RESET_TO_CHIPS = 20000
 
 # ---------- 德州配置 ----------
-SMALL_BLIND = 200
-BIG_BLIND = 400
+SMALL_BLIND = 100
+BIG_BLIND = 200
 ANTE = 100
 TURN_TIMEOUT = 60
 FIXED_MIN_RAISE = 100
@@ -30,9 +30,9 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START = 20      # 20秒
-RACE_UPDATE_INTERVAL = 35           # 刷新间隔
-RACE_ANIMATION_INTERVAL = 1.5
+RACE_AUTO_START = 20           # 下注阶段总时长（秒）  测试用20秒，正式改为 590
+RACE_UPDATE_INTERVAL = 5       # 界面刷新间隔（秒）  测试用5秒，正式改为 35
+RACE_ANIMATION_INTERVAL = 1.5  # 动画更新间隔
 RACE_TRACK_LENGTH = 14
 
 # ---------- 牌型中英文映射 ----------
@@ -152,7 +152,7 @@ async def daily_reset_chips():
         for chat_id in race_daily_stats:
             race_daily_stats[chat_id] = [0] * HORSE_COUNT
         daily_emergency_used.clear()
-        logger.info("每日筹码重置完成（全部玩家设为20000）")
+        logger.info("每日筹码重置完成")
 
 async def daily_leaderboard_scheduler(app):
     while True:
@@ -175,9 +175,7 @@ async def daily_leaderboard_scheduler(app):
             for idx, (uid, profit) in enumerate(sorted_rank[:10], 1):
                 name = await get_name(app, uid)
                 lines.append(f"{idx}. {name}: {'+' if profit >= 0 else ''}{profit} 积分")
-            try:
-                await safe_send(app.bot, chat_id, "\n".join(lines))
-            except: pass
+            await safe_send(app.bot, chat_id, "\n".join(lines))
         poker_profit.clear()
         horse_profit.clear()
         logger.info("每日排行榜发送完成")
@@ -612,7 +610,7 @@ async def settle_game(game, app):
     await safe_send(app.bot, game.chat_id, win_text)
     active_poker_games.pop(game.chat_id, None)
 
-# ==================== 赛马 ====================
+# ==================== 赛马（终极修复） ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
@@ -829,6 +827,7 @@ class HorseRace:
                     sign = '+' if profit >= 0 else ''
                     lines.append(f"{idx}. {name}: {sign}{profit} 积分")
 
+            # 结算消息必定发送
             await safe_send(self.app.bot, self.chat_id, "\n".join(lines))
 
             if self.animation_msg_id:
