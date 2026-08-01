@@ -30,7 +30,7 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START = 9 * 60 + 50       # 9分50秒
+RACE_AUTO_START = 20      # 20秒
 RACE_UPDATE_INTERVAL = 35           # 刷新间隔
 RACE_ANIMATION_INTERVAL = 1.5
 RACE_TRACK_LENGTH = 14
@@ -612,7 +612,7 @@ async def settle_game(game, app):
     await safe_send(app.bot, game.chat_id, win_text)
     active_poker_games.pop(game.chat_id, None)
 
-# ==================== 赛马（修复版） ====================
+# ==================== 赛马 ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
@@ -698,7 +698,6 @@ class HorseRace:
             except: pass
             msg = await safe_send(self.app.bot, self.chat_id, "🏇 比赛开始！正在奔跑中……")
             self.animation_msg_id = msg.message_id if msg else None
-        # 确保动画任务一定启动（即使发送失败）
         self.animation_task = asyncio.create_task(self._run_animation())
         return True
 
@@ -750,18 +749,19 @@ class HorseRace:
         self.cancel_tasks()
         try:
             if not self.app:
-                logger.error("HorseRace: app 未设置，无法发送结算消息")
+                logger.error("HorseRace: app 未设置")
                 return
 
+            # 预加载所有投注玩家的名称到缓存
+            for uid in self.bets:
+                if uid not in self.name_cache:
+                    try:
+                        self.name_cache[uid] = await get_name(self.app, uid)
+                    except:
+                        self.name_cache[uid] = f"玩家{uid}"
+
             async def safe_name(uid):
-                if uid in self.name_cache:
-                    return self.name_cache[uid]
-                try:
-                    name = await get_name(self.app, uid)
-                    self.name_cache[uid] = name
-                    return name
-                except:
-                    return f"玩家{uid}"
+                return self.name_cache.get(uid, f"玩家{uid}")
 
             if len(self.bets) == 1:
                 winner_odds = 1.01
@@ -829,14 +829,17 @@ class HorseRace:
                     sign = '+' if profit >= 0 else ''
                     lines.append(f"{idx}. {name}: {sign}{profit} 积分")
 
-            # 使用 safe_send 发送结算消息
             await safe_send(self.app.bot, self.chat_id, "\n".join(lines))
 
             if self.animation_msg_id:
                 try: await self.app.bot.delete_message(self.chat_id, self.animation_msg_id)
                 except: pass
+        except Exception as e:
+            logger.error(f"赛马结算异常: {e}")
+            try:
+                await safe_send(self.app.bot, self.chat_id, "⚠️ 赛马已结束，但结算时出现错误，请联系管理员。")
+            except: pass
         finally:
-            # 无论如何都要清除游戏，避免残留
             active_horse_races.pop(self.chat_id, None)
 
     def cancel_tasks(self):
@@ -941,7 +944,7 @@ async def _race_main_loop(race, app):
                     except: pass
             if remaining <= 0:
                 await race.start_race()
-                break  # 确保退出循环，不再继续等待
+                break
             view = await build_race_view(race, app)
             try:
                 await app.bot.edit_message_text(
@@ -1044,7 +1047,6 @@ async def cmd_dz(update, context):
 async def cmd_sm(update, context):
     if not await need_auth(update, context): return
     chat_id = update.effective_chat.id
-    # 自动清理已经结束的残留赛马
     if chat_id in active_horse_races:
         race = active_horse_races[chat_id]
         if race.phase == 'finished':
