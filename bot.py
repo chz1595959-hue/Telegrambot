@@ -2,6 +2,7 @@ import random, os, asyncio, logging, traceback, re, time
 from collections import defaultdict
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import RetryAfter
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from treys import Card, Evaluator
 
@@ -31,8 +32,8 @@ HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
 RACE_AUTO_START = 9 * 60 + 50       # 下注阶段总时长 = 590秒 = 9分50秒
-RACE_UPDATE_INTERVAL = 10           # 界面刷新间隔
-RACE_ANIMATION_INTERVAL = 1.5       # 动画更新间隔
+RACE_UPDATE_INTERVAL = 60           # 界面刷新间隔（秒），降低频率避免卡顿
+RACE_ANIMATION_INTERVAL = 1.5       # 动画更新间隔（秒）
 RACE_TRACK_LENGTH = 14              # 赛道长度
 
 # ---------- 牌型中英文映射 ----------
@@ -692,6 +693,8 @@ class HorseRace:
                     message_id=self.animation_msg_id,
                     text=text
                 )
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after)
             except Exception:
                 pass
             if len(self.arrival_order) == HORSE_COUNT:
@@ -724,6 +727,17 @@ class HorseRace:
 
     async def _settle_race(self):
         self.cancel_tasks()
+        if not self.app:
+            logger.error("HorseRace: app 未设置，无法发送结算消息")
+            active_horse_races.pop(self.chat_id, None)
+            return
+
+        async def safe_name(uid):
+            try:
+                return await get_name(self.app, uid)
+            except:
+                return f"玩家{uid}"
+
         if len(self.bets) == 1:
             winner_odds = 1.01
         else:
@@ -762,7 +776,7 @@ class HorseRace:
             if available >= total_prize:
                 for uid, bet, prize in winner_payouts:
                     group_chips[self.chat_id][uid] += prize
-                    name = await get_name(self.app, uid)
+                    name = await safe_name(uid)
                     profit = prize - bet
                     lines.append(f"{name}: 投注{bet} → 获得{prize} (+{profit}) 赔率{winner_odds:.2f}")
                     horse_profit[self.chat_id][uid] += profit
@@ -776,7 +790,7 @@ class HorseRace:
                 deficit = total_prize - available
                 for uid, bet, prize in winner_payouts:
                     group_chips[self.chat_id][uid] += prize
-                    name = await get_name(self.app, uid)
+                    name = await safe_name(uid)
                     profit = prize - bet
                     lines.append(f"{name}: 投注{bet} → 获得{prize} (+{profit}) 赔率{winner_odds:.2f}")
                     horse_profit[self.chat_id][uid] += profit
@@ -789,7 +803,7 @@ class HorseRace:
             lines.append("\n🏆 赛马大赛排行榜 🏆")
             lines.append("━" * 20)
             for idx, (uid, profit) in enumerate(sorted_rank[:10], 1):
-                name = await get_name(self.app, uid)
+                name = await safe_name(uid)
                 percentage = (profit / total_profit * 100) if total_profit > 0 else 0
                 if idx == 1:
                     lines.append(f"🥇 {name}: +{profit} 积分 ({percentage:.2f}%)")
@@ -803,7 +817,7 @@ class HorseRace:
         try:
             await self.app.bot.send_message(self.chat_id, "\n".join(lines))
         except Exception as e:
-            logger.error(f"发送结算消息失败: {e}")
+            logger.error(f"发送赛马结算消息失败: {e}")
 
         if self.animation_msg_id:
             try:
@@ -916,7 +930,9 @@ async def _race_main_loop(race, app):
                     text=view,
                     reply_markup=get_race_buttons()
                 )
-            except:
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+            except Exception:
                 pass
 
             await asyncio.sleep(RACE_UPDATE_INTERVAL)
