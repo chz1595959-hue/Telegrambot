@@ -752,8 +752,14 @@ async def cmd_end(update, context):
     cid, uid = update.effective_chat.id, update.effective_user.id; poker, race = active_poker_games.get(cid), active_horse_races.get(cid)
     owner = poker.owner_id if poker else (race.owner_id if race else None)
     if owner is None: await update.message.reply_text("当前没有进行中的游戏。"); return
-    # 按需求，群管理员不自动越权；仅 bot 管理员或发起人。
-    if uid != ADMIN_USER_ID and uid != owner: await update.message.reply_text("❌ 仅 Bot 管理员或本局发起人可终止。"); return
+    allowed_users = set()
+if poker:
+    allowed_users.update(poker.players)
+if race:
+    allowed_users.update(race.bets)
+
+if uid != ADMIN_USER_ID and uid not in allowed_users:
+    await update.message.reply_text("❌ 仅 Bot 管理员或当前参与玩家可终止。"); return
     notices = []
     if poker:
         await refund_poker(poker, context.application, "🛑 德州扑克已终止，已退还本局全部底注、盲注和下注。")
