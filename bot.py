@@ -362,15 +362,26 @@ class PokerGame:
         if self._next((self.dealer_idx + 1) % len(self.players)) is None: self.phase = "showdown"
 
     def showdown(self):
-        while len(self.board) < 5:
-            self.deck.pop()
-            if not self.board: self.board.extend([self.deck.pop() for _ in range(3)])
-            else: self.board.append(self.deck.pop())
-        alive = [uid for uid in self.players if uid not in self.folded]; self.showdown_order = alive.copy()
-        if len(alive) == 1:
-            winner = alive[0]; self.chips[winner] += self.pot
-            for uid in self.players: group_chips[self.chat_id][uid] = self.chips[uid]
-            save_data(); return [(winner, "最后赢家", self.pot, [("全部底池", self.pot)], {})]
+    alive = [uid for uid in self.players if uid not in self.folded]
+    self.showdown_order = alive.copy()
+
+    # 所有人弃牌，只剩一名玩家时，直接收下底池：
+    # 不补发公牌，也不公开任何人的手牌。
+    if len(alive) == 1:
+        winner = alive[0]
+        self.chips[winner] += self.pot
+        for uid in self.players:
+            group_chips[self.chat_id][uid] = self.chips[uid]
+        save_data()
+        return [(winner, "最后赢家", self.pot, [("全部底池", self.pot)], {})]
+
+    # 至少两名玩家未弃牌，才进入正常摊牌流程并补齐公牌。
+    while len(self.board) < 5:
+        self.deck.pop()
+        if not self.board:
+            self.board.extend([self.deck.pop() for _ in range(3)])
+        else:
+            self.board.append(self.deck.pop())
         scores = {uid: self.evaluator.evaluate(self.hands[uid], self.board) for uid in alive}
         names = {uid: HAND_NAME_CN.get(self.evaluator.class_to_string(self.evaluator.get_rank_class(score)), "未知") for uid, score in scores.items()}
         payouts = distribute_side_pots(self.total_bet, scores)
@@ -491,12 +502,24 @@ async def settle_poker(game, app):
         date, hand_types = business_date(), result[0][4]
         name_ids = set(game.players) | set(game.showdown_order)
         names = {uid: await get_name(app, uid) for uid in name_ids}
-        lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━", f"🂡 公牌：{'  '.join(card_str(card) for card in game.board)}", "", "亮牌："]
-        for uid in game.players:
-            if uid in game.folded:
-                lines.extend([f"{names[uid]}：弃牌", ""])
-            else:
-                lines.extend([f"{names[uid]}：{'  '.join(card_str(card) for card in game.hands[uid])}｜{hand_types.get(uid, '')}", ""])
+        board_text = "  ".join(card_str(card) for card in game.board) or "未发牌"
+lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━", f"🂡 公牌：{board_text}", ""]
+
+# 仅正常摊牌时亮未弃牌玩家的手牌；
+# 若其余玩家全部弃牌，则赢家直接收池，不公开手牌。
+if len(game.showdown_order) > 1:
+    lines.append("亮牌：")
+    for uid in game.players:
+        if uid in game.folded:
+            lines.extend([f"{names[uid]}：弃牌", ""])
+        else:
+            lines.extend([f"{names[uid]}：{'  '.join(card_str(card) for card in game.hands[uid])}｜{hand_types.get(uid, '')}", ""])
+else:
+    for uid in game.players:
+        if uid in game.folded:
+            lines.extend([f"{names[uid]}：弃牌", ""])
+    lines.append("其余玩家弃牌，剩余玩家直接赢得底池。")
+    lines.append("")
         lines.append("派奖：")
         for uid, hand, amount, details, _ in sorted(result, key=lambda item: item[2], reverse=True):
             lines.extend([f"{names[uid]}：{hand}｜+{amount}（{'，'.join(f'{pool}+{value}' for pool, value in details)}）", ""])
