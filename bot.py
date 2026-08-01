@@ -30,10 +30,10 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
 HORSE_EMOJI = ["🐎", "🐴", "🦄", "🦓"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START = 9 * 60 + 50       # 9分50秒
-RACE_UPDATE_INTERVAL = 35           # 界面刷新间隔
-RACE_ANIMATION_INTERVAL = 1.5       # 动画更新间隔
-RACE_TRACK_LENGTH = 14              # 赛道长度
+RACE_AUTO_START = 9 * 60 + 50
+RACE_UPDATE_INTERVAL = 35
+RACE_ANIMATION_INTERVAL = 1.5
+RACE_TRACK_LENGTH = 14
 
 # ---------- 牌型中英文映射 ----------
 HAND_NAME_CN = {
@@ -664,7 +664,7 @@ async def settle_game(game, app):
     except:
         pass
 
-# ==================== 赛马（修复动画启动） ====================
+# ==================== 赛马 ====================
 class HorseRace:
     def __init__(self, chat_id, owner_id, initial_pool=0):
         self.chat_id = chat_id
@@ -737,6 +737,7 @@ class HorseRace:
 
     async def start_race(self):
         if self.phase != 'betting':
+            logger.warning(f"start_race 时 phase 不是 betting，当前为 {self.phase}")
             return False
         self.phase = 'racing'
         self.winner = -1
@@ -750,13 +751,17 @@ class HorseRace:
             msg = await safe_send(self.app.bot, self.chat_id, "🏇 比赛开始！正在奔跑中……")
             if msg:
                 self.animation_msg_id = msg.message_id
-        # 即使 msg 为 None，也启动动画（动画函数内会跳过消息编辑）
+            else:
+                logger.warning("赛马动画消息发送失败，但动画将继续进行")
+        # 无论如何启动动画任务
         self.animation_task = asyncio.create_task(self._run_animation())
         return True
 
     async def _run_animation(self):
         if not self.app:
+            logger.error("_run_animation: app 未设置")
             return
+        logger.info(f"赛马动画开始 chat_id={self.chat_id}")
         while self.phase == 'racing':
             for i in range(HORSE_COUNT):
                 if self.positions[i] < RACE_TRACK_LENGTH:
@@ -764,7 +769,6 @@ class HorseRace:
                     self.positions[i] = min(RACE_TRACK_LENGTH, self.positions[i] + step)
                     if self.positions[i] >= RACE_TRACK_LENGTH and i not in self.arrival_order:
                         self.arrival_order.append(i)
-            # 有动画消息才编辑
             if self.animation_msg_id:
                 text = self._build_animation_view()
                 await safe_edit(self.app.bot, self.chat_id, self.animation_msg_id, text)
@@ -776,6 +780,7 @@ class HorseRace:
                 if len(history) > 10:
                     race_history[self.chat_id] = history[-10:]
                 self.phase = 'finished'
+                logger.info(f"赛马动画结束，开始结算 chat_id={self.chat_id}")
                 await self._settle_race()
                 return
             await asyncio.sleep(RACE_ANIMATION_INTERVAL)
@@ -992,15 +997,27 @@ async def _race_main_loop(race, app):
                 if remaining <= threshold and threshold not in race.notified:
                     race.notified.add(threshold)
                     time_str = f"{threshold // 60} 分钟" if threshold >= 60 else f"{threshold} 秒"
-                    await safe_send(app.bot, race.chat_id, f"⏰ 赛马大赛即将开始！还有 {time_str}，抓紧下注！")
+                    try:
+                        await safe_send(app.bot, race.chat_id, f"⏰ 赛马大赛即将开始！还有 {time_str}，抓紧下注！")
+                    except Exception as e:
+                        logger.warning(f"赛马提醒发送失败: {e}")
             if remaining <= 0:
-                await race.start_race()
-                break
+                try:
+                    logger.info(f"赛马时间到，开始比赛 chat_id={race.chat_id}")
+                    success = await race.start_race()
+                    if not success:
+                        logger.error(f"赛马 start_race 返回 False chat_id={race.chat_id}")
+                except Exception as e:
+                    logger.error(f"调用 start_race 异常: {e}")
+                finally:
+                    break
             view = await build_race_view(race, app)
             await safe_edit(app.bot, race.chat_id, race.game_msg_id, view, reply_markup=get_race_buttons())
             await asyncio.sleep(RACE_UPDATE_INTERVAL)
     except asyncio.CancelledError:
-        pass
+        logger.info("赛马下注循环被取消")
+    except Exception as e:
+        logger.error(f"赛马下注循环异常: {e}")
 
 # ---------- 整点自动赛马 ----------
 async def hourly_race_scheduler(app):
