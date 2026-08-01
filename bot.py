@@ -23,7 +23,7 @@ STARTING_CHIPS = 20000
 # 按用户要求保留该默认管理员 ID 配置，本次不处理该问题。
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
-SMALL_BLIND, BIG_BLIND, ANTE = 0, 400, 100
+SMALL_BLIND, BIG_BLIND, ANTE = 200, 400, 100
 TURN_TIMEOUT, AUTO_START_TIMEOUT, FIXED_MIN_RAISE = 60, 60, 100
 HORSE_COUNT = 4
 HORSE_NAMES = ["骏马", "战马", "独角兽", "斑马"]
@@ -410,6 +410,7 @@ async def poker_table_text(game, app):
         "",
         "━━━━━━━━━━━━━━━━━━━━",
         f"🂡 公牌：{'  '.join(card_str(card) for card in game.board) or '未发牌'}",
+        "",
         f"💰 奖池：{game.pot}｜当前下注：{game.current_bet}",
         "━━━━━━━━━━━━━━━━━━━━",
     ]
@@ -492,8 +493,10 @@ async def settle_poker(game, app):
         names = {uid: await get_name(app, uid) for uid in name_ids}
         lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━━━━", f"🂡 公牌：{'  '.join(card_str(card) for card in game.board)}", "", "亮牌："]
         for uid in game.players:
-            suffix = "（弃牌）" if uid in game.folded else ""
-            lines.extend([f"{names[uid]}：{'  '.join(card_str(card) for card in game.hands[uid])}｜{hand_types.get(uid, '')}{suffix}", ""])
+            if uid in game.folded:
+                lines.extend([f"{names[uid]}：弃牌", ""])
+            else:
+                lines.extend([f"{names[uid]}：{'  '.join(card_str(card) for card in game.hands[uid])}｜{hand_types.get(uid, '')}", ""])
         lines.append("派奖：")
         for uid, hand, amount, details, _ in sorted(result, key=lambda item: item[2], reverse=True):
             lines.extend([f"{names[uid]}：{hand}｜+{amount}（{'，'.join(f'{pool}+{value}' for pool, value in details)}）", ""])
@@ -823,7 +826,7 @@ async def cmd_cx(update, context):
 async def cmd_ph(update, context):
     if not await need_auth(update): return
     cid = update.effective_chat.id; lines = ["💰 当前筹码榜", "━"*14]
-    for i, (uid, value) in enumerate(sorted(group_chips[cid].items(), key=lambda x:x[1], reverse=True)[:20], 1): lines.append(f"{i}. {await get_name(context.application, uid)}：{value}")
+    for i, (uid, value) in enumerate(sorted(group_chips[cid].items(), key=lambda x:x[1], reverse=True)[:14], 1): lines.append(f"{i}. {await get_name(context.application, uid)}：{value}")
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
 async def cmd_sq(update, context):
