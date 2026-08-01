@@ -657,7 +657,7 @@ class HorseRace:
 
                 lines.extend(["", "💰 本局结算："])
                 for _, name, stake, payout, net in settlements:
-                    lines.append(f"{name}：投注 {stake}｜派彩 {payout}｜盈亏 {net:+d}")
+                    lines.append(f"{name}：投注 {stake}｜派彩 {payout}｜盈亏 {net:+d}｜赔率 {odd:.2f}x")
 
                 round_rank = sorted(settlements, key=lambda item: item[4], reverse=True)
                 lines.extend(["", "🏆 本局赛马盈利排行榜", "━━━━━━━━━━━━━━━━━"])
