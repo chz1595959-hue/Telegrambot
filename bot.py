@@ -127,11 +127,10 @@ async def daily_reset_chips():
         await asyncio.sleep(wait_seconds)
         for chat_id in group_chips:
             for uid in list(group_chips[chat_id].keys()):
-                if group_chips[chat_id][uid] < RESET_TO_CHIPS:
-                    group_chips[chat_id][uid] = RESET_TO_CHIPS
+                group_chips[chat_id][uid] = RESET_TO_CHIPS   # 直接重置为2万
         for chat_id in race_daily_stats:
             race_daily_stats[chat_id] = [0] * HORSE_COUNT
-        logger.info("每日筹码重置完成（不足20000已补足）")
+        logger.info("每日筹码重置完成（全部重置为20000）")
 
 async def daily_leaderboard_scheduler(app):
     while True:
