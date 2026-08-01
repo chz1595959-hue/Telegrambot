@@ -408,11 +408,11 @@ async def poker_table_text(game, app):
     lines = [
         f"🃏 积分德州｜{phase}",
         "",
-        "━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━",
         f"🂡 公牌：{'  '.join(card_str(card) for card in game.board) or '未发牌'}",
         "",
         f"💰 奖池：{game.pot}｜当前下注：{game.current_bet}",
-        "━━━━━━━━━━━━━━━━━━━━",
+        "━━━━━━━━━━━━━━━━━",
     ]
     current = game.current()
     if current:
@@ -491,7 +491,7 @@ async def settle_poker(game, app):
         date, hand_types = business_date(), result[0][4]
         name_ids = set(game.players) | set(game.showdown_order)
         names = {uid: await get_name(app, uid) for uid in name_ids}
-        lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━━━━", f"🂡 公牌：{'  '.join(card_str(card) for card in game.board)}", "", "亮牌："]
+        lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━", f"🂡 公牌：{'  '.join(card_str(card) for card in game.board)}", "", "亮牌："]
         for uid in game.players:
             if uid in game.folded:
                 lines.extend([f"{names[uid]}：弃牌", ""])
@@ -633,7 +633,7 @@ class HorseRace:
                 race_daily_stats[self.chat_id][winner] += 1
                 race_history[self.chat_id] = (race_history[self.chat_id] + [winner])[-10:]
                 standings = ["🥇", "🥈", "🥉", "4."]
-                lines = [f"🏆 赛马大赛 {race_id(self.create_time)} 结果 🏆", "━━━━━━━━━━━━━━━━━━━━"]
+                lines = [f"🏆 赛马大赛 {race_id(self.create_time)} 结果 🏆", "━━━━━━━━━━━━━━━━━"]
                 lines.extend(f"{standings[index]} {HORSE_EMOJI[horse]} {HORSE_NAMES[horse]}" for index, horse in enumerate(self.arrivals))
 
                 settlements, total_payout = [], 0
@@ -660,12 +660,12 @@ class HorseRace:
                     lines.append(f"{name}：投注 {stake}｜派彩 {payout}｜盈亏 {net:+d}")
 
                 round_rank = sorted(settlements, key=lambda item: item[4], reverse=True)
-                lines.extend(["", "🏆 本局赛马盈利排行榜", "━━━━━━━━━━━━━━━━━━━━"])
+                lines.extend(["", "🏆 本局赛马盈利排行榜", "━━━━━━━━━━━━━━━━━"])
                 for index, (_, name, _, _, net) in enumerate(round_rank, 1):
                     lines.append(f"{index}. {name}：{net:+d} 积分")
 
                 day_rank = sorted(race_profit_by_date[date][self.chat_id].items(), key=lambda item: item[1], reverse=True)[:10]
-                lines.extend(["", "🏆 当日赛马累计盈利榜", "━━━━━━━━━━━━━━━━━━━━"])
+                lines.extend(["", "🏆 当日赛马累计盈利榜", "━━━━━━━━━━━━━━━━━"])
                 for index, (uid, amount) in enumerate(day_rank, 1):
                     name = self.name_cache.get(uid) or await get_name(app, uid)
                     self.name_cache[uid] = name
