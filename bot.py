@@ -20,6 +20,9 @@ logger = logging.getLogger(__name__)
 
 # ---------- 配置 ----------
 STARTING_CHIPS = 20000
+ENTERTAINMENT_CHIPS = 20000
+EMERGENCY_CHIPS = 2000
+EMERGENCY_MAX_USES = 3
 # 按用户要求保留该默认管理员 ID 配置，本次不处理该问题。
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
@@ -44,6 +47,7 @@ def rank_marker(index):
 
 # ---------- 数据 ----------
 group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
+entertainment_chips = defaultdict(lambda: defaultdict(lambda: ENTERTAINMENT_CHIPS))
 AUTHORIZED_GROUPS = set()
 race_history = defaultdict(list)
 race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
@@ -57,6 +61,7 @@ hourly_race_enabled = defaultdict(lambda: False)
 daily_emergency_used = defaultdict(lambda: defaultdict(bool))
 # 已实扣的赛马下注，用于 Railway 重启时退款。
 pending_horse_bets = defaultdict(lambda: defaultdict(int))
+pending_horse_bet_modes = defaultdict(lambda: defaultdict(str))
 last_business_date = ""
 active_poker_games, active_horse_races = {}, {}
 background_tasks = set()
@@ -71,6 +76,15 @@ def business_date(now=None):
     return (now + timedelta(days=1) if (now.hour, now.minute) >= (23, 50) else now).strftime("%Y-%m-%d")
 
 
+def is_entertainment_time(now=None):
+    now = now or now_bj()
+    return now.hour == 23
+
+
+def current_game_mode(now=None):
+    return "entertainment" if is_entertainment_time(now) else "official"
+
+
 def restore_nested(target, source):
     for cid, users in source.items():
         for uid, value in users.items(): target[int(cid)][int(uid)] = int(value)
@@ -82,6 +96,7 @@ def save_data():
         with data_save_lock:
             data = {
                 "group_chips": {str(cid): dict(users) for cid, users in group_chips.items()},
+                "entertainment_chips": {str(cid): dict(users) for cid, users in entertainment_chips.items()},
                 "profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in profit_by_date.items()},
                 "poker_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in poker_profit_by_date.items()},
                 "race_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in race_profit_by_date.items()},
@@ -93,6 +108,7 @@ def save_data():
                 "daily_emergency_used": {str(cid): {str(uid): used for uid, used in users.items()} for cid, users in daily_emergency_used.items()},
                 "last_business_date": last_business_date,
                 "pending_horse_bets": {str(cid): dict(users) for cid, users in pending_horse_bets.items()},
+                "pending_horse_bet_modes": {str(cid): dict(users) for cid, users in pending_horse_bet_modes.items()},
             }
             os.makedirs(os.path.dirname(os.path.abspath(DATA_FILE)), exist_ok=True)
             with open(DATA_TEMP_FILE, "w", encoding="utf-8") as file:
@@ -122,6 +138,7 @@ def load_data():
             logger.exception("备份读取失败"); return
     try:
         restore_nested(group_chips, data.get("group_chips", {}))
+        restore_nested(entertainment_chips, data.get("entertainment_chips", {}))
         for date, chats in data.get("profit_by_date", {}).items(): restore_nested(profit_by_date[date], chats)
         for date, chats in data.get("poker_profit_by_date", {}).items(): restore_nested(poker_profit_by_date[date], chats)
         for date, chats in data.get("race_profit_by_date", {}).items(): restore_nested(race_profit_by_date[date], chats)
@@ -131,12 +148,15 @@ def load_data():
         for cid, value in data.get("race_history", {}).items(): race_history[int(cid)] = list(value)[-10:]
         for cid, value in data.get("race_daily_stats", {}).items(): race_daily_stats[int(cid)] = list(value)[:HORSE_COUNT]
         for cid, users in data.get("daily_emergency_used", {}).items():
-            for uid, used in users.items(): daily_emergency_used[int(cid)][int(uid)] = bool(used)
+            for uid, used in users.items(): daily_emergency_used[int(cid)][int(uid)] = min(int(used), EMERGENCY_MAX_USES)
         last_business_date = data.get("last_business_date", "")
         # 德州筹码只保存在局对象里且未实扣持久化余额；只有赛马需要退款。
         for cid, users in data.get("pending_horse_bets", {}).items():
-            for uid, amount in users.items(): group_chips[int(cid)][int(uid)] += int(amount)
-        pending_horse_bets.clear(); save_data()
+            for uid, amount in users.items():
+                mode = data.get("pending_horse_bet_modes", {}).get(cid, {}).get(uid, "official")
+                wallet = entertainment_chips if mode == "entertainment" else group_chips
+                wallet[int(cid)][int(uid)] += int(amount)
+        pending_horse_bets.clear(); pending_horse_bet_modes.clear(); save_data()
     except Exception:
         logger.exception("恢复数据失败")
 
@@ -225,11 +245,13 @@ async def action_notice(cid, app, uid, desc):
 
 
 async def emergency_if_needed(cid, uid, app, poker=None):
-    if group_chips[cid][uid] != 0 or daily_emergency_used[cid][uid]: return False
-    group_chips[cid][uid] = 1000
-    if poker and uid in poker.chips: poker.chips[uid] += 1000
-    daily_emergency_used[cid][uid] = True; save_data()
-    await safe_send(app.bot, cid, f"🆘 {await get_name(app, uid)} 筹码归零，已赠送 1000 应急筹码（日限一次）。")
+    used = daily_emergency_used[cid][uid]
+    if group_chips[cid][uid] != 0 or used >= EMERGENCY_MAX_USES: return False
+    group_chips[cid][uid] = EMERGENCY_CHIPS
+    if poker and uid in poker.chips: poker.chips[uid] += EMERGENCY_CHIPS
+    daily_emergency_used[cid][uid] = used + 1; save_data()
+    remaining = EMERGENCY_MAX_USES - daily_emergency_used[cid][uid]
+    await safe_send(app.bot, cid, f"🆘 {await get_name(app, uid)} 筹码归零，已赠送 {EMERGENCY_CHIPS} 应急筹码（今日已补充 {daily_emergency_used[cid][uid]}/{EMERGENCY_MAX_USES} 次，剩余 {remaining} 次）。")
     return True
 
 
@@ -259,8 +281,8 @@ def distribute_side_pots(total_bets, scores):
 
 
 class PokerGame:
-    def __init__(self, cid, owner):
-        self.chat_id, self.owner_id, self.phase = cid, owner, "waiting"
+    def __init__(self, cid, owner, mode=None):
+        self.chat_id, self.owner_id, self.mode, self.phase = cid, owner, mode or current_game_mode(), "waiting"
         self.players, self.chips, self.initial_chips = [], {}, {}
         self.total_bet, self.round_bets, self.hands = {}, {}, {}
         self.folded, self.all_in, self.acted = set(), set(), set()
@@ -274,15 +296,17 @@ class PokerGame:
 
     def add(self, uid):
         if self.phase != "waiting" or uid in self.players: return False
-        if group_chips[self.chat_id][uid] < ANTE: return False
-        self.players.append(uid); self.chips[uid] = group_chips[self.chat_id][uid]; self.total_bet[uid] = 0
+        wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+        if wallet[self.chat_id][uid] < ANTE: return False
+        self.players.append(uid); self.chips[uid] = wallet[self.chat_id][uid]; self.total_bet[uid] = 0
         return True
 
     def start(self):
         if len(self.players) < 2: return False
         self.cancel_auto(); self.cancel_wait(); self.folded.clear(); self.all_in.clear(); self.acted.clear(); self.raise_locked.clear(); self.board = []; self.pot = 0; self.settled = False
+        wallet = entertainment_chips if self.mode == "entertainment" else group_chips
         for uid in self.players:
-            self.chips[uid] = group_chips[self.chat_id][uid]; self.initial_chips[uid] = self.chips[uid]
+            self.chips[uid] = wallet[self.chat_id][uid]; self.initial_chips[uid] = self.chips[uid]
             self.total_bet[uid] = self.round_bets[uid] = 0
             ante = min(ANTE, self.chips[uid]); self.chips[uid] -= ante; self.total_bet[uid] += ante; self.pot += ante
             if not self.chips[uid]: self.all_in.add(uid)
@@ -379,8 +403,9 @@ class PokerGame:
         if len(alive) == 1:
             winner = alive[0]
             self.chips[winner] += self.pot
+            wallet = entertainment_chips if self.mode == "entertainment" else group_chips
             for uid in self.players:
-                group_chips[self.chat_id][uid] = self.chips[uid]
+                wallet[self.chat_id][uid] = self.chips[uid]
             save_data()
             return [(winner, "最后赢家", self.pot, [("全部底池", self.pot)], {})]
 
@@ -395,7 +420,8 @@ class PokerGame:
         names = {uid: HAND_NAME_CN.get(self.evaluator.class_to_string(self.evaluator.get_rank_class(score)), "未知") for uid, score in scores.items()}
         payouts = distribute_side_pots(self.total_bet, scores)
         for uid, item in payouts.items(): self.chips[uid] += item["amount"]
-        for uid in self.players: group_chips[self.chat_id][uid] = self.chips[uid]
+        wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+        for uid in self.players: wallet[self.chat_id][uid] = self.chips[uid]
         save_data(); return [(uid, names[uid], item["amount"], item["details"], names) for uid, item in payouts.items()]
 
     def cancel_timer(self):
@@ -429,7 +455,7 @@ async def poker_table_text(game, app):
         f"🃏 积分德州｜{phase}",
         "",
         "━━━━━━━━━━━━━━━━━",
-        f"🂡 公牌：{'  '.join(card_str(card) for card in game.board) or '未发牌'}",
+        f"🃏 公牌：{'  '.join(card_str(card) for card in game.board) or '未发牌'}",
         "",
         f"💰 奖池：{game.pot}｜当前下注：{game.current_bet}",
         "━━━━━━━━━━━━━━━━━",
@@ -510,9 +536,13 @@ async def settle_poker(game, app):
         if not result: raise RuntimeError("德州摊牌未生成结算结果")
         date, hand_types = business_date(), result[0][4]
         name_ids = set(game.players) | set(game.showdown_order)
+        if game.mode == "entertainment":
+            lines_mode_notice = "🎮 娱乐局：本局不计入正式盈亏榜，娱乐筹码将在 00:00 清零。"
+        else:
+            lines_mode_notice = ""
         names = {uid: await get_name(app, uid) for uid in name_ids}
         board_text = "  ".join(card_str(card) for card in game.board) or "未发牌"
-        lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━", f"🂡 公牌：{board_text}", ""]
+        lines = ["🃏 德州结算", "━━━━━━━━━━━━━━━━━", f"🃏 公牌：{board_text}", ""]
 
         # 仅有两名或以上未弃牌玩家时，才属于正常摊牌并亮手牌。
         if len(game.showdown_order) > 1:
@@ -535,14 +565,18 @@ async def settle_poker(game, app):
         lines.append("派奖：")
         for uid, hand, amount, details, _ in sorted(result, key=lambda item: item[2], reverse=True):
             lines.extend([f"{names[uid]}：{hand}｜+{amount}（{'，'.join(f'{pool}+{value}' for pool, value in details)}）", ""])
+        if lines_mode_notice:
+            lines.extend([lines_mode_notice, ""])
         lines.append("投入 / 盈亏：")
         for uid in game.players:
             net = game.chips[uid] - game.initial_chips[uid]
-            profit_by_date[date][game.chat_id][uid] += net
-            poker_profit_by_date[date][game.chat_id][uid] += net
+            if game.mode == "official":
+                profit_by_date[date][game.chat_id][uid] += net
+                poker_profit_by_date[date][game.chat_id][uid] += net
             lines.extend([f"{names[uid]}：投入 {game.total_bet[uid]}｜盈亏 {net:+d}", ""])
-        rank = sorted(poker_profit_by_date[date][game.chat_id].items(), key=lambda item: item[1], reverse=True)[:50]
-        lines.extend(["🏆 当日德州累计盈利榜", *[f"{rank_marker(index)} {names.get(uid) or await get_name(app, uid)}：{amount:+d}" for index, (uid, amount) in enumerate(rank, 1)]])
+        if game.mode == "official":
+            rank = sorted(poker_profit_by_date[date][game.chat_id].items(), key=lambda item: item[1], reverse=True)[:50]
+            lines.extend(["🏆 当日德州累计盈利榜", *[f"{rank_marker(index)} {names.get(uid) or await get_name(app, uid)}：{amount:+d}" for index, (uid, amount) in enumerate(rank, 1)]])
         delivered = await safe_send_long(app.bot, game.chat_id, "\n".join(lines))
         if delivered is None:
             await safe_send(app.bot, game.chat_id, "⚠️ 德州已完成结算，但详细结算消息发送失败。筹码与当日盈亏已保存，可使用 /cx 查看排行榜。")
@@ -551,15 +585,17 @@ async def settle_poker(game, app):
         await safe_send(app.bot, game.chat_id, "⚠️ 德州结算消息生成异常，请管理员检查日志；系统已保留结算状态并保存当前筹码。")
     finally:
         if active_poker_games.get(game.chat_id) is game: active_poker_games.pop(game.chat_id, None)
-        for uid in game.players:
-            await emergency_if_needed(game.chat_id, uid, app, game)
+        if game.mode == "official":
+            for uid in game.players:
+                await emergency_if_needed(game.chat_id, uid, app, game)
         save_data()
 
 
 # ==================== 赛马 ====================
 class HorseRace:
-    def __init__(self, cid, owner, jackpot):
+    def __init__(self, cid, owner, jackpot, mode=None):
         self.chat_id, self.owner_id, self.jackpot = cid, owner, jackpot
+        self.mode = mode or current_game_mode()
         self.bets, self.total_bets, self.pool = defaultdict(dict), [0] * HORSE_COUNT, 0
         self.phase, self.create_time, self.positions, self.arrivals = "betting", time.time(), [0] * HORSE_COUNT, []
         self.notified, self.name_cache = set(), {}
@@ -579,9 +615,12 @@ class HorseRace:
 
     def bet(self, uid, horse, amount):
         if self.phase != "betting" or self.cancelled: return False, "当前不是下注阶段"
-        if not 0 <= horse < HORSE_COUNT or amount <= 0 or amount > group_chips[self.chat_id][uid]: return False, "马号、金额或筹码无效"
-        group_chips[self.chat_id][uid] -= amount; self.pool += amount; self.total_bets[horse] += amount
-        self.bets[uid][horse] = self.bets[uid].get(horse, 0) + amount; pending_horse_bets[self.chat_id][uid] += amount
+        wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+        if not 0 <= horse < HORSE_COUNT or amount <= 0 or amount > wallet[self.chat_id][uid]: return False, "马号、金额或筹码无效"
+        wallet[self.chat_id][uid] -= amount; self.pool += amount; self.total_bets[horse] += amount
+        self.bets[uid][horse] = self.bets[uid].get(horse, 0) + amount
+        pending_horse_bets[self.chat_id][uid] += amount
+        pending_horse_bet_modes[self.chat_id][uid] = self.mode
         save_data(); return True, "下注成功"
 
     def buttons(self):
@@ -665,8 +704,9 @@ class HorseRace:
             try:
                 if not self.arrivals: raise RuntimeError("赛马未产生到达顺序")
                 winner, odd, date = self.arrivals[0], self.odds()[self.arrivals[0]], business_date()
-                race_daily_stats[self.chat_id][winner] += 1
-                race_history[self.chat_id] = (race_history[self.chat_id] + [winner])[-10:]
+                if self.mode == "official":
+                    race_daily_stats[self.chat_id][winner] += 1
+                    race_history[self.chat_id] = (race_history[self.chat_id] + [winner])[-10:]
                 standings = ["🥇", "🥈", "🥉", "🏅"]
                 lines = [f"🏆 赛马大赛 {race_id(self.create_time)} 结果 🏆", "━━━━━━━━━━━━━━━━━"]
                 lines.extend(f"{standings[index]} {HORSE_EMOJI[horse]} {HORSE_NAMES[horse]}" for index, horse in enumerate(self.arrivals))
@@ -675,16 +715,19 @@ class HorseRace:
                 for uid, bets in self.bets.items():
                     stake, payout = sum(bets.values()), int(bets.get(winner, 0) * odd)
                     net = payout - stake
-                    group_chips[self.chat_id][uid] += payout; total_payout += payout
-                    profit_by_date[date][self.chat_id][uid] += net
-                    race_profit_by_date[date][self.chat_id][uid] += net
+                    wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+                    wallet[self.chat_id][uid] += payout; total_payout += payout
+                    if self.mode == "official":
+                        profit_by_date[date][self.chat_id][uid] += net
+                        race_profit_by_date[date][self.chat_id][uid] += net
                     name = self.name_cache.get(uid) or await get_name(app, uid)
                     self.name_cache[uid] = name
                     settlements.append((uid, name, stake, payout, net))
 
                 available_pool = self.jackpot + self.pool
                 supplement = max(0, total_payout - available_pool)
-                race_jackpot[self.chat_id] = max(0, available_pool - total_payout)
+                if self.mode == "official":
+                    race_jackpot[self.chat_id] = max(0, available_pool - total_payout)
                 if supplement:
                     lines.extend(["", f"⚠️ 奖池不足，系统补充 {supplement} 积分"])
                 elif not total_payout:
@@ -699,33 +742,45 @@ class HorseRace:
                 for index, (_, name, _, _, net) in enumerate(round_rank, 1):
                     lines.append(f"{rank_marker(index)} {name}：{net:+d} 积分")
 
-                day_rank = sorted(race_profit_by_date[date][self.chat_id].items(), key=lambda item: item[1], reverse=True)[:50]
-                lines.extend(["", "🏆 当日赛马累计盈利榜", "━━━━━━━━━━━━━━━━━"])
-                for index, (uid, amount) in enumerate(day_rank, 1):
-                    name = self.name_cache.get(uid) or await get_name(app, uid)
-                    self.name_cache[uid] = name
-                    lines.append(f"{rank_marker(index)} {name}：{amount:+d}")
-                pending_horse_bets.pop(self.chat_id, None); self.phase = "finished"; save_data()
+                if self.mode == "official":
+                    day_rank = sorted(race_profit_by_date[date][self.chat_id].items(), key=lambda item: item[1], reverse=True)[:50]
+                    lines.extend(["", "🏆 当日赛马累计盈利榜", "━━━━━━━━━━━━━━━━━"])
+                    for index, (uid, amount) in enumerate(day_rank, 1):
+                        name = self.name_cache.get(uid) or await get_name(app, uid)
+                        self.name_cache[uid] = name
+                        lines.append(f"{rank_marker(index)} {name}：{amount:+d}")
+                else:
+                    lines.extend(["", "🎮 娱乐局：本局不计入正式盈亏榜，娱乐筹码将在 00:00 清零。"])
+                pending_horse_bets.pop(self.chat_id, None); pending_horse_bet_modes.pop(self.chat_id, None); self.phase = "finished"; save_data()
                 delivered = await safe_send_long(app.bot, self.chat_id, "\n".join(lines))
                 if delivered is None:
                     await safe_send(app.bot, self.chat_id, "⚠️ 赛马已完成结算，但详细结果消息发送失败。筹码与当日盈亏已保存，可使用 /cx 查看排行榜。")
             except Exception:
                 logger.exception("赛马结算异常，群 %s", self.chat_id)
                 await safe_send(app.bot, self.chat_id, "⚠️ 赛马结算异常，请管理员检查日志；本局将退款以保护玩家筹码。")
+                wallet = entertainment_chips if self.mode == "entertainment" else group_chips
                 for uid, bets in self.bets.items():
-                    group_chips[self.chat_id][uid] += sum(bets.values())
-                pending_horse_bets.pop(self.chat_id, None); race_jackpot[self.chat_id] = self.jackpot; save_data()
+                    wallet[self.chat_id][uid] += sum(bets.values())
+                pending_horse_bets.pop(self.chat_id, None)
+                pending_horse_bet_modes.pop(self.chat_id, None)
+                if self.mode == "official": race_jackpot[self.chat_id] = self.jackpot
+                save_data()
             finally:
                 await safe_delete(app.bot, self.chat_id, self.animation_msg_id)
                 if active_horse_races.get(self.chat_id) is self: active_horse_races.pop(self.chat_id, None)
-                for uid in self.bets: await emergency_if_needed(self.chat_id, uid, app)
+                if self.mode == "official":
+                    for uid in self.bets: await emergency_if_needed(self.chat_id, uid, app)
 
     async def refund(self, app, notice):
         async with self.lock:
             if self.cancelled: return
             self.cancelled, self.phase = True, "cancelled"
-            for uid, bets in self.bets.items(): group_chips[self.chat_id][uid] += sum(bets.values())
-            pending_horse_bets.pop(self.chat_id, None); race_jackpot[self.chat_id] += self.jackpot; save_data()
+            wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+            for uid, bets in self.bets.items(): wallet[self.chat_id][uid] += sum(bets.values())
+            pending_horse_bets.pop(self.chat_id, None)
+            pending_horse_bet_modes.pop(self.chat_id, None)
+            if self.mode == "official": race_jackpot[self.chat_id] += self.jackpot
+            save_data()
             if active_horse_races.get(self.chat_id) is self: active_horse_races.pop(self.chat_id, None)
             await safe_edit(app.bot, self.chat_id, self.game_msg_id, notice, reply_markup=None)
 
@@ -744,8 +799,11 @@ async def cmd_start(update, context): await update.message.reply_text("使用 /d
 async def cmd_dz(update, context):
     if not await need_auth(update): return
     cid, uid = update.effective_chat.id, update.effective_user.id; game = active_poker_games.get(cid)
-    if group_chips[cid][uid] < ANTE:
-        await update.message.reply_text(f"❌ 进入德州至少需要 {ANTE} 筹码。"); return
+    mode = game.mode if game and game.phase == "waiting" else current_game_mode()
+    wallet = entertainment_chips if mode == "entertainment" else group_chips
+    if wallet[cid][uid] < ANTE:
+        label = "娱乐筹码" if mode == "entertainment" else "筹码"
+        await update.message.reply_text(f"❌ 进入德州至少需要 {ANTE} {label}。"); return
     if game:
         if game.phase != "waiting": await update.message.reply_text("当前已有进行中的德州扑克。"); return
         if game.add(uid):
@@ -755,7 +813,7 @@ async def cmd_dz(update, context):
                 await start_auto_game(game, context.application)
         else: await update.message.reply_text("你已在等待房间中。")
         return
-    game = PokerGame(cid, uid); game.add(uid); active_poker_games[cid] = game
+    game = PokerGame(cid, uid, mode); game.add(uid); active_poker_games[cid] = game
     msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("加入游戏", callback_data="texas_join")]]))
     if msg:
         game.game_msg_id = msg.message_id
@@ -765,7 +823,9 @@ async def cmd_sm(update, context):
     if not await need_auth(update): return
     cid = update.effective_chat.id
     if cid in active_horse_races: await update.message.reply_text("当前已有赛马进行中。"); return
-    race = HorseRace(cid, update.effective_user.id, race_jackpot.pop(cid, 0)); active_horse_races[cid] = race
+    mode = current_game_mode()
+    jackpot = race_jackpot.pop(cid, 0) if mode == "official" else 0
+    race = HorseRace(cid, update.effective_user.id, jackpot, mode); active_horse_races[cid] = race
     msg = await safe_send(context.bot, cid, await race.view(context.application), reply_markup=race.buttons())
     if msg: race.game_msg_id = msg.message_id
     race.task = asyncio.create_task(race.run(context.application)); save_data()
@@ -773,9 +833,10 @@ async def cmd_sm(update, context):
 async def refund_poker(game, app, notice):
     """终止未结算牌局时，按开局筹码退还全部 ante、盲注和后续下注。"""
     game.cancel_timer(); game.cancel_auto(); game.cancel_wait()
+    wallet = entertainment_chips if game.mode == "entertainment" else group_chips
     for player_id in game.players:
         # 德州下注只在局对象中暂扣；显式恢复开局余额，避免后续改动破坏退款语义。
-        group_chips[game.chat_id][player_id] = game.initial_chips.get(player_id, group_chips[game.chat_id][player_id])
+        wallet[game.chat_id][player_id] = game.initial_chips.get(player_id, wallet[game.chat_id][player_id])
     game.phase = "cancelled"
     if active_poker_games.get(game.chat_id) is game:
         active_poker_games.pop(game.chat_id, None)
@@ -896,8 +957,14 @@ async def cmd_cx(update, context):
 
 async def cmd_ph(update, context):
     if not await need_auth(update): return
-    cid = update.effective_chat.id; lines = ["💰 当前筹码榜", "━"*14]
-    for i, (uid, value) in enumerate(sorted(group_chips[cid].items(), key=lambda x:x[1], reverse=True)[:50], 1): lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value}")
+    cid = update.effective_chat.id
+    lines = ["💰 当前筹码榜", "━"*14]
+    for i, (uid, value) in enumerate(sorted(group_chips[cid].items(), key=lambda x:x[1], reverse=True)[:50], 1):
+        lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：正式 {value}")
+    if is_entertainment_time():
+        lines.extend(["", "🎮 娱乐筹码（23:00-00:00）", "━"*14])
+        for i, (uid, value) in enumerate(sorted(entertainment_chips[cid].items(), key=lambda x:x[1], reverse=True)[:50], 1):
+            lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：娱乐 {value}")
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
 async def cmd_sq(update, context):
@@ -932,8 +999,10 @@ async def on_button(update, context):
         if data == "texas_hand":
             hand = game.hands.get(uid); await q.answer(f"你的手牌：{card_str(hand[0])}  {card_str(hand[1])}" if hand and uid not in game.folded else "当前无法查看手牌", show_alert=True); return
         if game.phase == "waiting":
-            if data == "texas_join" and group_chips[cid][uid] < ANTE:
-                await q.answer(f"进入德州至少需要 {ANTE} 筹码", show_alert=True)
+            wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+            if data == "texas_join" and wallet[cid][uid] < ANTE:
+                label = "娱乐筹码" if game.mode == "entertainment" else "筹码"
+                await q.answer(f"进入德州至少需要 {ANTE} {label}", show_alert=True)
             elif data == "texas_join" and game.add(uid):
                 await q.answer("已加入"); await update_poker_waiting(game, context.application)
                 if len(game.players) >= 2:
@@ -989,7 +1058,7 @@ async def on_text(update, context):
 
 
 # ---------- 定时任务与启动 ----------
-async def daily_reset_scheduler():
+async def daily_reset_scheduler(app):
     global last_business_date
     today = now_bj().strftime("%Y-%m-%d")
     # 第一次启动只记录业务日，避免因部署重启立刻重置玩家筹码。
@@ -999,7 +1068,18 @@ async def daily_reset_scheduler():
         now = now_bj(); target = (now + timedelta(days=1)).replace(hour=0, minute=0, second=1, microsecond=0)
         await asyncio.sleep((target-now).total_seconds())
         today = now_bj().strftime("%Y-%m-%d")
-        # 不重置正在进行德州或赛马中的玩家，避免跨日覆盖未结算状态。
+        # 午夜先取消娱乐局并退款，避免娱乐局跨日结算后写回娱乐钱包。
+        for poker in list(active_poker_games.values()):
+            if poker.mode == "entertainment":
+                await refund_poker(poker, app, "🕛 娱乐时段结束，本局娱乐筹码已退回。")
+        for race in list(active_horse_races.values()):
+            if race.mode == "entertainment":
+                if race.task and not race.task.done():
+                    race.task.cancel()
+                    await asyncio.gather(race.task, return_exceptions=True)
+                await race.refund(app, "🕛 娱乐时段结束，本局娱乐筹码已退回。")
+        entertainment_chips.clear()
+        # 不重置正在进行正式德州或赛马中的玩家，避免跨日覆盖未结算状态。
         protected = set()
         for poker in active_poker_games.values():
             if poker.phase != "waiting":
@@ -1036,7 +1116,9 @@ async def hourly_race_scheduler(app):
             last_key = key
             for cid, enabled in list(hourly_race_enabled.items()):
                 if not enabled or cid in active_horse_races: continue
-                race = HorseRace(cid, ADMIN_USER_ID, race_jackpot.pop(cid, 0)); active_horse_races[cid] = race
+                mode = current_game_mode()
+                jackpot = race_jackpot.pop(cid, 0) if mode == "official" else 0
+                race = HorseRace(cid, ADMIN_USER_ID, jackpot, mode); active_horse_races[cid] = race
                 msg = await safe_send(app.bot, cid, await race.view(app), reply_markup=race.buttons())
                 if msg: race.game_msg_id = msg.message_id
                 race.task = asyncio.create_task(race.run(app)); save_data()
@@ -1044,7 +1126,7 @@ async def hourly_race_scheduler(app):
         await asyncio.sleep(max(1, (next_minute-now).total_seconds()))
 
 async def post_init(app):
-    background_tasks.update({asyncio.create_task(daily_reset_scheduler()), asyncio.create_task(leaderboard_scheduler(app)), asyncio.create_task(hourly_race_scheduler(app))})
+    background_tasks.update({asyncio.create_task(daily_reset_scheduler(app)), asyncio.create_task(leaderboard_scheduler(app)), asyncio.create_task(hourly_race_scheduler(app))})
 
 async def post_shutdown(app):
     save_data()
