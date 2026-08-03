@@ -610,8 +610,8 @@ class HorseRace:
         self.final_odds = None
         rates = [random.uniform(.18, .35) for _ in range(HORSE_COUNT)]; total = sum(rates)
         self.rates = [value / total for value in rates]
-        # 以本局胜率生成速度权重：胜率越高，平均速度越快，但仍保留随机波动。
-        self.speed_weights = [rate * HORSE_COUNT for rate in self.rates]
+        # 用胜率抽样每匹对象的精确完赛时间：长期获胜概率更接近显示胜率，仍保留随机爆冷。
+        self.finish_durations = {}
 
     def odds(self):
         total = sum(self.total_bets); smoothing = 1000
@@ -692,9 +692,17 @@ class HorseRace:
             self.phase = "racing"
             self.final_odds = self.odds()
             self.race_start_time = time.time()
-            await safe_edit(app.bot, self.chat_id, self.game_msg_id, "🏇 比赛开始！🔒 最终赔率已锁定", reply_markup=None)
+            start_notice = "🏇 比赛开始！🔒 最终赔率已锁定"
+            await safe_edit(app.bot, self.chat_id, self.game_msg_id, "🏇 下注已截止", reply_markup=None)
+            # 单独发送不可编辑的开赛提示，避免原下注消息编辑失败导致提示消失。
+            await safe_send(app.bot, self.chat_id, start_notice)
             msg = await safe_send(app.bot, self.chat_id, "🏇 比赛开始！正在奔跑中……"); self.animation_msg_id = msg.message_id if msg else None
             last_update = self.race_start_time
+            # 指数竞速抽样：每匹对象的夺冠概率长期接近本局显示胜率，仍会自然产生爆冷。
+            self.finish_durations = {
+                i: random.expovariate(max(0.01, self.rates[i])) * 3.0
+                for i in range(HORSE_COUNT)
+            }
             while not self.cancelled and len(self.arrivals) < HORSE_COUNT:
                 now = time.time()
                 elapsed = max(0.05, now - last_update)
@@ -702,12 +710,11 @@ class HorseRace:
                 for i in range(HORSE_COUNT):
                     if i in self.arrival_times:
                         continue
-                    base_speed = self.speed_weights[i]
-                    speed_factor = random.uniform(0.80, 1.20)
-                    self.positions[i] = min(RACE_TRACK_LENGTH, self.positions[i] + base_speed * speed_factor * elapsed * 2.0)
-                    if self.positions[i] >= RACE_TRACK_LENGTH:
-                        remaining = max(0.0, RACE_TRACK_LENGTH - (self.positions[i] - base_speed * speed_factor * elapsed * 2.0))
-                        self.arrival_times[i] = now - elapsed + remaining / max(0.01, base_speed * speed_factor * 2.0)
+                    duration = self.finish_durations[i]
+                    progress = min(1.0, max(0.0, (now - self.race_start_time) / duration))
+                    self.positions[i] = RACE_TRACK_LENGTH * progress
+                    if progress >= 1.0:
+                        self.arrival_times[i] = self.race_start_time + duration
                         self.positions[i] = float(RACE_TRACK_LENGTH)
                 self.arrivals = sorted(self.arrival_times, key=self.arrival_times.get)
                 await safe_edit(app.bot, self.chat_id, self.animation_msg_id, self.animation())
