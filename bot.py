@@ -698,10 +698,25 @@ class HorseRace:
             await safe_send(app.bot, self.chat_id, start_notice)
             msg = await safe_send(app.bot, self.chat_id, "🏇 比赛开始！正在奔跑中……"); self.animation_msg_id = msg.message_id if msg else None
             last_update = self.race_start_time
-            # 指数竞速抽样：每匹对象的夺冠概率长期接近本局显示胜率，仍会自然产生爆冷。
+            # 先按胜率加权抽取完整名次，再分配有间隔的完赛时间。
+            # 这样长期夺冠率接近显示胜率，同时不会出现开赛第一帧直接到终点。
+            remaining = list(range(HORSE_COUNT))
+            finish_order = []
+            while remaining:
+                total_rate = sum(self.rates[index] for index in remaining)
+                target = random.uniform(0, total_rate)
+                cumulative = 0.0
+                for index in remaining:
+                    cumulative += self.rates[index]
+                    if cumulative >= target:
+                        finish_order.append(index)
+                        remaining.remove(index)
+                        break
+            minimum_duration = 6.0
+            finish_gap = 1.25
             self.finish_durations = {
-                i: random.expovariate(max(0.01, self.rates[i])) * 3.0
-                for i in range(HORSE_COUNT)
+                horse: minimum_duration + rank * finish_gap + random.uniform(-0.20, 0.20)
+                for rank, horse in enumerate(finish_order)
             }
             while not self.cancelled and len(self.arrivals) < HORSE_COUNT:
                 now = time.time()
