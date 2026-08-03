@@ -259,19 +259,15 @@ async def safe_send_photo(bot, cid, photo, caption, **kwargs):
 
 
 async def update_gomoku_board(game, app, names, selecting_row=None, remove_keyboard=False, custom_caption=None):
-    # 先尝试删除旧的棋盘消息，让新棋盘始终出现在聊天最下方
-    await safe_delete(app.bot, game.chat_id, game.game_msg_id)
     caption = custom_caption if custom_caption else game.caption(names, selecting_row)
-    msg = await safe_send_photo(
+    # 方案二：直接编辑文本消息，不再发送/删除图片
+    return await safe_edit(
         app.bot,
         game.chat_id,
-        gomoku_board_image(game.board),
+        game.game_msg_id,
         caption,
         reply_markup=None if remove_keyboard else game.buttons(selecting_row),
     )
-    if msg:
-        game.game_msg_id = msg.message_id
-    return msg
 
 
 async def safe_delete(bot, cid, msg_id):
@@ -387,7 +383,7 @@ def gomoku_board_image(board):
 
 
 class GomokuGame:
-    SIZE = 11
+    SIZE = 9
     EMPTY, BLACK, WHITE = "empty", "black", "white"
 
     def __init__(self, chat_id, owner_id):
@@ -417,9 +413,8 @@ class GomokuGame:
             return False, "当前不是落子阶段"
         if uid != self.current_uid():
             return False, "还没轮到你"
-        if not (1 <= row <= self.SIZE and 1 <= col <= self.SIZE):
-            return False, f"行列必须在 1 到 {self.SIZE} 之间"
-        row -= 1; col -= 1
+        if not (0 <= row < self.SIZE and 0 <= col < self.SIZE):
+            return False, f"坐标越界"
         if self.board[row][col] != self.EMPTY:
             return False, "这个位置已经有棋子了"
         stone = self.BLACK if self.turn == 0 else self.WHITE
@@ -446,14 +441,14 @@ class GomokuGame:
 
     def caption(self, names=None, selecting_row=None):
         names = names or {}
-        header = ["🎯 11×11 五子棋", "⚫ 黑：" + (names.get(self.players[0], str(self.players[0])) if self.players else "等待玩家")]
+        header = ["🎯 9×9 五子棋", "⚫ 黑：" + (names.get(self.players[0], str(self.players[0])) if self.players else "等待玩家")]
         if len(self.players) > 1:
             header.append("⚪ 白：" + names.get(self.players[1], str(self.players[1])))
         if self.phase == "waiting":
             header.append("\n等待第二位玩家点击加入。发起人可用 /end 取消。")
         elif self.phase == "playing":
             current = names.get(self.current_uid(), str(self.current_uid()))
-            header.append(f"\n当前回合：{current}\n直接发坐标：7 7 或 77\n（也兼容：落子 7 7）｜/end 终止本局")
+            header.append(f"\n当前回合：{current}\n点击下方格子直接落子｜/end 终止")
         elif self.draw:
             header.append("\n本局和棋")
         else:
@@ -463,12 +458,24 @@ class GomokuGame:
     def buttons(self, selecting_row=None):
         if self.phase == "waiting":
             return InlineKeyboardMarkup([
-                [InlineKeyboardButton("加入五子棋", callback_data="gomoku_join")],
+                [InlineKeyboardButton("➕ 加入五子棋", callback_data="gomoku_join")],
                 [InlineKeyboardButton("🛑 终止本局", callback_data="gomoku_end")],
             ])
         if self.phase != "playing":
             return None
-        return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 终止本局", callback_data="gomoku_end")]])
+        
+        # 核心：生成 9x9 按钮棋盘
+        kb = []
+        for r in range(self.SIZE):
+            row_btns = []
+            for c in range(self.SIZE):
+                stone = self.board[r][c]
+                # 使用点号代表空格，视觉上比加号更像棋盘
+                label = "⚫" if stone == self.BLACK else "⚪" if stone == self.WHITE else "·"
+                row_btns.append(InlineKeyboardButton(label, callback_data=f"gomoku_place_{r}_{c}"))
+            kb.append(row_btns)
+        kb.append([InlineKeyboardButton("🛑 终止本局", callback_data="gomoku_end")])
+        return InlineKeyboardMarkup(kb)
 
 
 # ==================== 德州扑克 ====================
@@ -1087,7 +1094,7 @@ async def cancel_gomoku(game, app, notice):
 
 
 async def settle_gomoku(game, app, names):
-    """保留最终盘面，另发一条清晰的五子棋结算消息。"""
+    """五子棋结算。"""
     await update_gomoku_board(game, app, names, remove_keyboard=True)
     black = names.get(game.players[0], str(game.players[0]))
     white = names.get(game.players[1], str(game.players[1]))
@@ -1108,7 +1115,8 @@ async def cmd_wz(update, context):
         await update.message.reply_text("当前已有进行中的五子棋。"); return
     game = GomokuGame(cid, uid); game.add(uid); active_gomoku_games[cid] = game
     names = {uid: await get_name(context.application, uid)}
-    msg = await context.bot.send_photo(chat_id=cid, photo=gomoku_board_image(game.board), caption=game.caption(names), reply_markup=game.buttons())
+    # 方案二：初始发送文本消息
+    msg = await safe_send(context.bot, cid, game.caption(names), reply_markup=game.buttons())
     if msg:
         game.game_msg_id = msg.message_id
         game.wait_task = asyncio.create_task(gomoku_wait_timeout(game, context.application))
@@ -1335,6 +1343,25 @@ async def on_button(update, context):
         await q.answer("本局已终止")
         await cancel_gomoku(game, context.application, "🛑 五子棋已终止。")
         return
+    if data.startswith("gomoku_place_"):
+        game = active_gomoku_games.get(cid)
+        if not game: await q.answer("棋局已结束", show_alert=True); return
+        if uid != game.current_uid(): await q.answer("还没轮到你", show_alert=True); return
+        try:
+            _, _, r, c = data.split("_")
+            r, c = int(r), int(c)
+        except ValueError: return
+        ok, result = game.place(uid, r, c)
+        if not ok: await q.answer(result, show_alert=True); return
+        
+        names = {p: await get_name(context.application, p) for p in game.players}
+        if game.phase == "finished":
+            await q.answer("落子成功，游戏结束")
+            await settle_gomoku(game, context.application, names)
+        else:
+            await q.answer("落子成功")
+            await update_gomoku_board(game, context.application, names)
+        return
     if data.startswith("texas_"):
         game = active_poker_games.get(cid)
         if not game: await q.answer("德州游戏已结束", show_alert=True); return
@@ -1386,8 +1413,11 @@ async def on_text(update, context):
     # 支持输入“棋盘”或“刷新”来重新发送棋盘消息
     if text in ["棋盘", "刷新", "看棋", "board", "qp"]:
         if gomoku:
+            # 方案二：呼叫棋盘时，删除旧消息发送新消息，使其置底
             names = {player: await get_name(context.application, player) for player in gomoku.players}
-            await update_gomoku_board(gomoku, context.application, names)
+            await safe_delete(context.bot, cid, gomoku.game_msg_id)
+            msg = await safe_send(context.bot, cid, gomoku.caption(names), reply_markup=gomoku.buttons())
+            if msg: gomoku.game_msg_id = msg.message_id
             return
     match = re.fullmatch(r"下注\s+(\d+)\s+(\d+)", text); race = active_horse_races.get(cid)
     if match and race:
