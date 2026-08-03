@@ -34,7 +34,7 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["金猪", "投喂", "柳一", "龟龟"]
 HORSE_EMOJI = ["🐖", "🐩", "🦍", "🐢"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_AUTO_START, RACE_UPDATE_INTERVAL = 30, 30
+RACE_AUTO_START, RACE_UPDATE_INTERVAL = 120, 30
 RACE_ANIMATION_INTERVAL, RACE_TRACK_LENGTH = 1.5, 14
 DATA_FILE = os.environ.get("DATA_FILE", "bot_data.json")
 DATA_BACKUP_FILE, DATA_TEMP_FILE = f"{DATA_FILE}.bak", f"{DATA_FILE}.tmp"
@@ -692,10 +692,7 @@ class HorseRace:
             self.phase = "racing"
             self.final_odds = self.odds()
             self.race_start_time = time.time()
-            start_notice = "🏇 比赛开始！🔒 最终赔率已锁定"
-            await safe_edit(app.bot, self.chat_id, self.game_msg_id, "🏇 下注已截止", reply_markup=None)
-            # 单独发送不可编辑的开赛提示，避免原下注消息编辑失败导致提示消失。
-            await safe_send(app.bot, self.chat_id, start_notice)
+            await safe_edit(app.bot, self.chat_id, self.game_msg_id, "🏇 比赛开始！正在奔跑中……", reply_markup=None)
             msg = await safe_send(app.bot, self.chat_id, "🏇 比赛开始！正在奔跑中……"); self.animation_msg_id = msg.message_id if msg else None
             last_update = self.race_start_time
             # 先按胜率加权抽取完整名次，再分配有间隔的完赛时间。
