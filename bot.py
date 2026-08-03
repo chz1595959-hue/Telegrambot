@@ -5,12 +5,15 @@ import os
 import random
 import re
 import shutil
+import struct
 import threading
 import time
+import zlib
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from treys import Card, Evaluator
@@ -226,6 +229,36 @@ async def safe_edit(bot, cid, msg_id, text, **kwargs):
     return None
 
 
+async def safe_edit_photo(bot, cid, msg_id, photo, caption, **kwargs):
+    if not msg_id: return None
+    try:
+        return await bot.edit_message_media(
+            chat_id=cid,
+            message_id=msg_id,
+            media=InputMediaPhoto(media=photo, caption=caption),
+            **kwargs,
+        )
+    except BadRequest as exc:
+        logger.warning("编辑五子棋图片失败: %s", exc)
+    except RetryAfter as exc:
+        await asyncio.sleep(exc.retry_after)
+        return await safe_edit_photo(bot, cid, msg_id, photo, caption, **kwargs)
+    except TelegramError:
+        logger.exception("编辑五子棋图片失败")
+    return None
+
+
+async def update_gomoku_board(game, app, names, selecting_row=None, remove_keyboard=False):
+    return await safe_edit_photo(
+        app.bot,
+        game.chat_id,
+        game.game_msg_id,
+        gomoku_board_image(game.board),
+        game.caption(names, selecting_row),
+        reply_markup=None if remove_keyboard else game.buttons(selecting_row),
+    )
+
+
 async def safe_delete(bot, cid, msg_id):
     if msg_id:
         try: await bot.delete_message(chat_id=cid, message_id=msg_id)
@@ -258,10 +291,89 @@ async def emergency_if_needed(cid, uid, app, poker=None):
 
 
 # ==================== 五子棋 ====================
+def png_chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
+
+
+def gomoku_board_image(board):
+    """仅用标准库绘制木色 11×11 棋盘 PNG，避免 emoji 棋盘在手机端变形。"""
+    size, margin, grid = 11, 46, 48
+    canvas = margin * 2 + grid * (size - 1)
+    pixels = bytearray(canvas * canvas * 3)
+    wood, line, black, white, shadow = (211, 165, 95), (78, 50, 25), (30, 30, 30), (244, 240, 228), (132, 96, 52)
+
+    def set_pixel(x, y, color):
+        if 0 <= x < canvas and 0 <= y < canvas:
+            offset = (y * canvas + x) * 3
+            pixels[offset:offset + 3] = bytes(color)
+
+    # 木色底板与细微横向纹理。
+    for y in range(canvas):
+        grain = ((y * 17) % 11) - 5
+        color = tuple(max(0, min(255, value + grain)) for value in wood)
+        for x in range(canvas):
+            set_pixel(x, y, color)
+    # 网格线。
+    for index in range(size):
+        pos = margin + index * grid
+        for delta in (-1, 0, 1):
+            for xy in range(margin, canvas - margin + 1):
+                set_pixel(pos + delta, xy, line)
+                set_pixel(xy, pos + delta, line)
+    # 用内置像素字绘制 1–11 坐标，不依赖字体文件或第三方图像库。
+    digits = {
+        "0": ("111", "101", "101", "101", "111"), "1": ("010", "110", "010", "010", "111"),
+        "2": ("111", "001", "111", "100", "111"), "3": ("111", "001", "111", "001", "111"),
+        "4": ("101", "101", "111", "001", "001"), "5": ("111", "100", "111", "001", "111"),
+        "6": ("111", "100", "111", "101", "111"), "7": ("111", "001", "010", "010", "010"),
+        "8": ("111", "101", "111", "101", "111"), "9": ("111", "101", "111", "001", "111"),
+    }
+
+    def draw_number(text, left, top, scale=2):
+        for char_index, char in enumerate(text):
+            for dy, pattern in enumerate(digits[char]):
+                for dx, enabled in enumerate(pattern):
+                    if enabled == "1":
+                        for py in range(scale):
+                            for px in range(scale):
+                                set_pixel(left + char_index * 8 + dx * scale + px, top + dy * scale + py, line)
+
+    for index in range(size):
+        label = str(index + 1)
+        draw_number(label, margin + index * grid - (3 if index < 9 else 7), 16)
+        draw_number(label, 16 if index < 9 else 10, margin + index * grid - 5)
+    # 五子棋星位。
+    for row, col in ((3, 3), (3, 7), (5, 5), (7, 3), (7, 7)):
+        cx, cy = margin + col * grid, margin + row * grid
+        for y in range(cy - 4, cy + 5):
+            for x in range(cx - 4, cx + 5):
+                if (x - cx) ** 2 + (y - cy) ** 2 <= 16:
+                    set_pixel(x, y, line)
+    # 棋子以实心圆绘制，白棋保留深色边缘，不会和棋盘混淆。
+    for row, values in enumerate(board):
+        for col, stone in enumerate(values):
+            if stone == GomokuGame.EMPTY:
+                continue
+            cx, cy = margin + col * grid, margin + row * grid
+            radius = 19
+            fill = black if stone == GomokuGame.BLACK else white
+            for y in range(cy - radius - 2, cy + radius + 3):
+                for x in range(cx - radius - 2, cx + radius + 3):
+                    distance = (x - cx) ** 2 + (y - cy) ** 2
+                    if distance <= (radius + 2) ** 2:
+                        set_pixel(x, y, shadow)
+                    if distance <= radius ** 2:
+                        set_pixel(x, y, fill)
+    raw = b"".join(b"\x00" + bytes(pixels[row * canvas * 3:(row + 1) * canvas * 3]) for row in range(canvas))
+    image = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", canvas, canvas, 8, 2, 0, 0, 0)) + png_chunk(b"IDAT", zlib.compress(raw, 9)) + png_chunk(b"IEND", b"")
+    data = BytesIO(image)
+    data.name = "gomoku_board.png"
+    return data
+
+
 class GomokuGame:
     SIZE = 11
-    # 棕色大方格与白棋分离，避免空格和白棋混淆；棋盘以文本完整呈现，不受内联键盘列数限制。
-    EMPTY, BLACK, WHITE = "🟫", "⚫", "⚪"
+    EMPTY, BLACK, WHITE = "empty", "black", "white"
 
     def __init__(self, chat_id, owner_id):
         self.chat_id, self.owner_id = chat_id, owner_id
@@ -317,30 +429,18 @@ class GomokuGame:
                 return True
         return False
 
-    def board_text(self):
-        """用 11 行大方格绘制棋盘；不会触发 Telegram 内联键盘的手机端自动折行。"""
-        lines = ["    1  2  3  4  5  6  7  8  9 10 11"]
-        for index, row in enumerate(self.board, 1):
-            lines.append(f"{index:>2}  " + "".join(row))
-        return "\n".join(lines)
-
-    def text(self, names=None, selecting_row=None):
+    def caption(self, names=None, selecting_row=None):
         names = names or {}
         header = ["🎯 11×11 五子棋", "⚫ 黑：" + (names.get(self.players[0], str(self.players[0])) if self.players else "等待玩家")]
         if len(self.players) > 1:
             header.append("⚪ 白：" + names.get(self.players[1], str(self.players[1])))
-        header.extend(["", self.board_text()])
         if self.phase == "waiting":
             header.append("\n等待第二位玩家点击加入。发起人可用 /end 取消。")
         elif self.phase == "playing":
             current = names.get(self.current_uid(), str(self.current_uid()))
-            if selecting_row:
-                guide = f"已选择第 {selecting_row} 行，请点击列号完成落子。"
-            else:
-                guide = "第 1 步：点击下方“行”按钮，再选择列号。"
-            header.append(f"\n当前回合：{current}\n{guide}\n文字备用：落子 行 列｜/end 终止本局")
+            header.append(f"\n当前回合：{current}\n请输入：落子 行 列，例如：落子 7 7\n/end 终止本局")
         elif self.draw:
-            header.append("\n和棋")
+            header.append("\n本局和棋")
         else:
             header.append(f"\n胜者：{names.get(self.winner, str(self.winner))}")
         return "\n".join(header)
@@ -353,24 +453,7 @@ class GomokuGame:
             ])
         if self.phase != "playing":
             return None
-        if selecting_row:
-            number_buttons = [
-                InlineKeyboardButton(f"列 {col}", callback_data=f"gomoku_col_{selecting_row}_{col}")
-                for col in range(1, self.SIZE + 1)
-            ]
-            rows = [number_buttons[index:index + 4] for index in range(0, self.SIZE, 4)]
-            rows.append([
-                InlineKeyboardButton("← 重选行", callback_data="gomoku_rows"),
-                InlineKeyboardButton("🛑 终止本局", callback_data="gomoku_end"),
-            ])
-            return InlineKeyboardMarkup(rows)
-        row_buttons = [
-            InlineKeyboardButton(f"行 {row}", callback_data=f"gomoku_row_{row}")
-            for row in range(1, self.SIZE + 1)
-        ]
-        rows = [row_buttons[index:index + 4] for index in range(0, self.SIZE, 4)]
-        rows.append([InlineKeyboardButton("🛑 终止本局", callback_data="gomoku_end")])
-        return InlineKeyboardMarkup(rows)
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 终止本局", callback_data="gomoku_end")]])
 
 
 # ==================== 德州扑克 ====================
@@ -974,7 +1057,7 @@ async def gomoku_wait_timeout(game, app):
     await asyncio.sleep(AUTO_START_TIMEOUT)
     if game.phase == "waiting" and active_gomoku_games.get(game.chat_id) is game:
         active_gomoku_games.pop(game.chat_id, None)
-        await safe_edit(app.bot, game.chat_id, game.game_msg_id, "⌛ 五子棋等待 60 秒无人加入，本局已取消。", reply_markup=None)
+        await safe_edit_photo(app.bot, game.chat_id, game.game_msg_id, gomoku_board_image(game.board), "⌛ 五子棋等待 60 秒无人加入，本局已取消。", reply_markup=None)
 
 
 async def cancel_gomoku(game, app, notice):
@@ -985,12 +1068,12 @@ async def cancel_gomoku(game, app, notice):
         task.cancel()
     if active_gomoku_games.get(game.chat_id) is game:
         active_gomoku_games.pop(game.chat_id, None)
-    await safe_edit(app.bot, game.chat_id, game.game_msg_id, notice, reply_markup=None)
+    await safe_edit_photo(app.bot, game.chat_id, game.game_msg_id, gomoku_board_image(game.board), notice, reply_markup=None)
 
 
 async def settle_gomoku(game, app, names):
     """保留最终盘面，另发一条清晰的五子棋结算消息。"""
-    await safe_edit(app.bot, game.chat_id, game.game_msg_id, game.text(names), reply_markup=None)
+    await update_gomoku_board(game, app, names, remove_keyboard=True)
     black = names.get(game.players[0], str(game.players[0]))
     white = names.get(game.players[1], str(game.players[1]))
     result = "🤝 本局和棋。" if game.draw else f"🏆 获胜者：{names.get(game.winner, str(game.winner))}"
@@ -1009,7 +1092,8 @@ async def cmd_wz(update, context):
     if cid in active_gomoku_games:
         await update.message.reply_text("当前已有进行中的五子棋。"); return
     game = GomokuGame(cid, uid); game.add(uid); active_gomoku_games[cid] = game
-    msg = await safe_send(context.bot, cid, game.text({uid: await get_name(context.application, uid)}), reply_markup=game.buttons())
+    names = {uid: await get_name(context.application, uid)}
+    msg = await context.bot.send_photo(chat_id=cid, photo=gomoku_board_image(game.board), caption=game.caption(names), reply_markup=game.buttons())
     if msg:
         game.game_msg_id = msg.message_id
         game.wait_task = asyncio.create_task(gomoku_wait_timeout(game, context.application))
@@ -1226,7 +1310,7 @@ async def on_button(update, context):
             game.wait_task = None
         names = {player: await get_name(context.application, player) for player in game.players}
         await q.answer("已加入五子棋")
-        await safe_edit(context.bot, cid, game.game_msg_id, game.text(names), reply_markup=game.buttons())
+        await update_gomoku_board(game, context.application, names)
         return
     if data == "gomoku_end":
         game = active_gomoku_games.get(cid)
@@ -1235,45 +1319,6 @@ async def on_button(update, context):
             await q.answer("仅管理员或本局玩家可终止", show_alert=True); return
         await q.answer("本局已终止")
         await cancel_gomoku(game, context.application, "🛑 五子棋已终止。")
-        return
-    if data == "gomoku_rows":
-        game = active_gomoku_games.get(cid)
-        if not game: await q.answer("五子棋已结束", show_alert=True); return
-        if uid != game.current_uid(): await q.answer("还没轮到你", show_alert=True); return
-        names = {player: await get_name(context.application, player) for player in game.players}
-        await q.answer("请重新选择行")
-        await safe_edit(context.bot, cid, game.game_msg_id, game.text(names), reply_markup=game.buttons())
-        return
-    if data.startswith("gomoku_row_"):
-        game = active_gomoku_games.get(cid)
-        if not game: await q.answer("五子棋已结束", show_alert=True); return
-        if uid != game.current_uid(): await q.answer("还没轮到你", show_alert=True); return
-        try:
-            row = int(data.rsplit("_", 1)[1])
-            if not 1 <= row <= game.SIZE: raise ValueError
-        except ValueError:
-            await q.answer("无效行号", show_alert=True); return
-        names = {player: await get_name(context.application, player) for player in game.players}
-        await q.answer(f"已选第 {row} 行")
-        await safe_edit(context.bot, cid, game.game_msg_id, game.text(names, selecting_row=row), reply_markup=game.buttons(selecting_row=row))
-        return
-    if data.startswith("gomoku_col_"):
-        game = active_gomoku_games.get(cid)
-        if not game: await q.answer("五子棋已结束", show_alert=True); return
-        try:
-            _, _, row, col = data.split("_")
-            row, col = int(row), int(col)
-        except (ValueError, TypeError):
-            await q.answer("无效棋盘位置", show_alert=True); return
-        ok, result = game.place(uid, row, col)
-        if not ok:
-            await q.answer(result, show_alert=True); return
-        names = {player: await get_name(context.application, player) for player in game.players}
-        await q.answer("落子成功")
-        if game.phase == "finished":
-            await settle_gomoku(game, context.application, names)
-        else:
-            await safe_edit(context.bot, cid, game.game_msg_id, game.text(names), reply_markup=game.buttons())
         return
     if data.startswith("texas_"):
         game = active_poker_games.get(cid)
@@ -1337,7 +1382,7 @@ async def on_text(update, context):
         if gomoku.phase == "finished":
             await settle_gomoku(gomoku, context.application, names)
         else:
-            await safe_edit(context.bot, cid, gomoku.game_msg_id, gomoku.text(names), reply_markup=gomoku.buttons())
+            await update_gomoku_board(gomoku, context.application, names)
         return
     match = re.fullmatch(r"(?:下注|加注)\s*[:：]?\s*(\d+)\s*(?:积分)?", text); game = active_poker_games.get(cid)
     if match and game:
