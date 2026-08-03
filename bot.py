@@ -68,7 +68,7 @@ daily_emergency_used = defaultdict(lambda: defaultdict(bool))
 pending_horse_bets = defaultdict(lambda: defaultdict(int))
 pending_horse_bet_modes = defaultdict(lambda: defaultdict(str))
 last_business_date = ""
-active_poker_games, active_horse_races, active_gomoku_games = {}, {}, {}
+active_poker_games, active_horse_races, active_gomoku_games, active_minesweeper_games = {}, {}, {}, {}
 background_tasks = set()
 # 保护保存快照与原子替换；即使未来接入线程/执行器也不会出现文件写入交叉。
 data_save_lock = threading.RLock()
@@ -469,10 +469,137 @@ class GomokuGame:
             row_btns = []
             for c in range(self.SIZE):
                 stone = self.board[r][c]
-                label = "⚫" if stone == self.BLACK else "⚪" if stone == self.WHITE else "·"
+                # 使用最窄的字符来尝试缩减按钮宽度
+                label = "●" if stone == self.BLACK else "○" if stone == self.WHITE else "."
                 row_btns.append(InlineKeyboardButton(label, callback_data=f"gomoku_place_{r}_{c}"))
             kb.append(row_btns)
         kb.append([InlineKeyboardButton("🛑 终止本局", callback_data="gomoku_end")])
+        return InlineKeyboardMarkup(kb)
+
+
+class MinesweeperGame:
+    WIDTH, HEIGHT = 8, 8  # 8x8 适配手机屏幕
+    MINE_COUNT = 10
+
+    def __init__(self, chat_id, owner_id):
+        self.chat_id, self.owner_id = chat_id, owner_id
+        self.players = []
+        self.board = [[0 for _ in range(self.WIDTH)] for _ in range(self.HEIGHT)]
+        self.mines = set()
+        self.revealed = [[False for _ in range(self.WIDTH)] for _ in range(self.HEIGHT)]
+        self.phase = "waiting" # waiting, playing, finished
+        self.game_msg_id = None
+        self.first_click = True
+        self.loser = None
+
+    def add(self, uid):
+        if self.phase != "waiting" or uid in self.players:
+            return False
+        self.players.append(uid)
+        return True
+
+    def start(self):
+        if len(self.players) < 1: return False
+        self.phase = "playing"
+        return True
+
+    def _place_mines(self, safe_r, safe_c):
+        """第一下必不踩雷，且周围 3x3 尽量不埋雷以优化开局体验。"""
+        candidates = [(r, c) for r in range(self.HEIGHT) for c in range(self.WIDTH) 
+                      if abs(r - safe_r) > 1 or abs(c - safe_c) > 1]
+        self.mines = set(random.sample(candidates, self.MINE_COUNT))
+        for r, c in self.mines:
+            self.board[r][c] = -1 # -1 代表雷
+        
+        # 计算周边数字
+        for r in range(self.HEIGHT):
+            for c in range(self.WIDTH):
+                if self.board[r][c] == -1: continue
+                count = 0
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        nr, nc = r + dr, c + dc
+                        if 0 <= nr < self.HEIGHT and 0 <= nc < self.WIDTH and self.board[nr][nc] == -1:
+                            count += 1
+                self.board[r][c] = count
+
+    def reveal(self, uid, r, c):
+        if self.phase != "playing" or self.revealed[r][c]:
+            return False, "invalid"
+        
+        if self.first_click:
+            self._place_mines(r, c)
+            self.first_click = False
+        
+        self.revealed[r][c] = True
+        
+        if self.board[r][c] == -1:
+            self.phase = "finished"
+            self.loser = uid
+            return True, "mine"
+        
+        # 如果是 0，递归自动翻开周围
+        if self.board[r][c] == 0:
+            self._auto_reveal(r, c)
+            
+        # 检查是否清空所有非雷格
+        safe_count = sum(not val for row in self.revealed for val in row)
+        if safe_count == self.MINE_COUNT:
+            self.phase = "finished"
+            return True, "win"
+            
+        return True, "ok"
+
+    def _auto_reveal(self, r, c):
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < self.HEIGHT and 0 <= nc < self.WIDTH and not self.revealed[nr][nc]:
+                    self.revealed[nr][nc] = True
+                    if self.board[nr][nc] == 0:
+                        self._auto_reveal(nr, nc)
+
+    def caption(self, names=None):
+        names = names or {}
+        header = [f"💣 扫雷大作战 ({self.WIDTH}x{self.HEIGHT})"]
+        if self.phase == "waiting":
+            header.append(f"\n🎮 纯娱乐模式（无筹码）\n等待加入... (当前 {len(self.players)} 人)\n发起人点击开始。")
+        elif self.phase == "playing":
+            header.append("\n游戏进行中！大家轮流点，踩雷即炸！")
+        elif self.loser:
+            header.append(f"\n💥 轰！{names.get(self.loser, '玩家')} 踩到了雷！游戏结束。")
+        else:
+            header.append("\n🎉 奇迹！所有安全区已清空，扫雷成功！")
+        return "\n".join(header)
+
+    def buttons(self):
+        if self.phase == "waiting":
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ 加入游戏", callback_data="mine_join")],
+                [InlineKeyboardButton("🎮 开始游戏", callback_data="mine_start")],
+                [InlineKeyboardButton("🛑 终止", callback_data="mine_end")]
+            ])
+        
+        kb = []
+        for r in range(self.HEIGHT):
+            row_btns = []
+            for c in range(self.WIDTH):
+                if not self.revealed[r][c] and self.phase == "playing":
+                    label = "·"
+                    row_btns.append(InlineKeyboardButton(label, callback_data=f"mine_rev_{r}_{c}"))
+                else:
+                    val = self.board[r][c]
+                    if val == -1: label = "💣"
+                    elif val == 0: label = " "
+                    else: label = str(val)
+                    row_btns.append(InlineKeyboardButton(label, callback_data="mine_noop"))
+            kb.append(row_btns)
+        
+        if self.phase == "playing":
+            kb.append([InlineKeyboardButton("🛑 终止游戏", callback_data="mine_end")])
+        else:
+            kb.append([InlineKeyboardButton("♻️ 重新开始", callback_data="mine_rematch")])
+            
         return InlineKeyboardMarkup(kb)
 
 
@@ -1119,6 +1246,26 @@ async def cmd_wz(update, context):
         game.game_msg_id = msg.message_id
         game.wait_task = asyncio.create_task(gomoku_wait_timeout(game, context.application))
 
+async def update_mine_board(game, app, names):
+    await safe_edit(
+        app.bot,
+        game.chat_id,
+        game.game_msg_id,
+        game.caption(names),
+        reply_markup=game.buttons(),
+    )
+
+
+async def cmd_sl(update, context):
+    if not await need_auth(update): return
+    cid, uid = update.effective_chat.id, update.effective_user.id
+    if cid in active_minesweeper_games:
+        await update.message.reply_text("当前已有进行中的扫雷。"); return
+    game = MinesweeperGame(cid, uid); game.add(uid); active_minesweeper_games[cid] = game
+    msg = await safe_send(context.bot, cid, game.caption({}), reply_markup=game.buttons())
+    if msg: game.game_msg_id = msg.message_id
+
+
 async def cmd_dz(update, context):
     if not await need_auth(update): return
     cid, uid = update.effective_chat.id, update.effective_user.id; game = active_poker_games.get(cid)
@@ -1177,8 +1324,9 @@ async def cmd_end(update, context):
     poker = active_poker_games.get(cid)
     race = active_horse_races.get(cid)
     gomoku = active_gomoku_games.get(cid)
+    mine = active_minesweeper_games.get(cid)
 
-    if not poker and not race and not gomoku:
+    if not poker and not race and not gomoku and not mine:
         await update.message.reply_text("当前没有进行中的游戏。")
         return
 
@@ -1190,6 +1338,8 @@ async def cmd_end(update, context):
         allowed_users.update(race.bets)
     if gomoku:
         allowed_users.update(gomoku.players)
+    if mine:
+        allowed_users.update(mine.players)
 
     # Bot 管理员始终可终止；其他人必须是当前游戏参与者。
     if uid != ADMIN_USER_ID and uid not in allowed_users:
@@ -1197,6 +1347,11 @@ async def cmd_end(update, context):
         return
 
     notices = []
+
+    if mine:
+        active_minesweeper_games.pop(cid, None)
+        await safe_edit(context.bot, cid, mine.game_msg_id, "🛑 扫雷已终止。", reply_markup=None)
+        notices.append("扫雷已终止")
 
     if gomoku:
         await cancel_gomoku(gomoku, context.application, "🛑 五子棋已终止。")
@@ -1360,6 +1515,46 @@ async def on_button(update, context):
             await q.answer("落子成功")
             await update_gomoku_board(game, context.application, names)
         return
+    if data.startswith("mine_"):
+        game = active_minesweeper_games.get(cid)
+        if not game: await q.answer("扫雷已结束", show_alert=True); return
+        if data == "mine_join":
+            if game.add(uid): 
+                await q.answer("已加入"); await update_mine_board(game, context.application, {})
+            else: await q.answer("已在游戏中", show_alert=True)
+            return
+        if data == "mine_start":
+            if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
+            if game.start(): 
+                await q.answer("游戏开始"); await update_mine_board(game, context.application, {})
+            else: await q.answer("需要至少1人", show_alert=True)
+            return
+        if data == "mine_end":
+            if uid != ADMIN_USER_ID and uid not in game.players:
+                await q.answer("权限不足", show_alert=True); return
+            active_minesweeper_games.pop(cid, None)
+            await safe_edit(context.bot, cid, game.game_msg_id, "🛑 扫雷已手动终止。", reply_markup=None)
+            await q.answer("已终止")
+            return
+        if data == "mine_rematch":
+            active_minesweeper_games.pop(cid, None)
+            await cmd_sl(update, context); await q.answer("新局已开启")
+            return
+        if data.startswith("mine_rev_"):
+            if game.phase != "playing": await q.answer("游戏未开始", show_alert=True); return
+            try: _, _, r, c = data.split("_"); r, c = int(r), int(c)
+            except ValueError: return
+            ok, res = game.reveal(uid, r, c)
+            if not ok: return
+            names = {p: await get_name(context.application, p) for p in game.players}
+            if game.phase == "finished":
+                await update_mine_board(game, context.application, names)
+                active_minesweeper_games.pop(cid, None)
+            else:
+                await update_mine_board(game, context.application, names)
+            await q.answer()
+            return
+
     if data.startswith("texas_"):
         game = active_poker_games.get(cid)
         if not game: await q.answer("德州游戏已结束", show_alert=True); return
@@ -1528,7 +1723,7 @@ def main():
     token = os.environ.get("BOT_TOKEN")
     if not token: logger.error("未设置 BOT_TOKEN"); return
     app = Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
-    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
+    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("sl",cmd_sl),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(on_button)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
