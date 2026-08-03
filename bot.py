@@ -259,8 +259,8 @@ async def emergency_if_needed(cid, uid, app, poker=None):
 
 # ==================== 五子棋 ====================
 class GomokuGame:
-    SIZE = 15
-    EMPTY, BLACK, WHITE = "·", "⚫", "⚪"
+    SIZE = 11
+    EMPTY, BLACK, WHITE = "⬜", "⚫", "⚪"
 
     def __init__(self, chat_id, owner_id):
         self.chat_id, self.owner_id = chat_id, owner_id
@@ -290,7 +290,7 @@ class GomokuGame:
         if uid != self.current_uid():
             return False, "还没轮到你"
         if not (1 <= row <= self.SIZE and 1 <= col <= self.SIZE):
-            return False, "行列必须在 1 到 15 之间"
+            return False, f"行列必须在 1 到 {self.SIZE} 之间"
         row -= 1; col -= 1
         if self.board[row][col] != self.EMPTY:
             return False, "这个位置已经有棋子了"
@@ -325,14 +325,25 @@ class GomokuGame:
             header.append("\n等待第二位玩家点击加入")
         elif self.phase == "playing":
             current = names.get(self.current_uid(), str(self.current_uid()))
-            header.append(f"\n当前回合：{current}\n发送：落子 行 列（例如：落子 8 8）")
+            header.append(f"\n当前回合：{current}\n点击棋盘落子；文字备用：落子 行 列")
         elif self.draw:
             header.append("\n和棋")
         else:
             header.append(f"\n胜者：{names.get(self.winner, str(self.winner))}")
-        board_lines = ["   " + " ".join(f"{i:02d}" for i in range(1, self.SIZE + 1))]
-        board_lines.extend(f"{i:02d} " + " ".join(self.board[i - 1]) for i in range(1, self.SIZE + 1))
-        return "\n".join(header + ["", *board_lines])
+        return "\n".join(header)
+
+    def buttons(self):
+        if self.phase == "waiting":
+            return InlineKeyboardMarkup([[InlineKeyboardButton("加入五子棋", callback_data="gomoku_join")]])
+        if self.phase != "playing":
+            return None
+        rows = []
+        for row in range(self.SIZE):
+            rows.append([
+                InlineKeyboardButton(self.board[row][col], callback_data=f"gomoku_place_{row + 1}_{col + 1}")
+                for col in range(self.SIZE)
+            ])
+        return InlineKeyboardMarkup(rows)
 
 
 # ==================== 德州扑克 ====================
@@ -944,8 +955,7 @@ async def cmd_wz(update, context):
     if cid in active_gomoku_games:
         await update.message.reply_text("当前已有进行中的五子棋。"); return
     game = GomokuGame(cid, uid); game.add(uid); active_gomoku_games[cid] = game
-    buttons = InlineKeyboardMarkup([[InlineKeyboardButton("加入五子棋", callback_data="gomoku_join")]])
-    msg = await safe_send(context.bot, cid, game.text({uid: await get_name(context.application, uid)}), reply_markup=buttons)
+    msg = await safe_send(context.bot, cid, game.text({uid: await get_name(context.application, uid)}), reply_markup=game.buttons())
     if msg:
         game.game_msg_id = msg.message_id
         game.wait_task = asyncio.create_task(gomoku_wait_timeout(game, context.application))
@@ -1153,8 +1163,26 @@ async def on_button(update, context):
         if not game.add(uid): await q.answer("无法加入，棋局已开始或人数已满", show_alert=True); return
         names = {player: await get_name(context.application, player) for player in game.players}
         await q.answer("已加入五子棋")
-        buttons = None if game.phase == "playing" else InlineKeyboardMarkup([[InlineKeyboardButton("加入五子棋", callback_data="gomoku_join")]])
-        await safe_edit(context.bot, cid, game.game_msg_id, game.text(names), reply_markup=buttons)
+        await safe_edit(context.bot, cid, game.game_msg_id, game.text(names), reply_markup=game.buttons())
+        return
+    if data.startswith("gomoku_place_"):
+        game = active_gomoku_games.get(cid)
+        if not game: await q.answer("五子棋已结束", show_alert=True); return
+        try:
+            _, _, row, col = data.split("_")
+            row, col = int(row), int(col)
+        except (ValueError, TypeError):
+            await q.answer("无效棋盘位置", show_alert=True); return
+        ok, result = game.place(uid, row, col)
+        if not ok:
+            await q.answer(result, show_alert=True); return
+        names = {player: await get_name(context.application, player) for player in game.players}
+        await q.answer("落子成功")
+        notice = ""
+        if result == "win": notice = f"\n🏆 {names[uid]} 五子连珠，获胜！"
+        elif result == "draw": notice = "\n🤝 棋盘已满，本局和棋。"
+        await safe_edit(context.bot, cid, game.game_msg_id, game.text(names) + notice, reply_markup=game.buttons())
+        if game.phase == "finished": active_gomoku_games.pop(cid, None)
         return
     if data.startswith("texas_"):
         game = active_poker_games.get(cid)
@@ -1218,7 +1246,7 @@ async def on_text(update, context):
         if result == "win": notice = f"\n🏆 {names[user.id]} 五子连珠，获胜！"
         elif result == "draw": notice = "\n🤝 棋盘已满，本局和棋。"
         else: notice = ""
-        await safe_edit(context.bot, cid, gomoku.game_msg_id, gomoku.text(names) + notice, reply_markup=None if gomoku.phase == "finished" else None)
+        await safe_edit(context.bot, cid, gomoku.game_msg_id, gomoku.text(names) + notice, reply_markup=gomoku.buttons())
         if gomoku.phase == "finished": active_gomoku_games.pop(cid, None)
         return
     match = re.fullmatch(r"(?:下注|加注)\s*[:：]?\s*(\d+)\s*(?:积分)?", text); game = active_poker_games.get(cid)
