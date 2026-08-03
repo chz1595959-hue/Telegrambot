@@ -2192,7 +2192,10 @@ async def on_button(update, context):
         if data.startswith("gomoku_place_"):
             game = active_gomoku_games.get(cid)
             if not game: await q.answer("棋局已结束", show_alert=True); return
-            if uid != game.current_uid(): await q.answer("还没轮到你", show_alert=True); return
+            if uid not in game.players:
+                await q.answer("❌ 你不是本局选手，无法落子。", show_alert=True); return
+            if uid != game.current_uid():
+                await q.answer("⌛ 还没轮到你，请稍等。", show_alert=True); return
             try:
                 _, _, r, c = data.split("_")
                 r, c = int(r), int(c)
@@ -2278,6 +2281,9 @@ async def on_button(update, context):
                 return
             if data.startswith("mine_rev_"):
                 if game.phase != "playing": await q.answer("游戏未开始", show_alert=True); return
+                # 修复权限 Bug：只有加入游戏的玩家才能点格子
+                if uid not in game.players:
+                    await q.answer("❌ 你未加入本局扫雷，无法操作。", show_alert=True); return
                 try: _, _, r, c = data.split("_"); r, c = int(r), int(c)
                 except ValueError: return
                 ok, res = game.reveal(uid, r, c)
@@ -2317,17 +2323,26 @@ async def on_button(update, context):
                 await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
             else: await q.answer("人数不足", show_alert=True)
         elif data.startswith("bj_hit_"):
-            if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
+            if uid not in game.players:
+                await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
+            if str(uid) != data.split("_")[2]: 
+                await q.answer("⌛ 还没轮到你，请稍等。", show_alert=True); return
             card = game.hit(uid); await q.answer(f"你抽到了 {card}")
             if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
             else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
         elif data.startswith("bj_stand_"):
-            if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
+            if uid not in game.players:
+                await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
+            if str(uid) != data.split("_")[2]: 
+                await q.answer("⌛ 还没轮到你，请稍等。", show_alert=True); return
             game.next_player(); await q.answer("停牌")
             if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
             else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
         elif data.startswith("bj_double_"):
-            if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
+            if uid not in game.players:
+                await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
+            if str(uid) != data.split("_")[2]: 
+                await q.answer("⌛ 还没轮到你，请稍等。", show_alert=True); return
             wallet = entertainment_chips if game.mode == "entertainment" else group_chips
             if wallet[cid][uid] < game.bets[uid]: await q.answer("筹码不足，无法双倍", show_alert=True); return
             
