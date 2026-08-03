@@ -414,7 +414,7 @@ class GomokuGame:
         if uid != self.current_uid():
             return False, "还没轮到你"
         if not (0 <= row < self.SIZE and 0 <= col < self.SIZE):
-            return False, f"坐标越界"
+            return False, "坐标越界"
         if self.board[row][col] != self.EMPTY:
             return False, "这个位置已经有棋子了"
         stone = self.BLACK if self.turn == 0 else self.WHITE
@@ -448,7 +448,7 @@ class GomokuGame:
             header.append("\n等待第二位玩家点击加入。发起人可用 /end 取消。")
         elif self.phase == "playing":
             current = names.get(self.current_uid(), str(self.current_uid()))
-            header.append(f"\n当前回合：{current}\n点击下方格子直接落子｜/end 终止")
+            header.append(f"\n当前回合：{current}\n直接点击格子落子｜/end 终止")
         elif self.draw:
             header.append("\n本局和棋")
         else:
@@ -464,13 +464,11 @@ class GomokuGame:
         if self.phase != "playing":
             return None
         
-        # 核心：生成 9x9 按钮棋盘
         kb = []
         for r in range(self.SIZE):
             row_btns = []
             for c in range(self.SIZE):
                 stone = self.board[r][c]
-                # 使用点号代表空格，视觉上比加号更像棋盘
                 label = "⚫" if stone == self.BLACK else "⚪" if stone == self.WHITE else "·"
                 row_btns.append(InlineKeyboardButton(label, callback_data=f"gomoku_place_{r}_{c}"))
             kb.append(row_btns)
