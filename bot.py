@@ -248,15 +248,30 @@ async def safe_edit_photo(bot, cid, msg_id, photo, caption, **kwargs):
     return None
 
 
-async def update_gomoku_board(game, app, names, selecting_row=None, remove_keyboard=False):
-    return await safe_edit_photo(
+async def safe_send_photo(bot, cid, photo, caption, **kwargs):
+    for attempt in range(2):
+        try: return await bot.send_photo(chat_id=cid, photo=photo, caption=caption, **kwargs)
+        except RetryAfter as exc:
+            if attempt == 0: await asyncio.sleep(exc.retry_after); continue
+        except TelegramError:
+            logger.exception("发送图片失败: %s", cid); break
+    return None
+
+
+async def update_gomoku_board(game, app, names, selecting_row=None, remove_keyboard=False, custom_caption=None):
+    # 先尝试删除旧的棋盘消息，让新棋盘始终出现在聊天最下方
+    await safe_delete(app.bot, game.chat_id, game.game_msg_id)
+    caption = custom_caption if custom_caption else game.caption(names, selecting_row)
+    msg = await safe_send_photo(
         app.bot,
         game.chat_id,
-        game.game_msg_id,
         gomoku_board_image(game.board),
-        game.caption(names, selecting_row),
+        caption,
         reply_markup=None if remove_keyboard else game.buttons(selecting_row),
     )
+    if msg:
+        game.game_msg_id = msg.message_id
+    return msg
 
 
 async def safe_delete(bot, cid, msg_id):
@@ -438,7 +453,7 @@ class GomokuGame:
             header.append("\n等待第二位玩家点击加入。发起人可用 /end 取消。")
         elif self.phase == "playing":
             current = names.get(self.current_uid(), str(self.current_uid()))
-            header.append(f"\n当前回合：{current}\n请输入：落子 行 列，例如：落子 7 7\n/end 终止本局")
+            header.append(f"\n当前回合：{current}\n直接发坐标：7 7 或 77\n（也兼容：落子 7 7）｜/end 终止本局")
         elif self.draw:
             header.append("\n本局和棋")
         else:
@@ -1057,7 +1072,7 @@ async def gomoku_wait_timeout(game, app):
     await asyncio.sleep(AUTO_START_TIMEOUT)
     if game.phase == "waiting" and active_gomoku_games.get(game.chat_id) is game:
         active_gomoku_games.pop(game.chat_id, None)
-        await safe_edit_photo(app.bot, game.chat_id, game.game_msg_id, gomoku_board_image(game.board), "⌛ 五子棋等待 60 秒无人加入，本局已取消。", reply_markup=None)
+        await update_gomoku_board(game, app, {}, remove_keyboard=True, custom_caption="⌛ 五子棋等待 60 秒无人加入，本局已取消。")
 
 
 async def cancel_gomoku(game, app, notice):
@@ -1068,7 +1083,7 @@ async def cancel_gomoku(game, app, notice):
         task.cancel()
     if active_gomoku_games.get(game.chat_id) is game:
         active_gomoku_games.pop(game.chat_id, None)
-    await safe_edit_photo(app.bot, game.chat_id, game.game_msg_id, gomoku_board_image(game.board), notice, reply_markup=None)
+    await update_gomoku_board(game, app, {}, remove_keyboard=True, custom_caption=notice)
 
 
 async def settle_gomoku(game, app, names):
@@ -1367,6 +1382,13 @@ async def on_text(update, context):
     if message.date and (datetime.now(timezone.utc) - message.date).total_seconds() > STALE_TEXT_COMMAND_SECONDS:
         return
     cid, text = update.effective_chat.id, message.text.strip()
+    gomoku = active_gomoku_games.get(cid)
+    # 支持输入“棋盘”或“刷新”来重新发送棋盘消息
+    if text in ["棋盘", "刷新", "看棋", "board", "qp"]:
+        if gomoku:
+            names = {player: await get_name(context.application, player) for player in gomoku.players}
+            await update_gomoku_board(gomoku, context.application, names)
+            return
     match = re.fullmatch(r"下注\s+(\d+)\s+(\d+)", text); race = active_horse_races.get(cid)
     if match and race:
         horse, amount = int(match.group(1))-1, int(match.group(2)); ok, desc = race.bet(user.id, horse, amount)
@@ -1374,9 +1396,12 @@ async def on_text(update, context):
         race.name_cache[user.id] = await get_name(context.application, user.id); await action_notice(cid, context.application, user.id, f"下注 {amount} 于 {HORSE_EMOJI[horse]}")
         await safe_edit(context.bot, cid, race.game_msg_id, await race.view(context.application), reply_markup=race.buttons()); return
     gomoku = active_gomoku_games.get(cid)
-    match = re.fullmatch(r"落子\s+(\d{1,2})\s+(\d{1,2})", text)
+    # 五子棋支持最短输入“行 列”，并兼容直接输入“行列”（如 77）以及旧写法“落子 行 列”。
+    match = re.fullmatch(r"(?:落子\s+)?(?:(\d{1,2})\s*(?:[,，]\s*|\s+)(\d{1,2})|(\d)(\d))", text)
     if match and gomoku:
-        ok, result = gomoku.place(user.id, int(match.group(1)), int(match.group(2)))
+        r = int(match.group(1)) if match.group(1) is not None else int(match.group(3))
+        c = int(match.group(2)) if match.group(2) is not None else int(match.group(4))
+        ok, result = gomoku.place(user.id, r, c)
         if not ok: await message.reply_text(f"❌ {result}"); return
         names = {player: await get_name(context.application, player) for player in gomoku.players}
         if gomoku.phase == "finished":
