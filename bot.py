@@ -259,7 +259,11 @@ async def emergency_if_needed(cid, uid, app, poker=None):
 
 # ==================== 德州扑克 ====================
 def side_pots(total_bets):
-    ordered = sorted((uid, value) for uid, value in total_bets.items() if value > 0)
+    # 必须按投入金额升序构造主池和边池；按用户 ID 排序会跳过部分底池。
+    ordered = sorted(
+        ((uid, value) for uid, value in total_bets.items() if value > 0),
+        key=lambda item: item[1],
+    )
     result, previous = [], 0
     for _, level in ordered:
         if level <= previous: continue
@@ -270,6 +274,7 @@ def side_pots(total_bets):
 
 def distribute_side_pots(total_bets, scores):
     payouts = defaultdict(lambda: {"amount": 0, "details": []})
+    total_pot = sum(total_bets.values())
     for index, (amount, contributors) in enumerate(side_pots(total_bets)):
         eligible = {uid: scores[uid] for uid in contributors if uid in scores}
         if not eligible: continue
@@ -279,6 +284,17 @@ def distribute_side_pots(total_bets, scores):
             won = share + (1 if position < remainder else 0)
             payouts[uid]["amount"] += won
             payouts[uid]["details"].append(("主池" if index == 0 else f"边池{index}", won))
+    # 守恒兜底：任何因异常边池资格导致的剩余底池，归入当前最佳存活玩家，禁止筹码凭空消失。
+    allocated = sum(item["amount"] for item in payouts.values())
+    unallocated = total_pot - allocated
+    if unallocated > 0 and scores:
+        best_score = min(scores.values())
+        winners = sorted(uid for uid, score in scores.items() if score == best_score)
+        share, remainder = divmod(unallocated, len(winners))
+        for position, uid in enumerate(winners):
+            won = share + (1 if position < remainder else 0)
+            payouts[uid]["amount"] += won
+            payouts[uid]["details"].append(("底池兜底", won))
     return payouts
 
 
