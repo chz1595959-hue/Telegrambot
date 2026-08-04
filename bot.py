@@ -57,7 +57,7 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["金猪", "投喂", "柳一", "龟龟"]
 HORSE_EMOJI = ["🐖", "🐩", "🦍", "🐢"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_UPDATE_INTERVAL = 5
+RACE_UPDATE_INTERVAL = 30
 RACE_TRACK_LENGTH = 14
 DATA_BACKUP_FILE, DATA_TEMP_FILE = f"{DATA_FILE}.bak", f"{DATA_FILE}.tmp"
 BEIJING_TZ = timezone(timedelta(hours=8))
