@@ -24,14 +24,14 @@ logger = logging.getLogger(__name__)
 
 # ---------- 全局配置中心 ----------
 STARTING_CHIPS = 20000
-ENTERTAINMENT_CHIPS = 20000
+ENTERTAINMENT_CHIPS = 50000  # 娱乐模式起始筹码（5W）
 MIN_ENTRY_CHIPS = 200
 EMERGENCY_CHIPS = 2000
 EMERGENCY_MAX_USES = 3
 
 # 游戏时间配置 (秒)
 TURN_TIMEOUT = 60          # 德州/21点单回合思考时间
-AUTO_START_TIMEOUT = 60    # 21点/百家乐自动开牌/解散时间
+AUTO_START_TIMEOUT = 30    # 21点/百家乐自动开牌/解散时间
 ROOM_WAIT_TIMEOUT = 60     # 各游戏等待房统一倒计时（60秒）
 RACE_AUTO_START = 120      # 赛马自动开赛时间
 RACE_ANIMATION_INTERVAL = 1.5
@@ -57,7 +57,7 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["金猪", "投喂", "柳一", "龟龟"]
 HORSE_EMOJI = ["🐖", "🐩", "🦍", "🐢"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_UPDATE_INTERVAL = 30
+RACE_UPDATE_INTERVAL = 5
 RACE_TRACK_LENGTH = 14
 DATA_BACKUP_FILE, DATA_TEMP_FILE = f"{DATA_FILE}.bak", f"{DATA_FILE}.tmp"
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -537,7 +537,7 @@ class GomokuGame:
         if self.phase == "waiting":
             return InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ 加入五子棋", callback_data="gomoku_join")],
-                [InlineKeyboardButton("🛑 终止本局", callback_data="gomoku_end")],
+                [InlineKeyboardButton("❌ 终止本局", callback_data="gomoku_end")],
             ])
         if self.phase != "playing":
             return None
@@ -551,7 +551,7 @@ class GomokuGame:
                 label = "⚫" if stone == self.BLACK else "⚪" if stone == self.WHITE else "·"
                 row_btns.append(InlineKeyboardButton(label, callback_data=f"gomoku_place_{r}_{c}"))
             kb.append(row_btns)
-        kb.append([InlineKeyboardButton("🛑 终止本局", callback_data="gomoku_end")])
+        kb.append([InlineKeyboardButton("❌ 终止本局", callback_data="gomoku_end")])
         return InlineKeyboardMarkup(kb)
 
 
@@ -656,7 +656,7 @@ class MinesweeperGame:
             return InlineKeyboardMarkup([
                 [InlineKeyboardButton("➕ 加入游戏", callback_data="mine_join")],
                 [InlineKeyboardButton("🎮 开始游戏", callback_data="mine_start")],
-                [InlineKeyboardButton("🛑 终止", callback_data="mine_end")]
+                [InlineKeyboardButton("❌ 终止", callback_data="mine_end")]
             ])
         
         kb = []
@@ -675,7 +675,7 @@ class MinesweeperGame:
             kb.append(row_btns)
         
         if self.phase == "playing":
-            kb.append([InlineKeyboardButton("🛑 终止游戏", callback_data="mine_end")])
+            kb.append([InlineKeyboardButton("❌ 终止游戏", callback_data="mine_end")])
         else:
             kb.append([InlineKeyboardButton("♻️ 重新开始", callback_data="mine_rematch")])
             
@@ -1073,9 +1073,9 @@ async def poker_waiting_text(game, app):
 
 
 async def update_poker_waiting(game, app):
-    rows = [[InlineKeyboardButton("加入游戏", callback_data="texas_join")]]
-    if len(game.players) >= 2: rows.append([InlineKeyboardButton("开始游戏", callback_data="texas_start")])
-    rows.append([InlineKeyboardButton("🛑 终止房间", callback_data="texas_end")])
+    rows = [[InlineKeyboardButton("➕ 加入游戏", callback_data="texas_join")]]
+    if len(game.players) >= 2: rows.append([InlineKeyboardButton("🎮 开始游戏", callback_data="texas_start")])
+    rows.append([InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")])
     await safe_edit(app.bot, game.chat_id, game.game_msg_id, await poker_waiting_text(game, app), reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -1602,9 +1602,9 @@ async def update_blackjack_ui(game, app):
         for uid in game.players:
             text += f"- {await get_name(app, uid)} (下注: {game.bets[uid]})\n"
         text += "\n⏰ 有人加入后 60 秒自动开局，无人加入自动解散。\n"
-        kb = [[InlineKeyboardButton("加入 (下注500)", callback_data="bj_join_500"), InlineKeyboardButton("加入 (下注1000)", callback_data="bj_join_1000")]]
-        if game.players: kb.append([InlineKeyboardButton("开始游戏", callback_data="bj_start")])
-        kb.append([InlineKeyboardButton("🛑 终止", callback_data="bj_end")])
+        kb = [[InlineKeyboardButton("➕ 加入 (下注500)", callback_data="bj_join_500"), InlineKeyboardButton("➕ 加入 (下注1000)", callback_data="bj_join_1000")]]
+        if game.players: kb.append([InlineKeyboardButton("🎮 开始游戏", callback_data="bj_start")])
+        kb.append([InlineKeyboardButton("❌ 终止", callback_data="bj_end")])
         await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
     elif game.phase == "playing":
         curr_uid = game.players[game.current_player_idx]
@@ -1770,7 +1770,7 @@ async def update_baccarat_ui(game, app):
         kb = [
             [InlineKeyboardButton("🔵 押闲 (1:1)", callback_data="bjl_bet_player"), InlineKeyboardButton("🔴 押庄 (1:0.95)", callback_data="bjl_bet_banker")],
             [InlineKeyboardButton("🟢 押和 (1:8)", callback_data="bjl_bet_tie")],
-            [InlineKeyboardButton("🎮 立即开牌", callback_data="bjl_start"), InlineKeyboardButton("🛑 终止", callback_data="bjl_end")]
+            [InlineKeyboardButton("🎮 立即开牌", callback_data="bjl_start"), InlineKeyboardButton("❌ 终止", callback_data="bjl_end")]
         ]
         await safe_edit(app.bot, game.chat_id, game.game_msg_id, "\n".join(text), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
 
@@ -1839,7 +1839,7 @@ async def cmd_21(update, context):
     mode = current_game_mode()
     game = BlackjackGame(cid, uid, mode)
     active_blackjack_games[cid] = game
-    msg = await safe_send(context.bot, cid, "🃏 21点 筹码局准备中...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("加入 (下注500)", callback_data="bj_join_500")]]))
+    msg = await safe_send(context.bot, cid, "🃏 21点 筹码局准备中...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ 加入 (下注500)", callback_data="bj_join_500")]]))
     if msg: 
         game.game_msg_id = msg.message_id
         await update_blackjack_ui(game, context.application)
@@ -1968,7 +1968,7 @@ async def cmd_dz(update, context):
         else: await update.message.reply_text("你已在等待房间中。")
         return
     game = PokerGame(cid, uid, mode); game.add(uid); active_poker_games[cid] = game
-    msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("加入游戏", callback_data="texas_join")], [InlineKeyboardButton("🛑 终止房间", callback_data="texas_end")]]))
+    msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ 加入游戏", callback_data="texas_join")], [InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")]]))
     if msg:
         game.game_msg_id = msg.message_id
         await start_wait_timeout(game, context.application)
@@ -2106,6 +2106,22 @@ async def cmd_add(update, context):
         await update.message.reply_text("该玩家正在游戏中，无法修改筹码。"); return
     group_chips[cid][uid] += amount; save_data()
     await update.message.reply_text(f"✅ 已增加 {await get_name(context.application, uid)} {amount} 筹码。")
+
+
+async def cmd_addyl(update, context):
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    if not await need_auth(update): return
+    try:
+        uid, amount = await _parse_target_amount(update, context)
+        if amount <= 0: raise ValueError
+    except (ValueError, IndexError):
+        await update.message.reply_text("用法：/addyl 用户ID 数量，或回复玩家消息后使用 /addyl 数量"); return
+    cid = update.effective_chat.id
+    if player_is_busy(cid, uid):
+        await update.message.reply_text("该玩家正在游戏中，无法修改筹码。"); return
+    entertainment_chips[cid][uid] += amount; save_data()
+    await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)} 添加 {amount} 娱乐筹码，当前 {entertainment_chips[cid][uid]}。")
 
 
 async def cmd_reduce(update, context):
@@ -2424,7 +2440,7 @@ async def on_text(update, context):
                 found = True
                 await safe_delete(context.bot, cid, poker.game_msg_id)
                 if poker.phase == "waiting":
-                    msg = await safe_send(context.bot, cid, await poker_waiting_text(poker, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("加入游戏", callback_data="texas_join")], [InlineKeyboardButton("🛑 终止房间", callback_data="texas_end")]]))
+                    msg = await safe_send(context.bot, cid, await poker_waiting_text(poker, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ 加入游戏", callback_data="texas_join")], [InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")]]))
                     if msg: poker.game_msg_id = msg.message_id
                 else:
                     msg = await safe_send(context.bot, cid, await poker_table_text(poker, context.application))
@@ -2585,7 +2601,7 @@ async def daily_reset_scheduler(app):
 
 async def leaderboard_scheduler(app):
     while True:
-        now = now_bj(); target = now.replace(hour=23, minute=50, second=0, microsecond=0)
+        now = now_bj(); target = now.replace(hour=23, minute=0, second=0, microsecond=0)
         if target <= now: target += timedelta(days=1)
         await asyncio.sleep((target-now).total_seconds())
         date = now_bj().strftime("%Y-%m-%d"); snapshot = profit_by_date.pop(date, {})
@@ -2639,7 +2655,7 @@ def main():
     
     app = Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
 
-    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("sl",cmd_sl),("lhj",cmd_lhj),("21",cmd_21),("bjl",cmd_bjl),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
+    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("sl",cmd_sl),("lhj",cmd_lhj),("21",cmd_21),("bjl",cmd_bjl),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("addyl",cmd_addyl),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(on_button)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
