@@ -40,6 +40,7 @@ SLOT_COOLDOWN = 3          # 老虎机冷却
 SLOT_BET = 300             # 老虎机单次金额
 BJ_MIN_BET = 100           # 21点最低打字下注
 BACCARAT_FIXED_BET = 500   # 百家乐按钮单次下注
+FIXED_MIN_RAISE = 100      # 德州最低加注额
 
 # 其他配置
 DEFAULT_ADMIN = 5431975432
@@ -89,6 +90,9 @@ daily_emergency_used = defaultdict(lambda: defaultdict(bool))
 # 已实扣的游戏下注，用于全系游戏在重启时自动退款。
 # pending_game_bets[群ID][用户ID] = {"amount": 100, "mode": "official", "game": "texas"}
 pending_game_bets = defaultdict(lambda: defaultdict(dict))
+# 旧版赛马下注记录（仅兼容结算代码中的 pop 清理，实际退款以 pending_game_bets 为准）
+pending_horse_bets = defaultdict(dict)
+pending_horse_bet_modes = defaultdict(str)
 last_business_date = ""
 active_poker_games, active_horse_races, active_gomoku_games, active_minesweeper_games = {}, {}, {}, {}
 active_blackjack_games, active_baccarat_games = {}, {}
@@ -97,6 +101,7 @@ user_cooldowns = defaultdict(float)
 # 高性能保存逻辑变量
 data_dirty = False
 save_event = None # 延迟初始化
+data_save_lock = threading.Lock()
 background_tasks = set()
 
 
@@ -112,6 +117,11 @@ def is_entertainment_time(now=None):
     now = now or now_bj()
     # 23:00:00 到 23:59:59 之间
     return now.hour == 23
+
+
+def current_game_mode():
+    """23:00-23:59 为娱乐模式，其余时间为正式积分模式。"""
+    return "entertainment" if is_entertainment_time() else "official"
 
 
 def restore_nested(target, source):
@@ -1873,6 +1883,27 @@ async def cmd_lhj(update, context):
 
 
 
+async def start_wait_timeout(game, app):
+    """德州开房后，等待超时无人开局则自动解散。"""
+    game.cancel_wait()
+    async def expire():
+        await asyncio.sleep(AUTO_START_TIMEOUT)
+        if game.phase == "waiting" and active_poker_games.get(game.chat_id) is game:
+            await refund_poker(game, app, "⌛ 德州等待超时无人开局，房间已解散，筹码已退回。")
+    game.wait_task = asyncio.create_task(expire())
+
+
+async def start_auto_game(game, app):
+    """德州房间满 2 人后，短暂倒计时自动开局。"""
+    game.cancel_wait()
+    await asyncio.sleep(3)
+    if game.phase != "waiting" or len(game.players) < 2: return
+    if active_poker_games.get(game.chat_id) is not game: return
+    if game.start():
+        await update_poker_table(game, app)
+        await start_turn_timer(game, app)
+
+
 async def cmd_dz(update, context):
     if not await need_auth(update): return
     cid, uid = update.effective_chat.id, update.effective_user.id; game = active_poker_games.get(cid)
@@ -2113,16 +2144,22 @@ async def on_button(update, context):
                     await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
                 else: await q.answer("人数不足", show_alert=True)
             elif data.startswith("bj_hit_"):
+                if uid not in game.players:
+                    await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
                 if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
                 card = game.hit(uid); await q.answer(f"你抽到了 {card}")
                 if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
                 else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
             elif data.startswith("bj_stand_"):
+                if uid not in game.players:
+                    await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
                 if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
                 game.next_player(); await q.answer("停牌")
                 if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
                 else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
             elif data.startswith("bj_double_"):
+                if uid not in game.players:
+                    await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
                 if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
                 wallet = entertainment_chips if game.mode == "entertainment" else group_chips
                 if wallet[cid][uid] < game.bets[uid]: await q.answer("筹码不足，无法双倍", show_alert=True); return
@@ -2159,7 +2196,7 @@ async def on_button(update, context):
                 await update_baccarat_ui(game, context.application)
             elif data == "bjl_start":
                 if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
-                await settle_baccarat(game, app)
+                await settle_baccarat(game, context.application)
             elif data == "bjl_end":
                 if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
                 # 退还本局下注
@@ -2301,216 +2338,6 @@ async def on_button(update, context):
     except Exception:
         logger.exception("按钮处理异常")
 
-    cid, uid, data = q.message.chat.id, q.from_user.id, q.data or ""
-    if not is_auth(cid): await q.answer("未授权", show_alert=True); return
-    
-    # --- 21点 回调 ---
-    if data.startswith("bj_"):
-        game = active_blackjack_games.get(cid)
-        if not game: await q.answer("游戏已结束", show_alert=True); return
-        if data.startswith("bj_join_"):
-            bet = int(data.split("_")[2])
-            wallet = entertainment_chips if game.mode == "entertainment" else group_chips
-            if wallet[cid][uid] < bet: await q.answer("筹码不足", show_alert=True); return
-            if game.add_player(uid, bet):
-                wallet[cid][uid] -= bet
-                await q.answer("已加入"); await update_blackjack_ui(game, context.application)
-            else: await q.answer("你已在局中或无法加入", show_alert=True)
-        elif data == "bj_start":
-            if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
-            if game.start(): 
-                game.cancel_wait() # 开始后取消等待计时
-                await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
-            else: await q.answer("人数不足", show_alert=True)
-        elif data.startswith("bj_hit_"):
-            if uid not in game.players:
-                await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
-            if str(uid) != data.split("_")[2]: 
-                await q.answer("⌛ 还没轮到你，请稍等。", show_alert=True); return
-            card = game.hit(uid); await q.answer(f"你抽到了 {card}")
-            if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
-            else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
-        elif data.startswith("bj_stand_"):
-            if uid not in game.players:
-                await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
-            if str(uid) != data.split("_")[2]: 
-                await q.answer("⌛ 还没轮到你，请稍等。", show_alert=True); return
-            game.next_player(); await q.answer("停牌")
-            if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
-            else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
-        elif data.startswith("bj_double_"):
-            if uid not in game.players:
-                await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
-            if str(uid) != data.split("_")[2]: 
-                await q.answer("⌛ 还没轮到你，请稍等。", show_alert=True); return
-            wallet = entertainment_chips if game.mode == "entertainment" else group_chips
-            if wallet[cid][uid] < game.bets[uid]: await q.answer("筹码不足，无法双倍", show_alert=True); return
-            
-            wallet[cid][uid] -= game.bets[uid]
-            game.double_down(uid)
-            await q.answer("双倍下注！摸牌并停牌")
-            await action_notice(cid, context.application, uid, f"选择了双倍下注！")
-            
-            if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
-            else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
-        elif data == "bj_end":
-            if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
-            # 退还本局下注
-            wallet = entertainment_chips if game.mode == "entertainment" else group_chips
-            for p_uid, bet in game.bets.items(): wallet[cid][p_uid] += bet
-            active_blackjack_games.pop(cid, None)
-            await safe_edit(context.bot, cid, game.game_msg_id, "🛑 21点已手动终止，筹码已退回。", reply_markup=None)
-        return
-
-    # --- 百家乐 回调 ---
-    if data.startswith("bjl_"):
-        game = active_baccarat_games.get(cid)
-        if not game: await q.answer("游戏已结束", show_alert=True); return
-        if data.startswith("bjl_bet_"):
-            side = data.split("_")[2]
-            bet_amount = BACCARAT_FIXED_BET # 引用全局配置
-            wallet = entertainment_chips if game.mode == "entertainment" else group_chips
-            if wallet[cid][uid] < bet_amount: await q.answer("筹码不足", show_alert=True); return
-            wallet[cid][uid] -= bet_amount
-            game.place_bet(uid, side, bet_amount)
-            side_names = {"player":"闲", "banker":"庄", "tie":"和"}
-            await q.answer(f"✅ 押注 {side_names.get(side, side)} 成功 (累计: {game.bets[uid][side]})", show_alert=False)
-            await update_baccarat_ui(game, context.application)
-        elif data == "bjl_start":
-            if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
-            await settle_baccarat(game, context.application)
-        elif data == "bjl_end":
-            if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
-            # 退还本局下注
-            wallet = entertainment_chips if game.mode == "entertainment" else group_chips
-            for p_uid, b_dict in game.bets.items():
-                for amount in b_dict.values(): wallet[cid][p_uid] += amount
-            active_baccarat_games.pop(cid, None)
-            await safe_edit(context.bot, cid, game.game_msg_id, "🛑 百家乐已手动终止，筹码已退回。", reply_markup=None)
-        return
-
-    if data == "gomoku_join":
-        game = active_gomoku_games.get(cid)
-        if not game: await q.answer("五子棋已结束", show_alert=True); return
-        if not game.add(uid): await q.answer("无法加入，棋局已开始或人数已满", show_alert=True); return
-        if game.wait_task and not game.wait_task.done():
-            game.wait_task.cancel()
-            game.wait_task = None
-        names = {player: await get_name(context.application, player) for player in game.players}
-        await q.answer("已加入五子棋")
-        await update_gomoku_board(game, context.application, names)
-        return
-    if data == "gomoku_end":
-        game = active_gomoku_games.get(cid)
-        if not game: await q.answer("五子棋已结束", show_alert=True); return
-        if uid != ADMIN_USER_ID and uid not in game.players:
-            await q.answer("仅管理员或本局玩家可终止", show_alert=True); return
-        await q.answer("本局已终止")
-        await cancel_gomoku(game, context.application, "🛑 五子棋已终止。")
-        return
-    if data.startswith("gomoku_place_"):
-        game = active_gomoku_games.get(cid)
-        if not game: await q.answer("棋局已结束", show_alert=True); return
-        if uid != game.current_uid(): await q.answer("还没轮到你", show_alert=True); return
-        try:
-            _, _, r, c = data.split("_")
-            r, c = int(r), int(c)
-        except ValueError: return
-        ok, result = game.place(uid, r, c)
-        if not ok: await q.answer(result, show_alert=True); return
-        
-        names = {p: await get_name(context.application, p) for p in game.players}
-        if game.phase == "finished":
-            await q.answer("落子成功，游戏结束")
-            await settle_gomoku(game, context.application, names)
-        else:
-            await q.answer("落子成功")
-            await update_gomoku_board(game, context.application, names)
-        return
-    if data.startswith("mine_"):
-        game = active_minesweeper_games.get(cid)
-        if not game: await q.answer("扫雷已结束", show_alert=True); return
-        if data == "mine_join":
-            if game.add(uid): 
-                await q.answer("已加入"); await update_mine_board(game, context.application, {})
-            else: await q.answer("已在游戏中", show_alert=True)
-            return
-        if data == "mine_start":
-            if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
-            if game.start(): 
-                await q.answer("游戏开始"); await update_mine_board(game, context.application, {})
-            else: await q.answer("需要至少1人", show_alert=True)
-            return
-        if data == "mine_end":
-            if uid != ADMIN_USER_ID and uid not in game.players:
-                await q.answer("权限不足", show_alert=True); return
-            active_minesweeper_games.pop(cid, None)
-            await safe_edit(context.bot, cid, game.game_msg_id, "🛑 扫雷已手动终止。", reply_markup=None)
-            await q.answer("已终止")
-            return
-        if data == "mine_rematch":
-            if cid in active_minesweeper_games:
-                active_minesweeper_games.pop(cid, None)
-            await cmd_sl(update, context); await q.answer("新局已开启")
-            return
-        if data.startswith("mine_rev_"):
-            if game.phase != "playing": await q.answer("游戏未开始", show_alert=True); return
-            try: _, _, r, c = data.split("_"); r, c = int(r), int(c)
-            except ValueError: return
-            ok, res = game.reveal(uid, r, c)
-            if not ok: return
-            names = {p: await get_name(context.application, p) for p in game.players}
-            if game.phase == "finished":
-                # 扫雷结算消息也置底
-                names = {p: await get_name(context.application, p) for p in game.players}
-                await safe_delete(context.bot, cid, game.game_msg_id)
-                await safe_send_long(context.bot, cid, game.caption(names))
-                active_minesweeper_games.pop(cid, None)
-            else:
-                await update_mine_board(game, context.application, names)
-            await q.answer()
-            return
-
-    if data.startswith("texas_"):
-        game = active_poker_games.get(cid)
-        if not game: await q.answer("德州游戏已结束", show_alert=True); return
-        if data == "texas_hand":
-            hand = game.hands.get(uid); await q.answer(f"你的手牌：{card_str(hand[0])}  {card_str(hand[1])}" if hand and uid not in game.folded else "当前无法查看手牌", show_alert=True); return
-        if game.phase == "waiting":
-            wallet = entertainment_chips if game.mode == "entertainment" else group_chips
-            if data == "texas_join" and wallet[cid][uid] < MIN_ENTRY_CHIPS:
-                label = "娱乐筹码" if game.mode == "entertainment" else "筹码"
-                await q.answer(f"进入德州至少需要 {MIN_ENTRY_CHIPS} {label}", show_alert=True)
-            elif data == "texas_join" and game.add(uid):
-                await q.answer("已加入"); await update_poker_waiting(game, context.application)
-                if len(game.players) >= 2:
-                    game.cancel_wait()
-                    await start_auto_game(game, context.application)
-            elif data == "texas_start" and uid == game.owner_id and game.start():
-                await q.answer("游戏开始"); await update_poker_table(game, context.application); await start_turn_timer(game, context.application)
-            else: await q.answer("无法执行此操作", show_alert=True)
-            return
-        if uid != game.current(): await q.answer("还没轮到你", show_alert=True); return
-        action = {"texas_fold":"fold", "texas_check":"check", "texas_call":"call", "texas_allin":"allin"}.get(data); extra = 0
-        if data.startswith("texas_raise_"):
-            try: action, extra = "raise", int(data.rsplit("_", 1)[1])
-            except ValueError: await q.answer("无效加注额", show_alert=True); return
-        if not action: await q.answer("未知操作", show_alert=True); return
-        ok, desc = game.action(uid, action, extra)
-        if not ok: await q.answer(desc, show_alert=True); return
-        await q.answer(desc); await safe_delete(context.bot, cid, game.action_msg_id); await action_notice(cid, context.application, uid, desc)
-        if game.phase == "showdown": await settle_poker(game, context.application)
-        else: await update_poker_table(game, context.application); await start_turn_timer(game, context.application)
-        return
-    if data.startswith("horsebet_"):
-        race = active_horse_races.get(cid)
-        try: _, horse, amount = data.split("_"); horse, amount = int(horse), int(amount)
-        except ValueError: await q.answer("无效下注数据", show_alert=True); return
-        if not race: await q.answer("赛马已结束", show_alert=True); return
-        ok, desc = race.bet(uid, horse, amount)
-        if not ok: await q.answer(desc, show_alert=True); return
-        race.name_cache[uid] = await get_name(context.application, uid); await q.answer(desc); await action_notice(cid, context.application, uid, f"下注 {amount} 于 {HORSE_EMOJI[horse]}")
-        await safe_edit(context.bot, cid, race.game_msg_id, await race.view(context.application), reply_markup=race.buttons())
 
 async def on_text(update, context):
     try:
@@ -2634,37 +2461,6 @@ async def on_text(update, context):
             return
     except Exception:
         logger.exception("文本指令处理异常")
-
-    if match and race:
-        horse, amount = int(match.group(1))-1, int(match.group(2)); ok, desc = race.bet(user.id, horse, amount)
-        if not ok: await message.reply_text(f"❌ {desc}"); return
-        race.name_cache[user.id] = await get_name(context.application, user.id); await action_notice(cid, context.application, user.id, f"下注 {amount} 于 {HORSE_EMOJI[horse]}")
-        await safe_edit(context.bot, cid, race.game_msg_id, await race.view(context.application), reply_markup=race.buttons()); return
-    gomoku = active_gomoku_games.get(cid)
-    # 五子棋支持最短输入“行 列”，并兼容直接输入“行列”（如 77）以及旧写法“落子 行 列”。
-    match = re.fullmatch(r"(?:落子\s+)?(?:(\d{1,2})\s*(?:[,，]\s*|\s+)(\d{1,2})|(\d)(\d))", text)
-    if match and gomoku:
-        r = int(match.group(1)) if match.group(1) is not None else int(match.group(3))
-        c = int(match.group(2)) if match.group(2) is not None else int(match.group(4))
-        ok, result = gomoku.place(user.id, r, c)
-        if not ok: await message.reply_text(f"❌ {result}"); return
-        names = {player: await get_name(context.application, player) for player in gomoku.players}
-        if gomoku.phase == "finished":
-            await settle_gomoku(gomoku, context.application, names)
-        else:
-            await update_gomoku_board(gomoku, context.application, names)
-        return
-    match = re.fullmatch(r"(?:下注|加注)\s*[:：]?\s*(\d+)\s*(?:积分)?", text); game = active_poker_games.get(cid)
-    if match and game:
-        if game.phase == "waiting":
-            await message.reply_text("❌ 德州还未开始，当前不能加注。"); return
-        if user.id != game.current():
-            await message.reply_text("❌ 还没轮到你，当前不能加注。"); return
-        ok, desc = game.action(user.id, "raise", int(match.group(1)))
-        if not ok: await message.reply_text(f"❌ {desc}"); return
-        await action_notice(cid, context.application, user.id, desc)
-        if game.phase == "showdown": await settle_poker(game, context.application)
-        else: await update_poker_table(game, context.application); await start_turn_timer(game, context.application)
 
 
 # ---------- 定时任务与启动 ----------
