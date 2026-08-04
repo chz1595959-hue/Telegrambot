@@ -32,6 +32,7 @@ EMERGENCY_MAX_USES = 3
 # 游戏时间配置 (秒)
 TURN_TIMEOUT = 60          # 德州/21点单回合思考时间
 AUTO_START_TIMEOUT = 30    # 21点/百家乐自动开牌/解散时间
+ROOM_WAIT_TIMEOUT = 60     # 各游戏等待房统一倒计时（60秒）
 RACE_AUTO_START = 120      # 赛马自动开赛时间
 RACE_ANIMATION_INTERVAL = 1.5
 SLOT_COOLDOWN = 3          # 老虎机冷却
@@ -565,6 +566,7 @@ class MinesweeperGame:
         self.revealed = [[False for _ in range(self.WIDTH)] for _ in range(self.HEIGHT)]
         self.phase = "waiting" # waiting, playing, finished
         self.game_msg_id = None
+        self.wait_task = None
         self.first_click = True
         self.loser = None
 
@@ -639,7 +641,7 @@ class MinesweeperGame:
         names = names or {}
         header = [f"💣 扫雷大作战 ({self.WIDTH}x{self.HEIGHT})"]
         if self.phase == "waiting":
-            header.append(f"\n🎮 纯娱乐模式（无筹码）\n等待加入... (当前 {len(self.players)} 人)\n发起人点击开始。")
+            header.append(f"\n🎮 纯娱乐模式（无筹码）\n等待加入... (当前 {len(self.players)} 人)\n发起人点击开始。\n⏰ 60 秒未开始将自动取消")
         elif self.phase == "playing":
             header.append("\n游戏进行中！大家轮流点，踩雷即炸！")
         elif self.loser:
@@ -736,9 +738,16 @@ class BlackjackGame:
     def is_blackjack(self, cards):
         return len(cards) == 2 and self.get_score(cards) == 21
 
+    def _draw(self):
+        """发牌；牌堆耗尽时自动重洗一副新牌，避免抽牌崩溃。"""
+        if not self.deck:
+            self.deck = [r + s for r in "23456789TJQKA" for s in "shdc"]
+            random.shuffle(self.deck)
+        return self.deck.pop()
+
     def hit(self, uid):
         if self.phase != "playing" or self.players[self.current_player_idx] != uid: return None
-        card = self.deck.pop()
+        card = self._draw()
         self.hands[uid].append(card)
         score = self.get_score(self.hands[uid])
         if score >= 21: self.next_player()
@@ -754,7 +763,7 @@ class BlackjackGame:
         pending_game_bets[self.chat_id][uid]["21"] = {"amount": self.bets[uid], "mode": self.mode}
         
         # 强制摸一张
-        self.hands[uid].append(self.deck.pop())
+        self.hands[uid].append(self._draw())
         # 强制停牌
         self.next_player()
         return True
@@ -766,7 +775,7 @@ class BlackjackGame:
 
     def dealer_play(self):
         while self.get_score(self.dealer_hand) < 17:
-            self.dealer_hand.append(self.deck.pop())
+            self.dealer_hand.append(self._draw())
         self.phase = "finished"
 
     def get_card_str(self, cards, hide_first=False):
@@ -1059,7 +1068,7 @@ class PokerGame:
 # ---------- 德州界面 / 流程 ----------
 async def poker_waiting_text(game, app):
     players = [f"{i}. {await get_name(app, uid)}" for i, uid in enumerate(game.players, 1)]
-    return f"🃏 新一局积分德州扑克\n发起人：{await get_name(app, game.owner_id)}\n\n已加入：\n" + "\n".join(players) + "\n\n点击加入，发起人可开始。"
+    return f"🃏 新一局积分德州扑克\n发起人：{await get_name(app, game.owner_id)}\n\n已加入：\n" + "\n".join(players) + "\n\n点击加入，发起人可立即开始。\n⏰ 满 2 人后 60 秒自动开局，不足 2 人 60 秒后自动解散。"
 
 
 async def update_poker_waiting(game, app):
@@ -1104,8 +1113,8 @@ def poker_buttons(game, uid):
 
 
 async def update_poker_table(game, app):
-    # 回归原地编辑逻辑
-    await safe_edit(app.bot, game.chat_id, game.game_msg_id, await poker_table_text(game, app))
+    # 开局后主消息转为静态提示，动态牌桌由行动消息携带（牌桌+提示+按钮一条消息）
+    await safe_edit(app.bot, game.chat_id, game.game_msg_id, "🃏 游戏开始！请点击下方行动消息的按钮操作。", reply_markup=None)
 
 
 async def start_turn_timer(game, app):
@@ -1114,13 +1123,28 @@ async def start_turn_timer(game, app):
     if uid is None:
         if game.phase == "showdown": await settle_poker(game, app)
         return
-    # 原地更新主表文字
-    await safe_edit(app.bot, game.chat_id, game.game_msg_id, await poker_table_text(game, app))
-    # 仅操作按钮区做必要的删发以保证置底
+    # 行动消息携带完整牌桌 + 行动提示 + 操作按钮（一条消息）
     await safe_delete(app.bot, game.chat_id, game.action_msg_id)
-    text = f"⏰ <b>{await get_name(app, uid)}</b> 请在 {TURN_TIMEOUT} 秒内行动。"
+    text = f"{await poker_table_text(game, app)}\n\n⏰ <b>{await get_name(app, uid)}</b> 请在 {TURN_TIMEOUT} 秒内行动。"
     msg = await safe_send(app.bot, game.chat_id, text, reply_markup=poker_buttons(game, uid), parse_mode="HTML")
     game.action_msg_id = msg.message_id if msg else None
+
+    # 真实超时任务：无需跟注自动过牌，否则自动弃牌，防止牌局卡死
+    async def timeout_action():
+        await asyncio.sleep(TURN_TIMEOUT)
+        if game.settled or game.phase == "showdown": return
+        if game.current() != uid: return  # 该玩家已行动过
+        if game.round_bets[uid] == game.current_bet:
+            ok, _ = game.action(uid, "check")
+            if not ok: game.action(uid, "fold")
+            desc = "超时自动过牌"
+        else:
+            game.action(uid, "fold")
+            desc = "超时自动弃牌"
+        await safe_send(app.bot, game.chat_id, f"⏰ {desc}：{await get_name(app, uid)}")
+        if game.phase == "showdown": await settle_poker(game, app)
+        else: await update_poker_table(game, app); await start_turn_timer(game, app)
+    game.turn_task = asyncio.create_task(timeout_action())
 
 
 async def settle_poker(game, app):
@@ -1431,7 +1455,7 @@ async def need_auth(update):
 async def cmd_start(update, context): await update.message.reply_text("🎮 欢迎使用娱乐机器人！\n\n可用命令：\n/dz - 发起德州扑克\n/sm - 发起赛马\n/wz - 发起五子棋\n/sl - 发起扫雷\n/lhj - 老虎机抽奖\n/21 - 发起21点\n/bjl - 发起百家乐\n\n📊 数据查询：\n/cx - 当日盈亏榜\n/ph - 总筹码榜\n/end - 终止当前游戏")
 
 async def gomoku_wait_timeout(game, app):
-    await asyncio.sleep(AUTO_START_TIMEOUT)
+    await asyncio.sleep(ROOM_WAIT_TIMEOUT)
     if game.phase == "waiting" and active_gomoku_games.get(game.chat_id) is game:
         active_gomoku_games.pop(game.chat_id, None)
         await update_gomoku_board(game, app, {}, remove_keyboard=True, custom_caption="⌛ 五子棋等待 60 秒无人加入，本局已取消。")
@@ -1486,6 +1510,14 @@ async def update_mine_board(game, app, names):
     )
 
 
+async def mine_wait_timeout(game, app):
+    """扫雷等待 60 秒无人开始则自动取消。"""
+    await asyncio.sleep(ROOM_WAIT_TIMEOUT)
+    if game.phase == "waiting" and active_minesweeper_games.get(game.chat_id) is game:
+        active_minesweeper_games.pop(game.chat_id, None)
+        await safe_edit(app.bot, game.chat_id, game.game_msg_id, "⌛ 扫雷等待 60 秒未开始，本局已取消。", reply_markup=None)
+
+
 async def cmd_sl(update, context):
     if not await need_auth(update): return
     cid, uid = update.effective_chat.id, update.effective_user.id
@@ -1493,7 +1525,9 @@ async def cmd_sl(update, context):
         await update.message.reply_text("当前已有进行中的扫雷。"); return
     game = MinesweeperGame(cid, uid); game.add(uid); active_minesweeper_games[cid] = game
     msg = await safe_send(context.bot, cid, game.caption({}), reply_markup=game.buttons())
-    if msg: game.game_msg_id = msg.message_id
+    if msg:
+        game.game_msg_id = msg.message_id
+        game.wait_task = asyncio.create_task(mine_wait_timeout(game, context.application))
 
 
 # ---------- 21点 / 百家乐 界面与逻辑 ----------
@@ -1510,26 +1544,27 @@ async def start_bj_turn_timer(game, app):
     game.timer_task = asyncio.create_task(timeout())
 
 async def start_bj_wait_timeout(game, app):
-    """21点开房后，若 60 秒内未开始则自动解散。"""
+    """21点等待房 60 秒倒计时：有人加入则自动开局，无人加入自动解散。"""
     game.cancel_wait()
     async def expire():
-        await asyncio.sleep(AUTO_START_TIMEOUT)
-        if game.phase == "waiting" and active_blackjack_games.get(game.chat_id) is game:
-            # 退还已加入玩家的筹码
-            wallet = entertainment_chips if game.mode == "entertainment" else group_chips
-            for uid, bet in game.bets.items():
-                wallet[game.chat_id][uid] += bet
-                pending_game_bets[game.chat_id].get(uid, {}).pop("21", None)
+        await asyncio.sleep(ROOM_WAIT_TIMEOUT)
+        if game.phase != "waiting" or active_blackjack_games.get(game.chat_id) is not game:
+            return
+        if game.players:
+            if game.start():
+                await update_blackjack_ui(game, app)
+                await start_bj_turn_timer(game, app)
+        else:
             active_blackjack_games.pop(game.chat_id, None)
-            await safe_edit(app.bot, game.chat_id, game.game_msg_id, "⌛ 21点等待 60 秒未开始，房间已自动解散并退款。", reply_markup=None)
+            await safe_edit(app.bot, game.chat_id, game.game_msg_id, "⌛ 21点等待 60 秒无人加入，房间已自动解散。", reply_markup=None)
     game.wait_task = asyncio.create_task(expire())
 
 async def start_baccarat_timer(game, app):
-    """百家乐下注倒计时刷新任务：30秒自动开牌。"""
+    """百家乐下注倒计时：60 秒无人下注自动解散，有人下注自动开牌。"""
     game.cancel_timer()
     async def countdown():
-        # 设置总共 30 秒
-        total_wait = 30
+        # 设置总共 60 秒
+        total_wait = ROOM_WAIT_TIMEOUT
         interval = 10 # 每 10 秒刷新一次界面，防止刷屏过猛
         
         start_ts = time.time()
@@ -1543,9 +1578,13 @@ async def start_baccarat_timer(game, app):
                 if game.phase == "betting" and active_baccarat_games.get(game.chat_id) is game:
                     await update_baccarat_ui(game, app)
         
-        # 时间到，自动开牌
+        # 时间到：有人下注自动开牌，无人下注自动解散
         if game.phase == "betting" and active_baccarat_games.get(game.chat_id) is game:
-            await settle_baccarat(game, app)
+            if game.bets:
+                await settle_baccarat(game, app)
+            else:
+                active_baccarat_games.pop(game.chat_id, None)
+                await safe_edit(app.bot, game.chat_id, game.game_msg_id, "⌛ 百家乐等待 60 秒无人下注，本局已取消。", reply_markup=None)
             
     game.timer_task = asyncio.create_task(countdown())
 
@@ -1561,6 +1600,7 @@ async def update_blackjack_ui(game, app):
         )
         for uid in game.players:
             text += f"- {await get_name(app, uid)} (下注: {game.bets[uid]})\n"
+        text += "\n⏰ 有人加入后 60 秒自动开局，无人加入自动解散。\n"
         kb = [[InlineKeyboardButton("加入 (下注500)", callback_data="bj_join_500"), InlineKeyboardButton("加入 (下注1000)", callback_data="bj_join_1000")]]
         if game.players: kb.append([InlineKeyboardButton("开始游戏", callback_data="bj_start")])
         kb.append([InlineKeyboardButton("🛑 终止", callback_data="bj_end")])
@@ -1672,8 +1712,8 @@ async def update_blackjack_ui(game, app):
 
 async def update_baccarat_ui(game, app):
     if game.phase == "betting":
-        # 统一使用 30 秒倒计时逻辑
-        total_wait = 30
+        # 统一使用 60 秒倒计时逻辑
+        total_wait = ROOM_WAIT_TIMEOUT
         remain = max(0, int(total_wait - (time.time() - game.create_time)))
         history_icons = {"player": "🔵", "banker": "🔴", "tie": "🟢"}
         history_list = "".join(history_icons.get(r, "") for r in baccarat_history[game.chat_id][-12:]) or "暂无"
@@ -1718,7 +1758,7 @@ async def update_baccarat_ui(game, app):
                 text.append(f"👤 <b>玩家</b>：{name} | {' '.join(bet_str)}")
             text.append("")
             
-        text.append(f"⏰ <b>将在 {remain} 秒后自动开牌</b>")
+        text.append(f"⏰ <b>将在 {remain} 秒后自动开牌，无人下注将取消</b>")
         text.append("🔒 庄闲平任你押，发牌后截止")
         
         kb = [
@@ -1892,24 +1932,19 @@ async def cmd_lhj(update, context):
 
 
 async def start_wait_timeout(game, app):
-    """德州开房后，等待超时无人开局则自动解散。"""
+    """德州等待房 60 秒倒计时：满 2 人自动开局，不足 2 人自动解散。"""
     game.cancel_wait()
-    async def expire():
-        await asyncio.sleep(AUTO_START_TIMEOUT)
-        if game.phase == "waiting" and active_poker_games.get(game.chat_id) is game:
-            await refund_poker(game, app, "⌛ 德州等待超时无人开局，房间已解散，筹码已退回。")
-    game.wait_task = asyncio.create_task(expire())
-
-
-async def start_auto_game(game, app):
-    """德州房间满 2 人后，短暂倒计时自动开局。"""
-    game.cancel_wait()
-    await asyncio.sleep(3)
-    if game.phase != "waiting" or len(game.players) < 2: return
-    if active_poker_games.get(game.chat_id) is not game: return
-    if game.start():
-        await update_poker_table(game, app)
-        await start_turn_timer(game, app)
+    async def countdown():
+        await asyncio.sleep(ROOM_WAIT_TIMEOUT)
+        if game.phase != "waiting" or active_poker_games.get(game.chat_id) is not game:
+            return
+        if len(game.players) >= 2:
+            if game.start():
+                await update_poker_table(game, app)
+                await start_turn_timer(game, app)
+        else:
+            await refund_poker(game, app, "⌛ 德州等待 60 秒不足 2 人，房间已自动解散。")
+    game.wait_task = asyncio.create_task(countdown())
 
 
 async def cmd_dz(update, context):
@@ -1923,10 +1958,7 @@ async def cmd_dz(update, context):
     if game:
         if game.phase != "waiting": await update.message.reply_text("当前已有进行中的德州扑克。"); return
         if game.add(uid):
-            await update_poker_waiting(game, context.application); await update.message.reply_text("已加入当前等待房间。")
-            if len(game.players) >= 2:
-                game.cancel_wait()
-                await start_auto_game(game, context.application)
+            await update_poker_waiting(game, context.application); await update.message.reply_text("已加入当前等待房间，满 2 人后 60 秒自动开局。")
         else: await update.message.reply_text("你已在等待房间中。")
         return
     game = PokerGame(cid, uid, mode); game.add(uid); active_poker_games[cid] = game
@@ -2209,6 +2241,12 @@ async def on_button(update, context):
                 await update_baccarat_ui(game, context.application)
             elif data == "bjl_start":
                 if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
+                if not game.bets:
+                    game.cancel_timer()
+                    active_baccarat_games.pop(cid, None)
+                    await q.answer("无人下注，本局已取消", show_alert=True)
+                    await safe_edit(context.bot, cid, game.game_msg_id, "🛑 百家乐无人下注，本局已取消。", reply_markup=None)
+                    return
                 await settle_baccarat(game, context.application)
             elif data == "bjl_end":
                 if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
@@ -2280,10 +2318,8 @@ async def on_button(update, context):
                     await q.answer(f"进入德州至少需要 {MIN_ENTRY_CHIPS} {label}", show_alert=True)
                 elif data == "texas_join" and game.add(uid):
                     await q.answer("已加入"); await update_poker_waiting(game, context.application)
-                    if len(game.players) >= 2:
-                        game.cancel_wait()
-                        await start_auto_game(game, context.application)
                 elif data == "texas_start" and uid == game.owner_id and game.start():
+                    game.cancel_wait()
                     await q.answer("游戏开始"); await update_poker_table(game, context.application); await start_turn_timer(game, context.application)
                 else: await q.answer("无法执行此操作", show_alert=True)
                 return
@@ -2543,7 +2579,7 @@ async def daily_reset_scheduler(app):
 
 async def leaderboard_scheduler(app):
     while True:
-        now = now_bj(); target = now.replace(hour=23, minute=0, second=0, microsecond=0)
+        now = now_bj(); target = now.replace(hour=23, minute=50, second=0, microsecond=0)
         if target <= now: target += timedelta(days=1)
         await asyncio.sleep((target-now).total_seconds())
         date = now_bj().strftime("%Y-%m-%d"); snapshot = profit_by_date.pop(date, {})
