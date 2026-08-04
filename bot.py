@@ -31,7 +31,7 @@ EMERGENCY_MAX_USES = 3
 
 # 游戏时间配置 (秒)
 TURN_TIMEOUT = 60          # 德州/21点单回合思考时间
-AUTO_START_TIMEOUT = 30    # 21点/百家乐自动开牌/解散时间
+AUTO_START_TIMEOUT = 60    # 21点/百家乐自动开牌/解散时间
 ROOM_WAIT_TIMEOUT = 60     # 各游戏等待房统一倒计时（60秒）
 RACE_AUTO_START = 120      # 赛马自动开赛时间
 RACE_ANIMATION_INTERVAL = 1.5
