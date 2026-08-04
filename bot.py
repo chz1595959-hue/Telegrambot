@@ -545,8 +545,8 @@ class GomokuGame:
             row_btns = []
             for c in range(self.SIZE):
                 stone = self.board[r][c]
-                # 使用最窄的字符来尝试缩减按钮宽度
-                label = "●" if stone == self.BLACK else "○" if stone == self.WHITE else "."
+                # 与顶部玩家信息一致，使用黑白圆 emoji；空位用中点
+                label = "⚫" if stone == self.BLACK else "⚪" if stone == self.WHITE else "·"
                 row_btns.append(InlineKeyboardButton(label, callback_data=f"gomoku_place_{r}_{c}"))
             kb.append(row_btns)
         kb.append([InlineKeyboardButton("🛑 终止本局", callback_data="gomoku_end")])
@@ -1094,15 +1094,12 @@ async def poker_table_text(game, app):
 
 def poker_buttons(game, uid):
     rows = [[InlineKeyboardButton("🂠 查看手牌", callback_data="texas_hand")]]
-    if uid != game.current() or uid in game.folded or uid in game.all_in:
-        rows.append([InlineKeyboardButton("🛑 终止本局", callback_data="texas_end")])
-        return InlineKeyboardMarkup(rows)
+    if uid != game.current() or uid in game.folded or uid in game.all_in: return InlineKeyboardMarkup(rows)
     to_call = max(0, game.current_bet - game.round_bets[uid])
     rows.append([InlineKeyboardButton("❌ 弃牌", callback_data="texas_fold"), InlineKeyboardButton("✅ 过牌" if not to_call else f"✅ 跟注 {to_call}", callback_data="texas_check" if not to_call else "texas_call")])
     if uid not in game.raise_locked and game.chips[uid] >= to_call + FIXED_MIN_RAISE:
         rows.append([InlineKeyboardButton(f"🔼 加注 {FIXED_MIN_RAISE}", callback_data=f"texas_raise_{FIXED_MIN_RAISE}")])
     if game.chips[uid] > 0: rows.append([InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data="texas_allin")])
-    rows.append([InlineKeyboardButton("🛑 终止本局", callback_data="texas_end")])
     return InlineKeyboardMarkup(rows)
 
 
