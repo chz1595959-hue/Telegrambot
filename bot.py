@@ -1065,6 +1065,7 @@ async def poker_waiting_text(game, app):
 async def update_poker_waiting(game, app):
     rows = [[InlineKeyboardButton("加入游戏", callback_data="texas_join")]]
     if len(game.players) >= 2: rows.append([InlineKeyboardButton("开始游戏", callback_data="texas_start")])
+    rows.append([InlineKeyboardButton("🛑 终止房间", callback_data="texas_end")])
     await safe_edit(app.bot, game.chat_id, game.game_msg_id, await poker_waiting_text(game, app), reply_markup=InlineKeyboardMarkup(rows))
 
 
@@ -1093,12 +1094,15 @@ async def poker_table_text(game, app):
 
 def poker_buttons(game, uid):
     rows = [[InlineKeyboardButton("🂠 查看手牌", callback_data="texas_hand")]]
-    if uid != game.current() or uid in game.folded or uid in game.all_in: return InlineKeyboardMarkup(rows)
+    if uid != game.current() or uid in game.folded or uid in game.all_in:
+        rows.append([InlineKeyboardButton("🛑 终止本局", callback_data="texas_end")])
+        return InlineKeyboardMarkup(rows)
     to_call = max(0, game.current_bet - game.round_bets[uid])
     rows.append([InlineKeyboardButton("❌ 弃牌", callback_data="texas_fold"), InlineKeyboardButton("✅ 过牌" if not to_call else f"✅ 跟注 {to_call}", callback_data="texas_check" if not to_call else "texas_call")])
     if uid not in game.raise_locked and game.chips[uid] >= to_call + FIXED_MIN_RAISE:
         rows.append([InlineKeyboardButton(f"🔼 加注 {FIXED_MIN_RAISE}", callback_data=f"texas_raise_{FIXED_MIN_RAISE}")])
     if game.chips[uid] > 0: rows.append([InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data="texas_allin")])
+    rows.append([InlineKeyboardButton("🛑 终止本局", callback_data="texas_end")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1639,7 +1643,8 @@ async def update_blackjack_ui(game, app):
                 if game.mode == "official":
                     profit_by_date[date][game.chat_id][uid] += net
                     blackjack_profit_by_date[date][game.chat_id][uid] += net
-                lines.append(f"👤 <b>玩家</b>：{player_names[uid]}\n<b>结果</b>：{result_str} | 盈亏 {net:+d}")
+                hand_text = game.get_card_str(game.hands[uid])
+                lines.append(f"👤 <b>玩家</b>：{player_names[uid]} | {hand_text} ({p_score})\n<b>结果</b>：{result_str} | 盈亏 {net:+d}")
                 pending_game_bets[game.chat_id].get(uid, {}).pop("21", None)
 
             # 记录庄家历史 (仅记录本局主要趋势)
@@ -1928,7 +1933,7 @@ async def cmd_dz(update, context):
         else: await update.message.reply_text("你已在等待房间中。")
         return
     game = PokerGame(cid, uid, mode); game.add(uid); active_poker_games[cid] = game
-    msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("加入游戏", callback_data="texas_join")]]))
+    msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("加入游戏", callback_data="texas_join")], [InlineKeyboardButton("🛑 终止房间", callback_data="texas_end")]]))
     if msg:
         game.game_msg_id = msg.message_id
         await start_wait_timeout(game, context.application)
@@ -2265,6 +2270,12 @@ async def on_button(update, context):
             if not game: await q.answer("德州游戏已结束", show_alert=True); return
             if data == "texas_hand":
                 hand = game.hands.get(uid); await q.answer(f"你的手牌：{card_str(hand[0])}  {card_str(hand[1])}" if hand and uid not in game.folded else "当前无法查看手牌", show_alert=True); return
+            if data == "texas_end":
+                if uid != ADMIN_USER_ID and uid not in game.players:
+                    await q.answer("权限不足", show_alert=True); return
+                await refund_poker(game, context.application, "🛑 德州已终止，筹码已退回。")
+                await q.answer("本局已终止")
+                return
             if game.phase == "waiting":
                 wallet = entertainment_chips if game.mode == "entertainment" else group_chips
                 if data == "texas_join" and wallet[cid][uid] < MIN_ENTRY_CHIPS:
@@ -2374,7 +2385,7 @@ async def on_text(update, context):
                 found = True
                 await safe_delete(context.bot, cid, poker.game_msg_id)
                 if poker.phase == "waiting":
-                    msg = await safe_send(context.bot, cid, await poker_waiting_text(poker, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("加入游戏", callback_data="texas_join")]]))
+                    msg = await safe_send(context.bot, cid, await poker_waiting_text(poker, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("加入游戏", callback_data="texas_join")], [InlineKeyboardButton("🛑 终止房间", callback_data="texas_end")]]))
                     if msg: poker.game_msg_id = msg.message_id
                 else:
                     msg = await safe_send(context.bot, cid, await poker_table_text(poker, context.application))
