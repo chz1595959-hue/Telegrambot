@@ -1114,14 +1114,13 @@ def poker_buttons(game, uid):
 
 
 async def update_poker_table(game, app):
-    # 开局/每回合：把等待房消息原地编辑成完整牌桌（桌台+行动提示+操作按钮），不删除、不另发消息
+    # 游戏开始后：把等待房消息直接编辑成完整游戏界面（牌桌+行动提示+操作按钮）
     uid = game.current()
     text = await poker_table_text(game, app)
     if uid:
         text += f"\n\n⏰ <b>{await get_name(app, uid)}</b> 请在 {TURN_TIMEOUT} 秒内行动。"
-    msg = await safe_edit(app.bot, game.chat_id, game.game_msg_id, text,
-                          reply_markup=poker_buttons(game, uid) if uid else None, parse_mode="HTML")
-    if msg: game.action_msg_id = game.game_msg_id
+    await safe_edit(app.bot, game.chat_id, game.game_msg_id, text,
+                    reply_markup=poker_buttons(game, uid) if uid else None, parse_mode="HTML")
 
 
 async def start_turn_timer(game, app):
@@ -1130,7 +1129,7 @@ async def start_turn_timer(game, app):
     if uid is None:
         if game.phase == "showdown": await settle_poker(game, app)
         return
-    # 行动界面已由 update_poker_table 原地编辑进等待房消息，这里只负责启动超时计时
+    # 游戏界面（牌桌+提示+按钮）已由 update_poker_table 编辑进等待房消息，这里只启动超时计时
     # 真实超时任务：无需跟注自动过牌，否则自动弃牌，防止牌局卡死
     async def timeout_action():
         await asyncio.sleep(TURN_TIMEOUT)
@@ -1197,8 +1196,6 @@ async def settle_poker(game, app):
         logger.exception("德州结算异常")
     finally:
         if active_poker_games.get(game.chat_id) is game: active_poker_games.pop(game.chat_id, None)
-        # 游戏界面与主消息合一后，结算时把界面编辑为结束提示，避免失效按钮残留
-        await safe_edit(app.bot, game.chat_id, game.game_msg_id, "🃏 本局德州已结束，结算详情见上方。", reply_markup=None)
         if game.mode == "official":
             for uid in game.players: await emergency_if_needed(game.chat_id, uid, app, game)
         save_data()
@@ -1997,8 +1994,7 @@ async def refund_poker(game, app, notice):
     game.phase = "cancelled"
     if active_poker_games.get(game.chat_id) is game:
         active_poker_games.pop(game.chat_id, None)
-    if game.action_msg_id and game.action_msg_id != game.game_msg_id:
-        await safe_delete(app.bot, game.chat_id, game.action_msg_id)
+    await safe_delete(app.bot, game.chat_id, game.action_msg_id)
     await safe_edit(app.bot, game.chat_id, game.game_msg_id, notice, reply_markup=None)
     save_data()
 
@@ -2341,7 +2337,7 @@ async def on_button(update, context):
             if not action: await q.answer("未知操作", show_alert=True); return
             ok, desc = game.action(uid, action, extra)
             if not ok: await q.answer(desc, show_alert=True); return
-            await q.answer(desc); await action_notice(cid, context.application, uid, desc)
+            await q.answer(desc); await safe_delete(context.bot, cid, game.action_msg_id); await action_notice(cid, context.application, uid, desc)
             if game.phase == "showdown": await settle_poker(game, context.application)
             else: await update_poker_table(game, context.application); await start_turn_timer(game, context.application)
             return
