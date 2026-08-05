@@ -1863,14 +1863,17 @@ SLOT_COOLDOWN = 5 # 冷却时间（秒）
 
 
 def get_slot_result():
-    res = [random.choice(SLOT_SYMBOLS) for _ in range(3)]
-    # 简单的中奖逻辑
-    if res[0] == res[1] == res[2]:
-        if res[0] == "7️⃣": return res, 50 # 777 大奖 50倍
-        if res[0] == "💎": return res, 20 # 钻石 20倍
-        return res, 10 # 其他三连 10倍
-    if res[0] == res[1] or res[1] == res[2] or res[0] == res[2]:
-        return res, 2 # 任意两连 2倍
+    """5 格老虎机：按任意位置相同数量结算（G 刺激流支付表）。"""
+    res = [random.choice(SLOT_SYMBOLS) for _ in range(5)]
+    # 取出现次数最多的符号，按最大匹配数结算（5连 > 4连 > 3连 > 无奖）
+    top = max(res, key=res.count)
+    n = res.count(top)
+    if n == 5:
+        return res, 500 if top == "7️⃣" else (250 if top == "💎" else 120)
+    if n == 4:
+        return res, 40 if top == "7️⃣" else (20 if top == "💎" else 10)
+    if n == 3:
+        return res, 8 if top == "7️⃣" else (4 if top == "💎" else 2)
     return res, 0
 
 
@@ -1887,13 +1890,14 @@ async def cmd_lhj(update, context):
         return
     lhj_cmd_spam[uid] = now
     
-    # 弹出选择界面：1次 / 5次 / 10次 / 20次
+    # 弹出选择界面：1次 / 5次 / 10次 / 20次（绑定发起人，他人点击无效）
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎯 1 次", callback_data="lhj_spin_1"), InlineKeyboardButton("🎮 5 次", callback_data="lhj_spin_5")],
-        [InlineKeyboardButton("⚡ 10 次", callback_data="lhj_spin_10"), InlineKeyboardButton("💥 20 次", callback_data="lhj_spin_20")],
+        [InlineKeyboardButton("🎯 1 次", callback_data=f"lhj_spin_1_{uid}"), InlineKeyboardButton("🎮 5 次", callback_data=f"lhj_spin_5_{uid}")],
+        [InlineKeyboardButton("⚡ 10 次", callback_data=f"lhj_spin_10_{uid}"), InlineKeyboardButton("💥 20 次", callback_data=f"lhj_spin_20_{uid}")],
+        [InlineKeyboardButton("🎲 50 次", callback_data=f"lhj_spin_50_{uid}"), InlineKeyboardButton("💯 100 次", callback_data=f"lhj_spin_100_{uid}")],
     ])
     await update.message.reply_text(
-        f"🎰 <b>老虎机</b>（单次 {SLOT_BET} 筹码）\n\n请选择转动次数：\n💡 5次={SLOT_BET*5}｜10次={SLOT_BET*10}｜20次={SLOT_BET*20}",
+        f"🎰 <b>老虎机</b>（单次 {SLOT_BET} 筹码）\n\n请选择转动次数：\n💡 5次={SLOT_BET*5}｜10次={SLOT_BET*10}｜20次={SLOT_BET*20}｜50次={SLOT_BET*50}｜100次={SLOT_BET*100}",
         reply_markup=kb, parse_mode="HTML")
 
 
@@ -1936,12 +1940,21 @@ async def run_slot_spins(context, cid, uid, count, answer=None):
                 result_text = f"🎰 <b>老虎机结果：[ {res_str} ]</b>\n\n🎉 恭喜 {name} 中了 {m} 倍！获得 {total_payout} 积分。"
             else:
                 result_text = f"🎰 <b>老虎机结果：[ {res_str} ]</b>\n\n💸 很遗憾，{name} 未中奖，失去了 {SLOT_BET} 积分。"
-        else:
+        elif count <= 20:
             lines = []
             for i, (res, m) in enumerate(results, 1):
                 rs = " | ".join(res)
                 lines.append(f"{i}. [ {rs} ] " + (f"🎉 ×{m}" if m > 0 else "💸"))
             result_text = f"🎰 <b>老虎机 {count} 连抽</b>｜👤 {name}\n━━━━━━━━━━━━━━━━━\n" + "\n".join(lines) + f"\n━━━━━━━━━━━━━━━━━\n💰 总投入 {total_cost}｜总赢回 {total_payout}｜净 {total_payout - total_cost:+d}"
+        else:
+            # 50/100 连抽：按倍率统计，避免超长消息
+            tally = {}
+            for _, m in results:
+                tally[m] = tally.get(m, 0) + 1
+            parts = [f"未中奖 {tally.get(0, 0)} 次"] if tally.get(0) else []
+            for m in sorted((k for k in tally if k > 0), reverse=True):
+                parts.append(f"🎉 中 {m} 倍 × {tally[m]} 次")
+            result_text = f"🎰 <b>老虎机 {count} 连抽</b>｜👤 {name}\n━━━━━━━━━━━━━━━━━\n" + "\n".join(parts) + f"\n━━━━━━━━━━━━━━━━━\n💰 总投入 {total_cost}｜总赢回 {total_payout}｜净 {total_payout - total_cost:+d}"
         
         # 榜单
         if mode == "official":
@@ -1949,10 +1962,9 @@ async def run_slot_spins(context, cid, uid, count, answer=None):
             result_text += "\n\n🏆 <b>老虎机累计盈利榜（总数）</b>\n"
             result_text += "\n".join([f"{rank_marker(i)} {await get_name(context.application, u)}：{a:+d}" for i, (u, a) in enumerate(s_rank, 1)])
         
-        await safe_send(context.bot, cid, result_text, parse_mode="HTML")
         save_data()
         if mode == "official": await emergency_if_needed(cid, uid, context.application)
-    return True
+    return True, result_text
 
 
 
@@ -2317,17 +2329,23 @@ async def on_button(update, context):
                 await safe_edit(context.bot, cid, game.game_msg_id, "🛑 百家乐已手动终止，筹码已退回。", reply_markup=None)
             return
 
-        # --- 老虎机连抽回调 ---
+        # --- 老虎机连抽回调（绑定发起人） ---
         if data.startswith("lhj_spin_"):
-            try: count = int(data.split("_")[2])
+            parts = data.split("_")
+            try:
+                count = int(parts[2]); owner = int(parts[3])
             except (ValueError, IndexError):
                 await q.answer("无效操作", show_alert=True); return
-            if count not in (1, 5, 10, 20):
+            if uid != owner:
+                await q.answer("这是别人的老虎机界面，请自己发送 /lhj", show_alert=True); return
+            if count not in (1, 5, 10, 20, 50, 100):
                 await q.answer("无效操作", show_alert=True); return
-            ok = await run_slot_spins(context, cid, uid, count, answer=q.answer)
+            ok, result_text = await run_slot_spins(context, cid, uid, count, answer=q.answer)
             if ok and q.message:
-                # 抽奖成功后删除选择界面，群聊更干净；冷却/筹码不足时保留以便重试
-                await safe_delete(context.bot, cid, q.message.message_id)
+                # 抽奖成功后原地编辑为开奖结果（1 次 API，比删除+发送省一半请求）；编辑失败则直接发送
+                edited = await safe_edit(context.bot, cid, q.message.message_id, result_text, reply_markup=None, parse_mode="HTML")
+                if edited is None:
+                    await safe_send(context.bot, cid, result_text, parse_mode="HTML")
             return
 
         if data == "gomoku_join":
