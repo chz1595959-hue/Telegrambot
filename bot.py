@@ -24,7 +24,8 @@ logger = logging.getLogger(__name__)
 
 # ---------- 全局配置中心 ----------
 STARTING_CHIPS = 20000
-ENTERTAINMENT_CHIPS = 50000  # 娱乐模式起始筹码（5W）
+GAME_STARTING_CHIPS = 50000  # 通用筹码初始值（首次使用自动获得）
+
 MIN_ENTRY_CHIPS = 200
 EMERGENCY_CHIPS = 2000
 EMERGENCY_MAX_USES = 3
@@ -71,18 +72,24 @@ def rank_marker(index):
     return RANK_ICONS[index - 1] if 1 <= index <= len(RANK_ICONS) else f"🔸{index}"
 
 
+def total_profit_by_game(game_profit, chat_id):
+    """聚合某游戏所有日期的盈亏为累计总数。"""
+    total = defaultdict(int)
+    for dates in game_profit.values():
+        for uid, v in dates.get(chat_id, {}).items():
+            total[uid] += v
+    return dict(total)
+
+
 # ---------- 数据 ----------
-group_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))
-entertainment_chips = defaultdict(lambda: defaultdict(lambda: ENTERTAINMENT_CHIPS))
+texas_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))  # 德州专用筹码（每日重置 20000）
+game_chips = defaultdict(lambda: defaultdict(lambda: GAME_STARTING_CHIPS))  # 其他游戏通用筹码（不重置，初始 5W）
 AUTHORIZED_GROUPS = set()
 race_history = defaultdict(list)
 baccarat_history = defaultdict(list)
 blackjack_history = defaultdict(list) # 新增 21点历史
 race_daily_stats = defaultdict(lambda: [0] * HORSE_COUNT)
 baccarat_daily_stats = defaultdict(lambda: {"player": 0, "banker": 0, "tie": 0})
-# profit_by_date[业务日期][群ID][用户ID] = 德州 + 赛马合并盈亏（供 /cx 与每日综合榜使用）
-profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-# 以下几份统计仅供各自游戏的局内“当日累计盈利榜”使用。
 poker_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 race_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 blackjack_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
@@ -95,9 +102,6 @@ daily_emergency_used = defaultdict(lambda: defaultdict(bool))
 # 按游戏类型分条存储，避免多游戏并发时记录互相覆盖：
 # pending_game_bets[群ID][用户ID]["21"/"baccarat"/"horse"] = {"amount": 100, "mode": "official"}
 pending_game_bets = defaultdict(lambda: defaultdict(dict))
-# 旧版赛马下注记录（仅兼容结算代码中的 pop 清理，实际退款以 pending_game_bets 为准）
-pending_horse_bets = defaultdict(dict)
-pending_horse_bet_modes = defaultdict(str)
 last_business_date = ""
 active_poker_games, active_horse_races, active_gomoku_games, active_minesweeper_games = {}, {}, {}, {}
 active_blackjack_games, active_baccarat_games = {}, {}
@@ -118,15 +122,11 @@ def business_date(now=None):
     return (now + timedelta(days=1) if (now.hour, now.minute) >= (23, 50) else now).strftime("%Y-%m-%d")
 
 
-def is_entertainment_time(now=None):
-    now = now or now_bj()
-    # 23:00:00 到 23:59:59 之间
-    return now.hour == 23
-
-
 def current_game_mode():
-    """23:00-23:59 为娱乐模式，其余时间为正式积分模式。"""
-    return "entertainment" if is_entertainment_time() else "official"
+    """统一正式模式（已移除娱乐时段）。"""
+    return "official"
+
+
 
 
 def restore_nested(target, source):
@@ -152,9 +152,8 @@ def force_save_now():
     try:
         with data_save_lock:
             data = {
-                "group_chips": {str(cid): dict(users) for cid, users in group_chips.items()},
-                "entertainment_chips": {str(cid): dict(users) for cid, users in entertainment_chips.items()},
-                "profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in profit_by_date.items()},
+                "texas_chips": {str(cid): dict(users) for cid, users in texas_chips.items()},
+                "game_chips": {str(cid): dict(users) for cid, users in game_chips.items()},
                 "poker_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in poker_profit_by_date.items()},
                 "race_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in race_profit_by_date.items()},
                 "blackjack_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in blackjack_profit_by_date.items()},
@@ -213,9 +212,9 @@ def load_data():
         except Exception:
             logger.exception("备份读取失败"); return
     try:
-        restore_nested(group_chips, data.get("group_chips", {}))
-        restore_nested(entertainment_chips, data.get("entertainment_chips", {}))
-        for date, chats in data.get("profit_by_date", {}).items(): restore_nested(profit_by_date[date], chats)
+        restore_nested(texas_chips, data.get("texas_chips", {}))
+        # 兼容旧存档：group_chips 键迁移为通用筹码
+        restore_nested(game_chips, data.get("game_chips", data.get("group_chips", {})))
         for date, chats in data.get("poker_profit_by_date", {}).items(): restore_nested(poker_profit_by_date[date], chats)
         for date, chats in data.get("race_profit_by_date", {}).items(): restore_nested(race_profit_by_date[date], chats)
         for date, chats in data.get("blackjack_profit_by_date", {}).items(): restore_nested(blackjack_profit_by_date[date], chats)
@@ -235,7 +234,7 @@ def load_data():
                 # 兼容旧格式（单条记录）与新格式（按游戏类型分条）
                 entries = [info] if "amount" in info else list(info.values())
                 for ginfo in entries:
-                    wallet = entertainment_chips if ginfo.get("mode") == "entertainment" else group_chips
+                    wallet = game_chips
                     wallet[int(cid)][int(uid)] += int(ginfo.get("amount", 0))
         # 老虎机冷却恢复
         for uid, ts in data.get("user_cooldowns", {}).items(): user_cooldowns[int(uid)] = float(ts)
@@ -370,10 +369,11 @@ async def action_notice(cid, app, uid, desc):
         asyncio.create_task(delete_later())
 
 
-async def emergency_if_needed(cid, uid, app, poker=None):
+async def emergency_if_needed(cid, uid, app, wallet=None, poker=None):
     used = daily_emergency_used[cid][uid]
-    if group_chips[cid][uid] != 0 or used >= EMERGENCY_MAX_USES: return False
-    group_chips[cid][uid] = EMERGENCY_CHIPS
+    wallet = wallet or game_chips
+    if wallet[cid][uid] != 0 or used >= EMERGENCY_MAX_USES: return False
+    wallet[cid][uid] = EMERGENCY_CHIPS
     if poker and uid in poker.chips: poker.chips[uid] += EMERGENCY_CHIPS
     daily_emergency_used[cid][uid] = used + 1; save_data()
     remaining = EMERGENCY_MAX_USES - daily_emergency_used[cid][uid]
@@ -926,7 +926,7 @@ class PokerGame:
 
     def add(self, uid):
         if self.phase != "waiting" or uid in self.players: return False
-        wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+        wallet = texas_chips
         if wallet[self.chat_id][uid] < MIN_ENTRY_CHIPS: return False
         self.players.append(uid); self.chips[uid] = wallet[self.chat_id][uid]; self.total_bet[uid] = 0
         return True
@@ -935,7 +935,7 @@ class PokerGame:
         if len(self.players) < 2: return False
         random.shuffle(self.players)
         self.cancel_auto(); self.cancel_wait(); self.folded.clear(); self.all_in.clear(); self.acted.clear(); self.raise_locked.clear(); self.board = []; self.pot = 0; self.settled = False
-        wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+        wallet = texas_chips
         for uid in self.players:
             self.chips[uid] = wallet[self.chat_id][uid]; self.initial_chips[uid] = self.chips[uid]
             self.total_bet[uid] = self.round_bets[uid] = 0
@@ -1034,7 +1034,7 @@ class PokerGame:
         if len(alive) == 1:
             winner = alive[0]
             self.chips[winner] += self.pot
-            wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+            wallet = texas_chips
             for uid in self.players:
                 wallet[self.chat_id][uid] = self.chips[uid]
             save_data()
@@ -1051,7 +1051,7 @@ class PokerGame:
         names = {uid: HAND_NAME_CN.get(self.evaluator.class_to_string(self.evaluator.get_rank_class(score)), "未知") for uid, score in scores.items()}
         payouts = distribute_side_pots(self.total_bet, scores)
         for uid, item in payouts.items(): self.chips[uid] += item["amount"]
-        wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+        wallet = texas_chips
         for uid in self.players: wallet[self.chat_id][uid] = self.chips[uid]
         save_data(); return [(uid, names[uid], item["amount"], item["details"], names) for uid, item in payouts.items()]
 
@@ -1182,7 +1182,6 @@ async def settle_poker(game, app):
         for uid in game.players:
             net = game.chips[uid] - game.initial_chips[uid]
             if game.mode == "official":
-                profit_by_date[date][game.chat_id][uid] += net
                 poker_profit_by_date[date][game.chat_id][uid] += net
             lines.extend([f"{names[uid]}：投入 {game.total_bet[uid]}｜盈亏 {net:+d}", ""])
             
@@ -1199,7 +1198,7 @@ async def settle_poker(game, app):
     finally:
         if active_poker_games.get(game.chat_id) is game: active_poker_games.pop(game.chat_id, None)
         if game.mode == "official":
-            for uid in game.players: await emergency_if_needed(game.chat_id, uid, app, game)
+            for uid in game.players: await emergency_if_needed(game.chat_id, uid, app, texas_chips, game)
         save_data()
 
 
@@ -1232,7 +1231,7 @@ class HorseRace:
 
     def bet(self, uid, horse, amount):
         if self.phase != "betting" or self.cancelled: return False, "当前不是下注阶段"
-        wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+        wallet = game_chips
         if not 0 <= horse < HORSE_COUNT or amount <= 0 or amount > wallet[self.chat_id][uid]: return False, "马号、金额或筹码无效"
         wallet[self.chat_id][uid] -= amount; self.pool += amount; self.total_bets[horse] += amount
         self.bets[uid][horse] = self.bets[uid].get(horse, 0) + amount
@@ -1378,10 +1377,9 @@ class HorseRace:
                 for uid, bets in self.bets.items():
                     stake, payout = sum(bets.values()), int(bets.get(winner, 0) * odd)
                     net = payout - stake
-                    wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+                    wallet = game_chips
                     wallet[self.chat_id][uid] += payout; total_payout += payout
                     if self.mode == "official":
-                        profit_by_date[date][self.chat_id][uid] += net
                         race_profit_by_date[date][self.chat_id][uid] += net
                     name = self.name_cache.get(uid) or await get_name(app, uid)
                     self.name_cache[uid] = name
@@ -1401,15 +1399,15 @@ class HorseRace:
                     lines.append(f"{name}：投注 {stake}｜派彩 {payout}｜盈亏 {net:+d}｜赔率 {odd:.2f}x")
 
                 if self.mode == "official":
-                    day_rank = sorted(race_profit_by_date[date][self.chat_id].items(), key=lambda item: item[1], reverse=True)[:50]
-                    lines.extend(["", "🏆 <b>当日赛马累计盈利榜</b>", "━━━━━━━━━━━━━━━━━"])
+                    day_rank = sorted(total_profit_by_game(race_profit_by_date, self.chat_id).items(), key=lambda item: item[1], reverse=True)[:50]
+                    lines.extend(["", "🏆 <b>赛马累计盈利榜（总数）</b>", "━━━━━━━━━━━━━━━━━"])
                     for index, (uid, amount) in enumerate(day_rank, 1):
                         name = self.name_cache.get(uid) or await get_name(app, uid)
                         lines.append(f"{rank_marker(index)} {name}：{amount:+d}")
                 else:
                     lines.extend(["", "🎮 娱乐局：本局不计入正式盈亏榜。"])
                 
-                pending_horse_bets.pop(self.chat_id, None); pending_horse_bet_modes.pop(self.chat_id, None); self.phase = "finished"; save_data()
+                self.phase = "finished"; save_data()
                 # 清除退款记录
                 for uid in self.bets: pending_game_bets[self.chat_id].get(uid, {}).pop("horse", None)
                 delivered = await safe_send_long(app.bot, self.chat_id, "\n".join(lines), parse_mode="HTML")
@@ -1419,11 +1417,10 @@ class HorseRace:
             except Exception:
                 logger.exception("赛马结算异常，群 %s", self.chat_id)
                 await safe_send(app.bot, self.chat_id, "⚠️ 赛马结算异常，请管理员检查日志；本局将退款以保护玩家筹码。")
-                wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+                wallet = game_chips
                 for uid, bets in self.bets.items():
                     wallet[self.chat_id][uid] += sum(bets.values())
-                pending_horse_bets.pop(self.chat_id, None)
-                pending_horse_bet_modes.pop(self.chat_id, None)
+
                 if self.mode == "official": race_jackpot[self.chat_id] = self.jackpot
                 save_data()
             finally:
@@ -1436,7 +1433,7 @@ class HorseRace:
         async with self.lock:
             if self.cancelled: return
             self.cancelled, self.phase = True, "cancelled"
-            wallet = entertainment_chips if self.mode == "entertainment" else group_chips
+            wallet = game_chips
             for uid, bets in self.bets.items(): 
                 wallet[self.chat_id][uid] += sum(bets.values())
                 pending_game_bets[self.chat_id].get(uid, {}).pop("horse", None)
@@ -1640,7 +1637,7 @@ async def update_blackjack_ui(game, app):
             InlineKeyboardButton("✋ 停牌 (Stand)", callback_data=f"bj_stand_{curr_uid}")
         ]]
         
-        wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+        wallet = game_chips
         if len(game.hands[curr_uid]) == 2 and wallet[game.chat_id][curr_uid] >= game.bets[curr_uid]:
             kb_rows.append([InlineKeyboardButton("💰 双倍 (Double Down)", callback_data=f"bj_double_{curr_uid}")])
         
@@ -1659,7 +1656,7 @@ async def update_blackjack_ui(game, app):
             d_score = game.get_score(game.dealer_hand)
             text = f"🃏 <b>21点 结算</b>\n━━━━━━━━━━━━━━━━━\n🏛 <b>庄家</b>：{game.get_card_str(game.dealer_hand)} ({d_score})\n\n"
             date = business_date()
-            wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+            wallet = game_chips
             
             lines = []
             # 预先获取所有名字，提高 HTML 生成速度
@@ -1685,7 +1682,6 @@ async def update_blackjack_ui(game, app):
                 net = payout - bet
                 wallet[game.chat_id][uid] += payout
                 if game.mode == "official":
-                    profit_by_date[date][game.chat_id][uid] += net
                     blackjack_profit_by_date[date][game.chat_id][uid] += net
                 hand_text = game.get_card_str(game.hands[uid])
                 lines.append(f"👤 <b>玩家</b>：{player_names[uid]} | {hand_text} ({p_score})\n<b>结果</b>：{result_str} | 盈亏 {net:+d}")
@@ -1702,8 +1698,8 @@ async def update_blackjack_ui(game, app):
             if game.mode == "entertainment": text += "\n\n🎮 娱乐局，筹码不计入正式榜单。"
             
             if game.mode == "official":
-                bj_rank = sorted(blackjack_profit_by_date[date][game.chat_id].items(), key=lambda item: item[1], reverse=True)[:30]
-                text += "\n\n🏆 <b>当日 21点 累计盈利榜</b>\n"
+                bj_rank = sorted(total_profit_by_game(blackjack_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
+                text += "\n\n🏆 <b>21点 累计盈利榜（总数）</b>\n"
                 rank_lines = []
                 for i, (u, a) in enumerate(bj_rank, 1):
                     name = game.name_cache.get(u) or await get_name(app, u)
@@ -1801,20 +1797,19 @@ async def settle_baccarat(game, app):
     text += f"<b>结果</b>：{res_map[result]}\n━━━━━━━━━━━━━━━━━\n"
     
     date = business_date()
-    wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+    wallet = game_chips
     lines = []
     
     for uid, bets in game.bets.items():
         win_amount = 0
         total_bet = sum(bets.values())
         if result == "player": win_amount = bets["player"] * 2
-        elif result == "banker": win_amount = int(bets["banker"] * 1.95)
+        elif result == "banker":                     win_amount = round(bets["banker"] * 1.95)
         elif result == "tie": win_amount = bets["tie"] * 9
         
         net = win_amount - total_bet
         wallet[game.chat_id][uid] += win_amount
         if game.mode == "official":
-            profit_by_date[date][game.chat_id][uid] += net
             baccarat_profit_by_date[date][game.chat_id][uid] += net
         if net != 0:
             lines.append(f"👤 <b>玩家</b>：{await get_name(app, uid)}\n<b>盈亏</b>：{net:+d}")
@@ -1825,8 +1820,8 @@ async def settle_baccarat(game, app):
     
     # 增加当日百家乐盈利榜
     if game.mode == "official":
-        bjl_rank = sorted(baccarat_profit_by_date[date][game.chat_id].items(), key=lambda item: item[1], reverse=True)[:30]
-        text += "\n\n🏆 <b>当日 百家乐 累计盈利榜</b>\n"
+        bjl_rank = sorted(total_profit_by_game(baccarat_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
+        text += "\n\n🏆 <b>百家乐 累计盈利榜（总数）</b>\n"
         text += "\n".join([f"{rank_marker(i)} {await get_name(app, u)}：{a:+d}" for i, (u, a) in enumerate(bjl_rank, 1)])
 
     # 核心：删除旧消息，发送新结算消息
@@ -1881,7 +1876,7 @@ def get_slot_result():
 
 async def cmd_lhj(update, context):
     if not await need_auth(update): return
-    cid, uid = update.effective_chat.id, update.effective_user.id
+    uid = update.effective_user.id
     
     # 彻底并发：不再限制忙碌状态
     # if player_is_busy(cid, uid): ...
@@ -1905,7 +1900,7 @@ async def cmd_lhj(update, context):
 async def run_slot_spins(context, cid, uid, count, answer=None):
     """老虎机连抽核心：扣款、开奖、一条消息结算。answer 用于按钮回调提示。"""
     mode = current_game_mode()
-    wallet = entertainment_chips if mode == "entertainment" else group_chips
+    wallet = game_chips
     now = time.time()
     if now - user_cooldowns[uid] < SLOT_COOLDOWN:
         if answer: await answer("🕒 冷却中，稍等几秒再抽", show_alert=True)
@@ -1932,7 +1927,6 @@ async def run_slot_spins(context, cid, uid, count, answer=None):
             for _, m in results:
                 net = SLOT_BET * m - SLOT_BET
                 slot_profit_by_date[date][cid][uid] += net
-                profit_by_date[date][cid][uid] += net
         
         # 结果消息
         if count == 1:
@@ -1951,8 +1945,8 @@ async def run_slot_spins(context, cid, uid, count, answer=None):
         
         # 榜单
         if mode == "official":
-            s_rank = sorted(slot_profit_by_date[date][cid].items(), key=lambda item: item[1], reverse=True)[:10]
-            result_text += "\n\n🏆 <b>当日老虎机累计盈利榜</b>\n"
+            s_rank = sorted(total_profit_by_game(slot_profit_by_date, cid).items(), key=lambda item: item[1], reverse=True)[:10]
+            result_text += "\n\n🏆 <b>老虎机累计盈利榜（总数）</b>\n"
             result_text += "\n".join([f"{rank_marker(i)} {await get_name(context.application, u)}：{a:+d}" for i, (u, a) in enumerate(s_rank, 1)])
         
         await safe_send(context.bot, cid, result_text, parse_mode="HTML")
@@ -1982,9 +1976,9 @@ async def cmd_dz(update, context):
     if not await need_auth(update): return
     cid, uid = update.effective_chat.id, update.effective_user.id; game = active_poker_games.get(cid)
     mode = game.mode if game and game.phase == "waiting" else current_game_mode()
-    wallet = entertainment_chips if mode == "entertainment" else group_chips
+    wallet = texas_chips
     if wallet[cid][uid] < MIN_ENTRY_CHIPS:
-        label = "娱乐筹码" if mode == "entertainment" else "筹码"
+        label = "筹码"
         await update.message.reply_text(f"❌ 进入德州至少需要 {MIN_ENTRY_CHIPS} {label}。"); return
     if game:
         if game.phase != "waiting": await update.message.reply_text("当前已有进行中的德州扑克。"); return
@@ -2012,7 +2006,7 @@ async def cmd_sm(update, context):
 async def refund_poker(game, app, notice):
     """终止未结算牌局时，按开局筹码退还全部 ante、盲注和后续下注。"""
     game.cancel_timer(); game.cancel_auto(); game.cancel_wait()
-    wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+    wallet = texas_chips
     for player_id in game.players:
         # 德州下注只在局对象中暂扣；显式恢复开局余额，避免后续改动破坏退款语义。
         wallet[game.chat_id][player_id] = game.initial_chips.get(player_id, wallet[game.chat_id][player_id])
@@ -2063,7 +2057,7 @@ async def cmd_end(update, context):
 
     if bj and (target_all or arg in ["21", "bj", "21点"]):
         if uid == ADMIN_USER_ID or uid in bj.players:
-            wallet = entertainment_chips if bj.mode == "entertainment" else group_chips
+            wallet = game_chips
             for p_uid, b in bj.bets.items():
                 wallet[cid][p_uid] += b
                 pending_game_bets[cid].get(p_uid, {}).pop("21", None)
@@ -2074,7 +2068,7 @@ async def cmd_end(update, context):
     if bjl: # 百家乐特殊判断，因为 arg 可能对应 bjl
         if target_all or arg in ["bjl", "baccarat", "百家乐"]:
             if uid == ADMIN_USER_ID or uid in bjl.bets.keys():
-                wallet = entertainment_chips if bjl.mode == "entertainment" else group_chips
+                wallet = game_chips
                 for p_uid, b_dict in bjl.bets.items():
                     for amount in b_dict.values(): wallet[cid][p_uid] += amount
                     pending_game_bets[cid].get(p_uid, {}).pop("baccarat", None)
@@ -2129,11 +2123,12 @@ async def cmd_add(update, context):
     cid = update.effective_chat.id
     if player_is_busy(cid, uid):
         await update.message.reply_text("该玩家正在游戏中，无法修改筹码。"); return
-    group_chips[cid][uid] += amount; save_data()
+    game_chips[cid][uid] += amount; save_data()
     await update.message.reply_text(f"✅ 已增加 {await get_name(context.application, uid)} {amount} 筹码。")
 
 
-async def cmd_addyl(update, context):
+
+async def cmd_adddz(update, context):
     if not is_bot_admin(update.effective_user.id):
         await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
     if not await need_auth(update): return
@@ -2141,12 +2136,12 @@ async def cmd_addyl(update, context):
         uid, amount = await _parse_target_amount(update, context)
         if amount <= 0: raise ValueError
     except (ValueError, IndexError):
-        await update.message.reply_text("用法：/addyl 用户ID 数量，或回复玩家消息后使用 /addyl 数量"); return
+        await update.message.reply_text("用法：/adddz 用户ID 数量，或回复玩家消息后使用 /adddz 数量"); return
     cid = update.effective_chat.id
     if player_is_busy(cid, uid):
         await update.message.reply_text("该玩家正在游戏中，无法修改筹码。"); return
-    entertainment_chips[cid][uid] += amount; save_data()
-    await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)} 添加 {amount} 娱乐筹码，当前 {entertainment_chips[cid][uid]}。")
+    texas_chips[cid][uid] += amount; save_data()
+    await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)} 添加 {amount} 德州筹码，当前 {texas_chips[cid][uid]}。")
 
 
 async def cmd_reduce(update, context):
@@ -2161,30 +2156,46 @@ async def cmd_reduce(update, context):
     cid = update.effective_chat.id
     if player_is_busy(cid, uid):
         await update.message.reply_text("该玩家正在游戏中，无法修改筹码。"); return
-    if group_chips[cid][uid] < amount:
+    if game_chips[cid][uid] < amount:
         await update.message.reply_text("❌ 玩家筹码不足。"); return
-    group_chips[cid][uid] -= amount; save_data()
+    game_chips[cid][uid] -= amount; save_data()
     await update.message.reply_text(f"✅ 已扣除 {await get_name(context.application, uid)} {amount} 筹码。")
 
 
 async def cmd_cx(update, context):
     if not await need_auth(update): return
-    cid, data = update.effective_chat.id, profit_by_date[business_date()].get(update.effective_chat.id, {})
-    if not data: await update.message.reply_text("当前业务日暂无盈亏记录。"); return
-    lines = ["📊 当日综合盈亏榜", "━"*14]
-    for i, (uid, value) in enumerate(sorted(data.items(), key=lambda x:x[1], reverse=True)[:50], 1): lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value:+d}")
+    cid = update.effective_chat.id
+    date = business_date()
+    texas = poker_profit_by_date[date].get(cid, {})
+    combined = {}
+    for g in (blackjack_profit_by_date, race_profit_by_date, baccarat_profit_by_date, slot_profit_by_date):
+        for uid, v in total_profit_by_game(g, cid).items():
+            combined[uid] = combined.get(uid, 0) + v
+    if not texas and not combined:
+        await update.message.reply_text("当前业务日暂无盈亏记录。"); return
+    lines = ["🃏 德州当日盈亏", "━"*14]
+    if texas:
+        for i, (uid, value) in enumerate(sorted(texas.items(), key=lambda x:x[1], reverse=True)[:50], 1):
+            lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value:+d}")
+    else:
+        lines.append("暂无记录")
+    lines.extend(["", "🎮 通用游戏累计盈亏", "━"*14])
+    if combined:
+        for i, (uid, value) in enumerate(sorted(combined.items(), key=lambda x:x[1], reverse=True)[:50], 1):
+            lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value:+d}")
+    else:
+        lines.append("暂无记录")
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
 async def cmd_ph(update, context):
     if not await need_auth(update): return
     cid = update.effective_chat.id
-    lines = ["💰 当前筹码榜", "━"*14]
-    for i, (uid, value) in enumerate(sorted(group_chips[cid].items(), key=lambda x:x[1], reverse=True)[:50], 1):
-        lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value}（正式）")
-    if is_entertainment_time():
-        lines.extend(["", "🎮 娱乐筹码（23:00-00:00）", "━"*14])
-        for i, (uid, value) in enumerate(sorted(entertainment_chips[cid].items(), key=lambda x:x[1], reverse=True)[:50], 1):
-            lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value}（娱乐）")
+    lines = ["💰 德州筹码榜", "━"*14]
+    for i, (uid, value) in enumerate(sorted(texas_chips[cid].items(), key=lambda x:x[1], reverse=True)[:50], 1):
+        lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value}")
+    lines.extend(["", "🎮 通用筹码榜", "━"*14])
+    for i, (uid, value) in enumerate(sorted(game_chips[cid].items(), key=lambda x:x[1], reverse=True)[:50], 1):
+        lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value}")
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
 async def cmd_sq(update, context):
@@ -2221,7 +2232,7 @@ async def on_button(update, context):
             if not game: await q.answer("游戏已结束", show_alert=True); return
             if data.startswith("bj_join_"):
                 bet = int(data.split("_")[2])
-                wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+                wallet = game_chips
                 if wallet[cid][uid] < bet: await q.answer("筹码不足", show_alert=True); return
                 if game.add_player(uid, bet):
                     wallet[cid][uid] -= bet
@@ -2251,7 +2262,7 @@ async def on_button(update, context):
                 if uid not in game.players:
                     await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
                 if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
-                wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+                wallet = game_chips
                 if wallet[cid][uid] < game.bets[uid]: await q.answer("筹码不足，无法双倍", show_alert=True); return
                 
                 wallet[cid][uid] -= game.bets[uid]
@@ -2264,7 +2275,7 @@ async def on_button(update, context):
             elif data == "bj_end":
                 if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
                 # 退还本局下注
-                wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+                wallet = game_chips
                 for p_uid, bet in game.bets.items():
                     wallet[cid][p_uid] += bet
                     pending_game_bets[cid].get(p_uid, {}).pop("21", None)
@@ -2279,7 +2290,7 @@ async def on_button(update, context):
             if data.startswith("bjl_bet_"):
                 side = data.split("_")[2]
                 bet_amount = BACCARAT_FIXED_BET # 引用全局配置
-                wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+                wallet = game_chips
                 if wallet[cid][uid] < bet_amount: await q.answer("筹码不足", show_alert=True); return
                 wallet[cid][uid] -= bet_amount
                 game.place_bet(uid, side, bet_amount)
@@ -2298,7 +2309,7 @@ async def on_button(update, context):
             elif data == "bjl_end":
                 if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
                 # 退还本局下注
-                wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+                wallet = game_chips
                 for p_uid, b_dict in game.bets.items():
                     for amount in b_dict.values(): wallet[cid][p_uid] += amount
                     pending_game_bets[cid].get(p_uid, {}).pop("baccarat", None)
@@ -2372,9 +2383,9 @@ async def on_button(update, context):
                 await q.answer("本局已终止")
                 return
             if game.phase == "waiting":
-                wallet = entertainment_chips if game.mode == "entertainment" else group_chips
+                wallet = texas_chips
                 if data == "texas_join" and wallet[cid][uid] < MIN_ENTRY_CHIPS:
-                    label = "娱乐筹码" if game.mode == "entertainment" else "筹码"
+                    label = "筹码"
                     await q.answer(f"进入德州至少需要 {MIN_ENTRY_CHIPS} {label}", show_alert=True)
                 elif data == "texas_join" and game.add(uid):
                     await q.answer("已加入"); await update_poker_waiting(game, context.application)
@@ -2517,7 +2528,7 @@ async def on_text(update, context):
             side_map = {"庄": "banker", "闲": "player", "和": "tie"}
             side_cn = bjl_match.group(1); side = side_map[side_cn]
             amount = int(bjl_match.group(2))
-            wallet = entertainment_chips if baccarat.mode == "entertainment" else group_chips
+            wallet = game_chips
             if wallet[cid][user.id] < amount:
                 await message.reply_text(f"❌ 筹码不足，你只有 {wallet[cid][user.id]}。"); return
             if amount > 50000:
@@ -2537,7 +2548,7 @@ async def on_text(update, context):
             amount = int(bj_match.group(1))
             if amount < BJ_MIN_BET:
                 await message.reply_text(f"❌ 21点最低下注 {BJ_MIN_BET} 积分。"); return
-            wallet = entertainment_chips if blackjack.mode == "entertainment" else group_chips
+            wallet = game_chips
             if wallet[cid][user.id] < amount:
                 await message.reply_text(f"❌ 筹码不足，你只有 {wallet[cid][user.id]}。"); return
             if blackjack.add_player(user.id, amount):
@@ -2562,8 +2573,9 @@ async def on_text(update, context):
         gomoku = active_gomoku_games.get(cid)
         match = re.fullmatch(r"(?:落子\s+)?(?:(\d{1,2})\s*(?:[,，]\s*|\s+)(\d{1,2})|(\d)(\d))", text)
         if match and gomoku:
-            r = int(match.group(1)) if match.group(1) is not None else int(match.group(3))
-            c = int(match.group(2)) if match.group(2) is not None else int(match.group(4))
+            # 文字输入为 1 基坐标，转为 0 基（与按钮一致）
+            r = (int(match.group(1)) if match.group(1) is not None else int(match.group(3))) - 1
+            c = (int(match.group(2)) if match.group(2) is not None else int(match.group(4))) - 1
             ok, result = gomoku.place(user.id, r, c)
             if not ok: await message.reply_text(f"❌ {result}"); return
             names = {player: await get_name(context.application, player) for player in gomoku.players}
@@ -2597,24 +2609,8 @@ async def daily_reset_scheduler(app):
         now = now_bj(); target = (now + timedelta(days=1)).replace(hour=0, minute=0, second=1, microsecond=0)
         await asyncio.sleep((target-now).total_seconds())
         today = now_bj().strftime("%Y-%m-%d")
-        # 午夜清理专项榜单数据
+        # 午夜仅清理德州榜单（德州当日榜）；其他游戏榜单不清空，累计为总数
         poker_profit_by_date.clear()
-        race_profit_by_date.clear()
-        blackjack_profit_by_date.clear()
-        baccarat_profit_by_date.clear()
-        slot_profit_by_date.clear()
-        # 午夜先取消娱乐局并退款，避免娱乐局跨日结算后写回娱乐钱包。
-
-        for poker in list(active_poker_games.values()):
-            if poker.mode == "entertainment":
-                await refund_poker(poker, app, "🕛 娱乐时段结束，本局娱乐筹码已退回。")
-        for race in list(active_horse_races.values()):
-            if race.mode == "entertainment":
-                if race.task and not race.task.done():
-                    race.task.cancel()
-                    await asyncio.gather(race.task, return_exceptions=True)
-                await race.refund(app, "🕛 娱乐时段结束，本局娱乐筹码已退回。")
-        entertainment_chips.clear()
         # 不重置正在进行正式德州或赛马中的玩家，避免跨日覆盖未结算状态。
         protected = set()
         for poker in active_poker_games.values():
@@ -2629,7 +2625,7 @@ async def daily_reset_scheduler(app):
         for bjl in active_baccarat_games.values():
             if bjl.phase == "betting":
                 protected.update((bjl.chat_id, uid) for uid in bjl.bets)
-        for chat_id, users in group_chips.items():
+        for chat_id, users in texas_chips.items():
             for uid in users:
                 if (chat_id, uid) not in protected:
                     users[uid] = STARTING_CHIPS
@@ -2642,13 +2638,11 @@ async def leaderboard_scheduler(app):
         now = now_bj(); target = now.replace(hour=23, minute=0, second=0, microsecond=0)
         if target <= now: target += timedelta(days=1)
         await asyncio.sleep((target-now).total_seconds())
-        date = now_bj().strftime("%Y-%m-%d"); snapshot = profit_by_date.pop(date, {})
-        poker_profit_by_date.pop(date, None); race_profit_by_date.pop(date, None)
-        blackjack_profit_by_date.pop(date, None); baccarat_profit_by_date.pop(date, None)
-        slot_profit_by_date.pop(date, None)
-        for cid, data in snapshot.items():
+        # 只推送并清空德州当日榜；其他游戏榜保留累计（总数）
+        date = now_bj().strftime("%Y-%m-%d"); texas_snapshot = poker_profit_by_date.pop(date, {})
+        for cid, data in texas_snapshot.items():
             if not data: continue
-            lines = [f"🏆 今日综合排行榜（{date}）", "━"*14]
+            lines = [f"🏆 德州当日排行榜（{date}）", "━"*14]
             for i, (uid, amount) in enumerate(sorted(data.items(), key=lambda x:x[1], reverse=True)[:10], 1): lines.append(f"{rank_marker(i)} {await get_name(app, uid)}：{amount:+d}")
             await safe_send_long(app.bot, cid, "\n".join(lines))
         save_data()
@@ -2696,7 +2690,7 @@ def main():
         builder = builder.max_concurrent_updates(8)  # 新版 PTB：并发上限 8
     app = builder.build()  # 旧版 PTB：concurrent_updates(True) 默认上限 4
 
-    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("sl",cmd_sl),("lhj",cmd_lhj),("21",cmd_21),("bjl",cmd_bjl),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("addyl",cmd_addyl),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
+    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("sl",cmd_sl),("lhj",cmd_lhj),("21",cmd_21),("bjl",cmd_bjl),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("adddz",cmd_adddz),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(on_button)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
