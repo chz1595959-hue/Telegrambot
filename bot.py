@@ -35,8 +35,9 @@ AUTO_START_TIMEOUT = 30    # 21点/百家乐自动开牌/解散时间
 ROOM_WAIT_TIMEOUT = 60     # 各游戏等待房统一倒计时（60秒）
 RACE_AUTO_START = 120      # 赛马自动开赛时间
 RACE_ANIMATION_INTERVAL = 1.5
-SLOT_COOLDOWN = 3          # 老虎机冷却
+SLOT_COOLDOWN = 5          # 老虎机冷却
 SLOT_SPIN_SEM = asyncio.Semaphore(2)  # 老虎机全局并发上限（防限流雪崩）
+lhj_cmd_spam = defaultdict(float)  # 老虎机命令防刷：与抽奖冷却同步（统一 5 秒窗口）
 
 # 游戏金额配置
 SLOT_BET = 500             # 老虎机单次金额
@@ -1863,7 +1864,7 @@ async def cmd_bjl(update, context):
     await start_baccarat_timer(game, context.application)
 SLOT_SYMBOLS = ["🍒", "🍋", "🍊", "🍇", "🔔", "💎", "7️⃣"]
 SLOT_BET = 500  # 单次抽奖金额
-SLOT_COOLDOWN = 3 # 冷却时间（秒）
+SLOT_COOLDOWN = 5 # 冷却时间（秒）
 
 
 def get_slot_result():
@@ -1885,15 +1886,16 @@ async def cmd_lhj(update, context):
     # 彻底并发：不再限制忙碌状态
     # if player_is_busy(cid, uid): ...
 
-    # 检查冷却时间
+    # 冷却检查：命令防刷与抽奖冷却同步（统一 5 秒窗口），静默忽略
     now = time.time()
-    if now - user_cooldowns[uid] < SLOT_COOLDOWN:
-        return  # 冷却中静默忽略，防止疯狂 /lhj 刷屏导致 Telegram 限流
+    if now - lhj_cmd_spam[uid] < SLOT_COOLDOWN or now - user_cooldowns[uid] < SLOT_COOLDOWN:
+        return
+    lhj_cmd_spam[uid] = now
     
     # 弹出选择界面：1次 / 5次 / 10次 / 20次
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🎯 1 次", callback_data="lhj_spin_1"), InlineKeyboardButton("🎯 5 次", callback_data="lhj_spin_5")],
-        [InlineKeyboardButton("🎯 10 次", callback_data="lhj_spin_10"), InlineKeyboardButton("🎯 20 次", callback_data="lhj_spin_20")],
+        [InlineKeyboardButton("🎯 1 次", callback_data="lhj_spin_1"), InlineKeyboardButton("🎮 5 次", callback_data="lhj_spin_5")],
+        [InlineKeyboardButton("⚡ 10 次", callback_data="lhj_spin_10"), InlineKeyboardButton("💥 20 次", callback_data="lhj_spin_20")],
     ])
     await update.message.reply_text(
         f"🎰 <b>老虎机</b>（单次 {SLOT_BET} 筹码）\n\n请选择转动次数：\n💡 5次={SLOT_BET*5}｜10次={SLOT_BET*10}｜20次={SLOT_BET*20}",
@@ -2235,7 +2237,7 @@ async def on_button(update, context):
                 if uid not in game.players:
                     await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
                 if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
-                card = game.hit(uid); await q.answer(f"你抽到了 {card}")
+                card = game.hit(uid); await q.answer(f"你抽到了 {game.get_card_str([card])}")
                 if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
                 else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
             elif data.startswith("bj_stand_"):
@@ -2311,7 +2313,10 @@ async def on_button(update, context):
                 await q.answer("无效操作", show_alert=True); return
             if count not in (1, 5, 10, 20):
                 await q.answer("无效操作", show_alert=True); return
-            await run_slot_spins(context, cid, uid, count, answer=q.answer)
+            ok = await run_slot_spins(context, cid, uid, count, answer=q.answer)
+            if ok and q.message:
+                # 抽奖成功后删除选择界面，群聊更干净；冷却/筹码不足时保留以便重试
+                await safe_delete(context.bot, cid, q.message.message_id)
             return
 
         if data == "gomoku_join":
@@ -2686,7 +2691,10 @@ def main():
     # 在主循环启动前初始化 Event
     save_event = asyncio.Event()
     
-    app = Application.builder().token(token).concurrent_updates(True).max_concurrent_updates(8).post_init(post_init).post_shutdown(post_shutdown).build()
+    builder = Application.builder().token(token).concurrent_updates(True).post_init(post_init).post_shutdown(post_shutdown)
+    if hasattr(builder, "max_concurrent_updates"):
+        builder = builder.max_concurrent_updates(8)  # 新版 PTB：并发上限 8
+    app = builder.build()  # 旧版 PTB：concurrent_updates(True) 默认上限 4
 
     for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("sl",cmd_sl),("lhj",cmd_lhj),("21",cmd_21),("bjl",cmd_bjl),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("addyl",cmd_addyl),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(on_button)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
