@@ -2652,6 +2652,81 @@ async def hourly_race_scheduler(app):
         next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
         await asyncio.sleep(max(1, (next_minute-now).total_seconds()))
 
+
+# ---------- 数据备份/恢复 ----------
+async def cmd_backup(update, context):
+    """管理员备份：把数据文件发送到管理员私聊。"""
+    uid = update.effective_user.id
+    if not is_bot_admin(uid):
+        await update.message.reply_text("⛔ 仅管理员可用")
+        return
+    # 强制写盘，确保文件是最新的
+    ok = await asyncio.to_thread(force_save_now)
+    if not ok:
+        await update.message.reply_text("⚠️ 写盘失败，请稍后再试")
+        return
+    if not os.path.exists(DATA_FILE):
+        await update.message.reply_text("⚠️ 数据文件不存在")
+        return
+    try:
+        with open(DATA_FILE, "rb") as f:
+            await context.bot.send_document(
+                chat_id=uid,
+                document=f,
+                filename=f"bot_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                caption="📦 数据备份完成",
+            )
+        # 在群里发的命令时，提示一下文件已发到私聊
+        if update.effective_chat.id != uid:
+            await update.message.reply_text("✅ 备份文件已发送到你的私聊")
+    except Exception:
+        logger.exception("备份失败")
+        await update.message.reply_text("⚠️ 备份失败，请先私聊我发 /start 后再试")
+
+
+async def cmd_restore(update, context):
+    """管理员恢复：回复一个 JSON 备份文件来恢复数据，恢复后自动重启。"""
+    global data_dirty
+    uid = update.effective_user.id
+    if not is_bot_admin(uid):
+        await update.message.reply_text("⛔ 仅管理员可用")
+        return
+    replied = update.message.reply_to_message
+    if not replied or not replied.document:
+        await update.message.reply_text("⚠️ 请回复一个 JSON 备份文件，再发送 /restore\n\n用法：点开备份文件 → 回复 → 发送 /restore")
+        return
+    tmp_path = f"{DATA_FILE}.restore_tmp"
+    try:
+        # 下载并验证备份文件
+        tg_file = await context.bot.get_file(replied.document.file_id)
+        await tg_file.download_to_drive(tmp_path)
+        with open(tmp_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("备份文件格式错误：不是字典")
+        # 验证通过：先阻止后台保存线程用旧数据覆盖新文件
+        data_dirty = False
+        if save_event is not None:
+            save_event.clear()
+        # 把当前数据另存一份，再写入新数据
+        if os.path.exists(DATA_FILE):
+            shutil.copy2(DATA_FILE, f"{DATA_FILE}.restore_bak")
+        os.replace(tmp_path, DATA_FILE)
+        await update.message.reply_text("✅ 数据恢复成功，正在重启加载新数据…")
+        logger.warning("管理员 %s 执行了数据恢复，进程即将退出重启", uid)
+        # 强制退出（不走 post_shutdown，避免内存旧数据覆盖）；Railway 会自动重启容器
+        os._exit(1)
+    except json.JSONDecodeError:
+        await update.message.reply_text("⚠️ 文件不是有效的 JSON 格式，恢复已取消")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception as e:
+        logger.exception("恢复失败")
+        await update.message.reply_text(f"⚠️ 恢复失败：{e}")
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+
 async def post_init(app):
     background_tasks.update({
         asyncio.create_task(daily_reset_scheduler(app)), 
@@ -2678,7 +2753,7 @@ def main():
         builder = builder.max_concurrent_updates(8)  # 新版 PTB：并发上限 8
     app = builder.build()  # 旧版 PTB：concurrent_updates(True) 默认上限 4
 
-    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("sl",cmd_sl),("lhj",cmd_lhj),("21",cmd_21),("bjl",cmd_bjl),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("adddz",cmd_adddz),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
+    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("sl",cmd_sl),("lhj",cmd_lhj),("21",cmd_21),("bjl",cmd_bjl),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("adddz",cmd_adddz),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm),("backup",cmd_backup),("restore",cmd_restore)]: app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(on_button)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
