@@ -36,9 +36,10 @@ ROOM_WAIT_TIMEOUT = 60     # 各游戏等待房统一倒计时（60秒）
 RACE_AUTO_START = 120      # 赛马自动开赛时间
 RACE_ANIMATION_INTERVAL = 1.5
 SLOT_COOLDOWN = 3          # 老虎机冷却
+SLOT_SPIN_SEM = asyncio.Semaphore(2)  # 老虎机全局并发上限（防限流雪崩）
 
 # 游戏金额配置
-SLOT_BET = 300             # 老虎机单次金额
+SLOT_BET = 500             # 老虎机单次金额
 BJ_MIN_BET = 100           # 21点最低打字下注
 BACCARAT_FIXED_BET = 500   # 百家乐按钮单次下注
 FIXED_MIN_RAISE = 100      # 德州最低加注额
@@ -263,7 +264,7 @@ async def safe_send(bot, cid, text, **kwargs):
     for attempt in range(2):
         try: return await bot.send_message(chat_id=cid, text=text, **kwargs)
         except RetryAfter as exc:
-            if attempt == 0: await asyncio.sleep(exc.retry_after); continue
+            if attempt == 0: await asyncio.sleep(min(exc.retry_after, 5)); continue
         except TelegramError:
             logger.exception("发送消息失败: %s", cid); break
     return None
@@ -301,7 +302,7 @@ async def safe_edit(bot, cid, msg_id, text, **kwargs):
     except BadRequest as exc:
         if "Message is not modified" not in str(exc): logger.warning("编辑消息失败: %s", exc)
     except RetryAfter as exc:
-        await asyncio.sleep(exc.retry_after)
+        await asyncio.sleep(min(exc.retry_after, 5))
         return await safe_edit(bot, cid, msg_id, text, **kwargs)
     except TelegramError: logger.exception("编辑消息失败")
     return None
@@ -319,7 +320,7 @@ async def safe_edit_photo(bot, cid, msg_id, photo, caption, **kwargs):
     except BadRequest as exc:
         logger.warning("编辑五子棋图片失败: %s", exc)
     except RetryAfter as exc:
-        await asyncio.sleep(exc.retry_after)
+        await asyncio.sleep(min(exc.retry_after, 5))
         return await safe_edit_photo(bot, cid, msg_id, photo, caption, **kwargs)
     except TelegramError:
         logger.exception("编辑五子棋图片失败")
@@ -330,7 +331,7 @@ async def safe_send_photo(bot, cid, photo, caption, **kwargs):
     for attempt in range(2):
         try: return await bot.send_photo(chat_id=cid, photo=photo, caption=caption, **kwargs)
         except RetryAfter as exc:
-            if attempt == 0: await asyncio.sleep(exc.retry_after); continue
+            if attempt == 0: await asyncio.sleep(min(exc.retry_after, 5)); continue
         except TelegramError:
             logger.exception("发送图片失败: %s", cid); break
     return None
@@ -536,7 +537,7 @@ class GomokuGame:
     def buttons(self, selecting_row=None):
         if self.phase == "waiting":
             return InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ 加入五子棋", callback_data="gomoku_join")],
+                [InlineKeyboardButton("📥 加入五子棋", callback_data="gomoku_join")],
                 [InlineKeyboardButton("❌ 终止本局", callback_data="gomoku_end")],
             ])
         if self.phase != "playing":
@@ -654,7 +655,7 @@ class MinesweeperGame:
     def buttons(self):
         if self.phase == "waiting":
             return InlineKeyboardMarkup([
-                [InlineKeyboardButton("➕ 加入游戏", callback_data="mine_join")],
+                [InlineKeyboardButton("📥 加入游戏", callback_data="mine_join")],
                 [InlineKeyboardButton("🎮 开始游戏", callback_data="mine_start")],
                 [InlineKeyboardButton("❌ 终止", callback_data="mine_end")]
             ])
@@ -1073,7 +1074,7 @@ async def poker_waiting_text(game, app):
 
 
 async def update_poker_waiting(game, app):
-    rows = [[InlineKeyboardButton("➕ 加入游戏", callback_data="texas_join")]]
+    rows = [[InlineKeyboardButton("📥 加入游戏", callback_data="texas_join")]]
     if len(game.players) >= 2: rows.append([InlineKeyboardButton("🎮 开始游戏", callback_data="texas_start")])
     rows.append([InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")])
     await safe_edit(app.bot, game.chat_id, game.game_msg_id, await poker_waiting_text(game, app), reply_markup=InlineKeyboardMarkup(rows))
@@ -1103,7 +1104,7 @@ async def poker_table_text(game, app):
 
 
 def poker_buttons(game, uid):
-    rows = [[InlineKeyboardButton("🂠 查看手牌", callback_data="texas_hand")]]
+    rows = [[InlineKeyboardButton("🃏 查看手牌", callback_data="texas_hand")]]
     if uid != game.current() or uid in game.folded or uid in game.all_in: return InlineKeyboardMarkup(rows)
     to_call = max(0, game.current_bet - game.round_bets[uid])
     rows.append([InlineKeyboardButton("❌ 弃牌", callback_data="texas_fold"), InlineKeyboardButton("✅ 过牌" if not to_call else f"✅ 跟注 {to_call}", callback_data="texas_check" if not to_call else "texas_call")])
@@ -1114,8 +1115,8 @@ def poker_buttons(game, uid):
 
 
 async def update_poker_table(game, app):
-    # 开局后主消息转为静态提示，动态牌桌由行动消息携带（牌桌+提示+按钮一条消息）
-    await safe_edit(app.bot, game.chat_id, game.game_msg_id, "🃏 游戏开始！请点击下方行动消息的按钮操作。", reply_markup=None)
+    # 不再推送/编辑"游戏开始"提示：牌桌由行动消息携带，减少每回合一次无效 API 调用
+    pass
 
 
 async def start_turn_timer(game, app):
@@ -1602,10 +1603,14 @@ async def update_blackjack_ui(game, app):
         for uid in game.players:
             text += f"- {await get_name(app, uid)} (下注: {game.bets[uid]})\n"
         text += "\n⏰ 有人加入后 60 秒自动开局，无人加入自动解散。\n"
-        kb = [[InlineKeyboardButton("➕ 加入 (下注500)", callback_data="bj_join_500"), InlineKeyboardButton("➕ 加入 (下注1000)", callback_data="bj_join_1000")]]
+        kb = [[InlineKeyboardButton("📥 加入 (下注500)", callback_data="bj_join_500"), InlineKeyboardButton("📥 加入 (下注1000)", callback_data="bj_join_1000")]]
         if game.players: kb.append([InlineKeyboardButton("🎮 开始游戏", callback_data="bj_start")])
         kb.append([InlineKeyboardButton("❌ 终止", callback_data="bj_end")])
-        await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        if game.game_msg_id:
+            await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        else:
+            msg = await safe_send(app.bot, game.chat_id, text, reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+            if msg: game.game_msg_id = msg.message_id
     elif game.phase == "playing":
         curr_uid = game.players[game.current_player_idx]
         text = f"🃏 <b>21点 进行中</b>\n\n🏛 <b>庄家</b>：{game.get_card_str(game.dealer_hand, True)}\n\n"
@@ -1772,7 +1777,11 @@ async def update_baccarat_ui(game, app):
             [InlineKeyboardButton("🟢 押和 (1:8)", callback_data="bjl_bet_tie")],
             [InlineKeyboardButton("🎮 立即开牌", callback_data="bjl_start"), InlineKeyboardButton("❌ 终止", callback_data="bjl_end")]
         ]
-        await safe_edit(app.bot, game.chat_id, game.game_msg_id, "\n".join(text), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        if game.game_msg_id:
+            await safe_edit(app.bot, game.chat_id, game.game_msg_id, "\n".join(text), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+        else:
+            msg = await safe_send(app.bot, game.chat_id, "\n".join(text), reply_markup=InlineKeyboardMarkup(kb), parse_mode="HTML")
+            if msg: game.game_msg_id = msg.message_id
 
 async def settle_baccarat(game, app):
     # 模拟开牌动画
@@ -1839,11 +1848,8 @@ async def cmd_21(update, context):
     mode = current_game_mode()
     game = BlackjackGame(cid, uid, mode)
     active_blackjack_games[cid] = game
-    msg = await safe_send(context.bot, cid, "🃏 21点 筹码局准备中...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ 加入 (下注500)", callback_data="bj_join_500")]]))
-    if msg: 
-        game.game_msg_id = msg.message_id
-        await update_blackjack_ui(game, context.application)
-        await start_bj_wait_timeout(game, context.application) # 启动等待超时
+    await update_blackjack_ui(game, context.application)  # 直接发送等待房界面，无"准备中"占位
+    await start_bj_wait_timeout(game, context.application) # 启动等待超时
 
 async def cmd_bjl(update, context):
     if not await need_auth(update): return
@@ -1853,13 +1859,10 @@ async def cmd_bjl(update, context):
     mode = current_game_mode()
     game = BaccaratGame(cid, uid, mode)
     active_baccarat_games[cid] = game
-    msg = await safe_send(context.bot, cid, "👑 百家乐 准备中...", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("开始押注", callback_data="bjl_bet_player")]]))
-    if msg: 
-        game.game_msg_id = msg.message_id; 
-        await update_baccarat_ui(game, context.application)
-        await start_baccarat_timer(game, context.application)
+    await update_baccarat_ui(game, context.application)  # 直接发送押注界面，无"准备中"占位
+    await start_baccarat_timer(game, context.application)
 SLOT_SYMBOLS = ["🍒", "🍋", "🍊", "🍇", "🔔", "💎", "7️⃣"]
-SLOT_BET = 300  # 单次抽奖金额
+SLOT_BET = 500  # 单次抽奖金额
 SLOT_COOLDOWN = 3 # 冷却时间（秒）
 
 
@@ -1885,55 +1888,75 @@ async def cmd_lhj(update, context):
     # 检查冷却时间
     now = time.time()
     if now - user_cooldowns[uid] < SLOT_COOLDOWN:
-        await update.message.reply_text(f"🕒 别急，歇 {int(SLOT_COOLDOWN - (now - user_cooldowns[uid]))} 秒再抽吧。")
-        return
+        return  # 冷却中静默忽略，防止疯狂 /lhj 刷屏导致 Telegram 限流
     
+    # 弹出选择界面：1次 / 5次 / 10次 / 20次
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎯 1 次", callback_data="lhj_spin_1"), InlineKeyboardButton("🎯 5 次", callback_data="lhj_spin_5")],
+        [InlineKeyboardButton("🎯 10 次", callback_data="lhj_spin_10"), InlineKeyboardButton("🎯 20 次", callback_data="lhj_spin_20")],
+    ])
+    await update.message.reply_text(
+        f"🎰 <b>老虎机</b>（单次 {SLOT_BET} 筹码）\n\n请选择转动次数：\n💡 5次={SLOT_BET*5}｜10次={SLOT_BET*10}｜20次={SLOT_BET*20}",
+        reply_markup=kb, parse_mode="HTML")
+
+
+async def run_slot_spins(context, cid, uid, count, answer=None):
+    """老虎机连抽核心：扣款、开奖、一条消息结算。answer 用于按钮回调提示。"""
     mode = current_game_mode()
     wallet = entertainment_chips if mode == "entertainment" else group_chips
-    if wallet[cid][uid] < SLOT_BET:
-        await update.message.reply_text(f"❌ 筹码不足，抽一次需要 {SLOT_BET}。")
-        return
+    now = time.time()
+    if now - user_cooldowns[uid] < SLOT_COOLDOWN:
+        if answer: await answer("🕒 冷却中，稍等几秒再抽", show_alert=True)
+        return False
+    total_cost = SLOT_BET * count
+    if wallet[cid][uid] < total_cost:
+        if answer: await answer(f"❌ 筹码不足，{count} 连抽需要 {total_cost} 筹码", show_alert=True)
+        return False
     
     # 扣钱并设置冷却
     user_cooldowns[uid] = now
-    wallet[cid][uid] -= SLOT_BET
+    wallet[cid][uid] -= total_cost
     
-    # --- 1. 发送转动中的初始消息 ---
-    name = await get_name(context.application, uid)
-    spin_msg = await safe_send(context.bot, cid, f"🎰 <b>老虎机转动中...</b>\n\n👤 玩家：{name}\n━━━━━━━━━━━━━━━━━\n[ 🔄 | 🔄 | 🔄 ]", parse_mode="HTML")
-    
-    # --- 2. 模拟转动停顿 (1.5秒) ---
-    await asyncio.sleep(1.5)
-    
-    res, multiplier = get_slot_result()
-    payout = SLOT_BET * multiplier
-    wallet[cid][uid] += payout
-    
-    date = business_date()
-    res_str = " | ".join(res)
-    
-    if multiplier > 0:
-        result_text = f"🎰 <b>老虎机结果：[ {res_str} ]</b>\n\n🎉 恭喜 {name} 中了 {multiplier} 倍！获得 {payout} 积分。"
-    else:
-        result_text = f"🎰 <b>老虎机结果：[ {res_str} ]</b>\n\n💸 很遗憾，{name} 未中奖，失去了 {SLOT_BET} 积分。"
-    
-    # 记录统计
-    if mode == "official":
-        net = payout - SLOT_BET
-        slot_profit_by_date[date][cid][uid] += net
-        profit_by_date[date][cid][uid] += net
+    # 全局并发限制：防止多人同时狂抽导致 Telegram 限流，卡死所有游戏
+    async with SLOT_SPIN_SEM:
+        date = business_date()
+        name = await get_name(context.application, uid)
+        results = [get_slot_result() for _ in range(count)]
+        total_payout = sum(SLOT_BET * m for _, m in results)
+        wallet[cid][uid] += total_payout
+        
+        # 记录统计
+        if mode == "official":
+            for _, m in results:
+                net = SLOT_BET * m - SLOT_BET
+                slot_profit_by_date[date][cid][uid] += net
+                profit_by_date[date][cid][uid] += net
+        
+        # 结果消息
+        if count == 1:
+            res_str = " | ".join(results[0][0])
+            m = results[0][1]
+            if m > 0:
+                result_text = f"🎰 <b>老虎机结果：[ {res_str} ]</b>\n\n🎉 恭喜 {name} 中了 {m} 倍！获得 {total_payout} 积分。"
+            else:
+                result_text = f"🎰 <b>老虎机结果：[ {res_str} ]</b>\n\n💸 很遗憾，{name} 未中奖，失去了 {SLOT_BET} 积分。"
+        else:
+            lines = []
+            for i, (res, m) in enumerate(results, 1):
+                rs = " | ".join(res)
+                lines.append(f"{i}. [ {rs} ] " + (f"🎉 ×{m}" if m > 0 else "💸"))
+            result_text = f"🎰 <b>老虎机 {count} 连抽</b>｜👤 {name}\n━━━━━━━━━━━━━━━━━\n" + "\n".join(lines) + f"\n━━━━━━━━━━━━━━━━━\n💰 总投入 {total_cost}｜总赢回 {total_payout}｜净 {total_payout - total_cost:+d}"
         
         # 榜单
-        s_rank = sorted(slot_profit_by_date[date][cid].items(), key=lambda item: item[1], reverse=True)[:10]
-        result_text += "\n\n🏆 <b>当日老虎机累计盈利榜</b>\n"
-        result_text += "\n".join([f"{rank_marker(i)} {await get_name(context.application, u)}：{a:+d}" for i, (u, a) in enumerate(s_rank, 1)])
-
-    # --- 3. 原地编辑出结果，确保置底且不刷屏 ---
-    if spin_msg:
-        await safe_edit(context.bot, cid, spin_msg.message_id, result_text, parse_mode="HTML")
-    
-    save_data()
-    if mode == "official": await emergency_if_needed(cid, uid, context.application)
+        if mode == "official":
+            s_rank = sorted(slot_profit_by_date[date][cid].items(), key=lambda item: item[1], reverse=True)[:10]
+            result_text += "\n\n🏆 <b>当日老虎机累计盈利榜</b>\n"
+            result_text += "\n".join([f"{rank_marker(i)} {await get_name(context.application, u)}：{a:+d}" for i, (u, a) in enumerate(s_rank, 1)])
+        
+        await safe_send(context.bot, cid, result_text, parse_mode="HTML")
+        save_data()
+        if mode == "official": await emergency_if_needed(cid, uid, context.application)
+    return True
 
 
 
@@ -1964,11 +1987,11 @@ async def cmd_dz(update, context):
     if game:
         if game.phase != "waiting": await update.message.reply_text("当前已有进行中的德州扑克。"); return
         if game.add(uid):
-            await update_poker_waiting(game, context.application); await update.message.reply_text("已加入当前等待房间，满 2 人后 60 秒自动开局。")
+            await update_poker_waiting(game, context.application); await update.message.reply_text("已加入当前等待房间。")
         else: await update.message.reply_text("你已在等待房间中。")
         return
     game = PokerGame(cid, uid, mode); game.add(uid); active_poker_games[cid] = game
-    msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ 加入游戏", callback_data="texas_join")], [InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")]]))
+    msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 加入游戏", callback_data="texas_join")], [InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")]]))
     if msg:
         game.game_msg_id = msg.message_id
         await start_wait_timeout(game, context.application)
@@ -2281,6 +2304,16 @@ async def on_button(update, context):
                 await safe_edit(context.bot, cid, game.game_msg_id, "🛑 百家乐已手动终止，筹码已退回。", reply_markup=None)
             return
 
+        # --- 老虎机连抽回调 ---
+        if data.startswith("lhj_spin_"):
+            try: count = int(data.split("_")[2])
+            except (ValueError, IndexError):
+                await q.answer("无效操作", show_alert=True); return
+            if count not in (1, 5, 10, 20):
+                await q.answer("无效操作", show_alert=True); return
+            await run_slot_spins(context, cid, uid, count, answer=q.answer)
+            return
+
         if data == "gomoku_join":
             game = active_gomoku_games.get(cid)
             if not game: await q.answer("五子棋已结束", show_alert=True); return
@@ -2440,7 +2473,7 @@ async def on_text(update, context):
                 found = True
                 await safe_delete(context.bot, cid, poker.game_msg_id)
                 if poker.phase == "waiting":
-                    msg = await safe_send(context.bot, cid, await poker_waiting_text(poker, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("➕ 加入游戏", callback_data="texas_join")], [InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")]]))
+                    msg = await safe_send(context.bot, cid, await poker_waiting_text(poker, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 加入游戏", callback_data="texas_join")], [InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")]]))
                     if msg: poker.game_msg_id = msg.message_id
                 else:
                     msg = await safe_send(context.bot, cid, await poker_table_text(poker, context.application))
@@ -2653,7 +2686,7 @@ def main():
     # 在主循环启动前初始化 Event
     save_event = asyncio.Event()
     
-    app = Application.builder().token(token).post_init(post_init).post_shutdown(post_shutdown).build()
+    app = Application.builder().token(token).concurrent_updates(True).max_concurrent_updates(8).post_init(post_init).post_shutdown(post_shutdown).build()
 
     for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("sl",cmd_sl),("lhj",cmd_lhj),("21",cmd_21),("bjl",cmd_bjl),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("addyl",cmd_addyl),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm)]: app.add_handler(CommandHandler(command, handler))
     app.add_handler(CallbackQueryHandler(on_button)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
