@@ -948,7 +948,14 @@ class PokerGame:
         elif self.phase == "flop": self.deck.pop(); self.board.append(self.deck.pop()); self.phase = "turn"
         elif self.phase == "turn": self.deck.pop(); self.board.append(self.deck.pop()); self.phase = "river"
         else: self.phase = "showdown"; return
-        if self._next((self.dealer_idx + 1) % len(self.players)) is None: self.phase = "showdown"
+        # 基于 dealer 在 active 中的位置计算起始行动者（dealer 可能已弃牌）
+        dealer = self.players[self.dealer_idx]
+        if dealer in self.active:
+            start = (self.active.index(dealer) + 1) % len(self.active)
+        else:
+            # dealer 已弃牌，从 active 第一个开始找
+            start = 0
+        if self._next(start) is None: self.phase = "showdown"
 
     def showdown(self):
         alive = [uid for uid in self.players if uid not in self.folded]
@@ -1070,7 +1077,9 @@ async def start_turn_timer(game, app):
             game.action(uid, "fold")
             desc = "超时自动弃牌"
         await safe_send(app.bot, game.chat_id, f"⏰ {desc}：{await get_name(app, uid)}")
-        if game.phase == "showdown": await settle_poker(game, app)
+        if game.phase == "showdown":
+            await safe_delete(app.bot, game.chat_id, game.action_msg_id)
+            await settle_poker(game, app)
         else: await update_poker_table(game, app); await start_turn_timer(game, app)
     game.turn_task = asyncio.create_task(timeout_action())
 
@@ -1465,6 +1474,7 @@ async def start_bj_turn_timer(game, app):
     curr_uid = game.players[game.current_player_idx]
     async def timeout():
         await asyncio.sleep(TURN_TIMEOUT)
+        if active_blackjack_games.get(game.chat_id) is not game: return  # 游戏已终止或被替换
         if game.phase == "playing" and game.players[game.current_player_idx] == curr_uid:
             game.next_player()
             await safe_send(app.bot, game.chat_id, f"⏰ {await get_name(app, curr_uid)} 超时自动停牌。")
@@ -1585,12 +1595,14 @@ async def update_blackjack_ui(game, app):
             text = f"🃏 <b>21点 结算</b>\n━━━━━━━━━━━━━━━━━\n🏛 <b>庄家</b>：{game.get_card_str(game.dealer_hand)} ({d_score})\n\n"
             date = business_date()
             wallet = game_chips
-            
+
             lines = []
             # 预先获取所有名字，提高 HTML 生成速度
             player_names = {}
             for uid in game.players: player_names[uid] = await get_name(app, uid)
-            
+
+            payouts_done = False
+            player_payouts = []
             for uid in game.players:
                 p_score = game.get_score(game.hands[uid])
                 bet = game.bets[uid]
@@ -1609,16 +1621,19 @@ async def update_blackjack_ui(game, app):
                 
                 net = payout - bet
                 wallet[game.chat_id][uid] += payout
+                player_payouts.append((payout, uid))
                 if game.mode == "official":
                     blackjack_profit_by_date[date][game.chat_id][uid] += net
                 hand_text = game.get_card_str(game.hands[uid])
                 lines.append(f"👤 <b>玩家</b>：{player_names[uid]} | {hand_text} ({p_score})\n<b>结果</b>：{result_str} | 盈亏 {net:+d}")
                 pending_game_bets[game.chat_id].get(uid, {}).pop("21", None)
 
+            payouts_done = True
+
             # 记录庄家历史 (仅记录本局主要趋势)
             if game.mode == "official":
                 # 计算本局玩家总体输赢，用于生成庄家路书图标
-                total_net = sum(payout - game.bets[uid] for uid in game.players)
+                total_net = sum(p - game.bets[u] for p, u in player_payouts)
                 history_icon = "🏛" if total_net < 0 else ("🤝" if total_net == 0 else "👤")
                 blackjack_history[game.chat_id] = (blackjack_history[game.chat_id] + [history_icon])[-10:]
 
@@ -1638,7 +1653,14 @@ async def update_blackjack_ui(game, app):
             await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
         except Exception:
             logger.exception("21点结算显示失败")
-            await safe_send(app.bot, game.chat_id, "⚠️ 21点已结算，但由于 HTML 渲染问题无法显示详细战报。积分已保存。")
+            if not payouts_done:
+                # 派彩前出错，退还投注
+                wallet = game_chips
+                for uid in game.players:
+                    wallet[game.chat_id][uid] += game.bets[uid]
+                await safe_send(app.bot, game.chat_id, "⚠️ 21点结算异常，本局已退款，积分不受影响。")
+            else:
+                await safe_send(app.bot, game.chat_id, "⚠️ 21点已结算，但由于 HTML 渲染问题无法显示详细战报。积分已保存。")
         finally:
             active_blackjack_games.pop(game.chat_id, None)
             save_data()
@@ -1726,42 +1748,61 @@ async def settle_baccarat(game, app):
     date = business_date()
     wallet = game_chips
     lines = []
-    
-    for uid, bets in game.bets.items():
-        win_amount = 0
-        total_bet = sum(bets.values())
-        if result == "player": win_amount = bets["player"] * 2
-        elif result == "banker":                     win_amount = round(bets["banker"] * 1.95)
-        elif result == "tie": win_amount = bets["tie"] * 9 + bets["player"] + bets["banker"]  # 押和9倍 + 庄闲投注退还
-        
-        net = win_amount - total_bet
-        wallet[game.chat_id][uid] += win_amount
-        if game.mode == "official":
-            baccarat_profit_by_date[date][game.chat_id][uid] += net
-        if net != 0:
-            lines.append(f"👤 <b>玩家</b>：{await get_name(app, uid)}\n<b>盈亏</b>：{net:+d}")
-        # 清除退款记录（本局已结束，无论盈亏都清理本游戏的记录）
-        pending_game_bets[game.chat_id].get(uid, {}).pop("baccarat", None)
-            
-    text += "\n\n".join(lines) if lines else "本局无人盈亏。"
-    
-    # 增加当日百家乐盈利榜
-    if game.mode == "official":
-        bjl_rank = sorted(total_profit_by_game(baccarat_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
-        text += "\n\n🏆 <b>百家乐 累计盈利榜（总数）</b>\n"
-        text += "\n".join([f"{rank_marker(i)} {await get_name(app, u)}：{a:+d}" for i, (u, a) in enumerate(bjl_rank, 1)])
+    payouts_applied = False
 
-    # 核心：删除旧消息，发送新结算消息
-    await safe_delete(app.bot, game.chat_id, game.game_msg_id)
-    await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
-    
-    # 应急积分检查
-    if game.mode == "official":
-        for uid in game.bets.keys():
-            await emergency_if_needed(game.chat_id, uid, app)
-    
-    active_baccarat_games.pop(game.chat_id, None)
-    save_data()
+    # 预取所有玩家名字，避免派彩循环中途网络调用抛异常导致部分派彩
+    bet_uids = list(game.bets.keys())
+    name_map = {}
+    for uid in bet_uids:
+        try: name_map[uid] = await get_name(app, uid)
+        except Exception: name_map[uid] = f"玩家{uid}"
+
+    try:
+        for uid, bets in game.bets.items():
+            win_amount = 0
+            total_bet = sum(bets.values())
+            if result == "player": win_amount = bets["player"] * 2
+            elif result == "banker":                     win_amount = round(bets["banker"] * 1.95)
+            elif result == "tie": win_amount = bets["tie"] * 9 + bets["player"] + bets["banker"]  # 押和9倍 + 庄闲投注退还
+
+            net = win_amount - total_bet
+            wallet[game.chat_id][uid] += win_amount
+            if game.mode == "official":
+                baccarat_profit_by_date[date][game.chat_id][uid] += net
+            if net != 0:
+                lines.append(f"👤 <b>玩家</b>：{name_map[uid]}\n<b>盈亏</b>：{net:+d}")
+            # 清除退款记录（本局已结束，无论盈亏都清理本游戏的记录）
+            pending_game_bets[game.chat_id].get(uid, {}).pop("baccarat", None)
+
+        payouts_applied = True
+
+        text += "\n\n".join(lines) if lines else "本局无人盈亏。"
+
+        # 增加当日百家乐盈利榜
+        if game.mode == "official":
+            bjl_rank = sorted(total_profit_by_game(baccarat_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
+            text += "\n\n🏆 <b>百家乐 累计盈利榜（总数）</b>\n"
+            text += "\n".join([f"{rank_marker(i)} {name_map.get(u, f'玩家{u}')}：{a:+d}" for i, (u, a) in enumerate(bjl_rank, 1)])
+
+        # 核心：删除旧消息，发送新结算消息
+        await safe_delete(app.bot, game.chat_id, game.game_msg_id)
+        await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
+
+        # 应急积分检查
+        if game.mode == "official":
+            for uid in game.bets.keys():
+                await emergency_if_needed(game.chat_id, uid, app)
+    except Exception:
+        logger.exception("百家乐结算异常，群 %s", game.chat_id)
+        if payouts_applied:
+            await safe_send(app.bot, game.chat_id, "⚠️ 百家乐派彩已完成，但结算展示异常，积分不受影响。")
+        else:
+            await safe_send(app.bot, game.chat_id, "⚠️ 百家乐结算异常，本局将退款以保护玩家积分。")
+            for uid, bets in game.bets.items():
+                wallet[game.chat_id][uid] += sum(bets.values())
+    finally:
+        active_baccarat_games.pop(game.chat_id, None)
+        save_data()
 
 async def cmd_21(update, context):
     if not await need_auth(update): return
