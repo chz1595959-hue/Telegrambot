@@ -6,13 +6,10 @@ import os
 import random
 import re
 import shutil
-import struct
 import threading
 import time
-import zlib
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from io import BytesIO
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest, RetryAfter, TelegramError
@@ -163,7 +160,7 @@ def force_save_now():
                 "race_jackpot": {str(cid): value for cid, value in race_jackpot.items()},
                 "hourly_race_enabled": {str(cid): value for cid, value in hourly_race_enabled.items()},
                 "race_history": {str(cid): value[-10:] for cid, value in race_history.items()},
-                "baccarat_history": {str(cid): value[-10:] for cid, value in baccarat_history.items()},
+                "baccarat_history": {str(cid): value[-12:] for cid, value in baccarat_history.items()},
                 "blackjack_history": {str(cid): value[-10:] for cid, value in blackjack_history.items()},
                 "race_daily_stats": {str(cid): value for cid, value in race_daily_stats.items()},
                 "baccarat_daily_stats": {str(cid): dict(value) for cid, value in baccarat_daily_stats.items()},
@@ -224,7 +221,11 @@ def load_data():
         for cid, value in data.get("race_jackpot", {}).items(): race_jackpot[int(cid)] = int(value)
         for cid, value in data.get("hourly_race_enabled", {}).items(): hourly_race_enabled[int(cid)] = bool(value)
         for cid, value in data.get("race_history", {}).items(): race_history[int(cid)] = list(value)[-10:]
+        for cid, value in data.get("baccarat_history", {}).items(): baccarat_history[int(cid)] = list(value)[-12:]
+        for cid, value in data.get("blackjack_history", {}).items(): blackjack_history[int(cid)] = list(value)[-10:]
         for cid, value in data.get("race_daily_stats", {}).items(): race_daily_stats[int(cid)] = list(value)[:HORSE_COUNT]
+        for cid, value in data.get("baccarat_daily_stats", {}).items():
+            baccarat_daily_stats[int(cid)] = {"player": int(value.get("player", 0)), "banker": int(value.get("banker", 0)), "tie": int(value.get("tie", 0))}
         for cid, users in data.get("daily_emergency_used", {}).items():
             for uid, used in users.items(): daily_emergency_used[int(cid)][int(uid)] = min(int(used), EMERGENCY_MAX_USES)
         last_business_date = data.get("last_business_date", "")
@@ -289,7 +290,9 @@ def split_telegram_text(text, max_bytes=4000):
 async def safe_send_long(bot, cid, text, **kwargs):
     last = None
     for index, part in enumerate(split_telegram_text(text)):
-        last = await safe_send(bot, cid, part, **(kwargs if index == 0 else {}))
+        part_kwargs = dict(kwargs)
+        if index > 0: part_kwargs.pop("reply_markup", None)  # 只有第一段带键盘，后续段保留 parse_mode
+        last = await safe_send(bot, cid, part, **part_kwargs)
         if last is None:
             logger.error("长消息发送失败，群 %s，第 %s 段未送达", cid, index + 1)
             return None
@@ -382,84 +385,6 @@ async def emergency_if_needed(cid, uid, app, wallet=None, poker=None):
 
 
 # ==================== 五子棋 ====================
-def png_chunk(kind, data):
-    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF)
-
-
-def gomoku_board_image(board):
-    """仅用标准库绘制木色 11×11 棋盘 PNG，避免 emoji 棋盘在手机端变形。"""
-    size, margin, grid = 11, 46, 48
-    canvas = margin * 2 + grid * (size - 1)
-    pixels = bytearray(canvas * canvas * 3)
-    wood, line, black, white, shadow = (211, 165, 95), (78, 50, 25), (30, 30, 30), (244, 240, 228), (132, 96, 52)
-
-    def set_pixel(x, y, color):
-        if 0 <= x < canvas and 0 <= y < canvas:
-            offset = (y * canvas + x) * 3
-            pixels[offset:offset + 3] = bytes(color)
-
-    # 木色底板与细微横向纹理。
-    for y in range(canvas):
-        grain = ((y * 17) % 11) - 5
-        color = tuple(max(0, min(255, value + grain)) for value in wood)
-        for x in range(canvas):
-            set_pixel(x, y, color)
-    # 网格线。
-    for index in range(size):
-        pos = margin + index * grid
-        for delta in (-1, 0, 1):
-            for xy in range(margin, canvas - margin + 1):
-                set_pixel(pos + delta, xy, line)
-                set_pixel(xy, pos + delta, line)
-    # 用内置像素字绘制 1–11 坐标，不依赖字体文件或第三方图像库。
-    digits = {
-        "0": ("111", "101", "101", "101", "111"), "1": ("010", "110", "010", "010", "111"),
-        "2": ("111", "001", "111", "100", "111"), "3": ("111", "001", "111", "001", "111"),
-        "4": ("101", "101", "111", "001", "001"), "5": ("111", "100", "111", "001", "111"),
-        "6": ("111", "100", "111", "101", "111"), "7": ("111", "001", "010", "010", "010"),
-        "8": ("111", "101", "111", "101", "111"), "9": ("111", "101", "111", "001", "111"),
-    }
-
-    def draw_number(text, left, top, scale=2):
-        for char_index, char in enumerate(text):
-            for dy, pattern in enumerate(digits[char]):
-                for dx, enabled in enumerate(pattern):
-                    if enabled == "1":
-                        for py in range(scale):
-                            for px in range(scale):
-                                set_pixel(left + char_index * 8 + dx * scale + px, top + dy * scale + py, line)
-
-    for index in range(size):
-        label = str(index + 1)
-        draw_number(label, margin + index * grid - (3 if index < 9 else 7), 16)
-        draw_number(label, 16 if index < 9 else 10, margin + index * grid - 5)
-    # 五子棋星位。
-    for row, col in ((3, 3), (3, 7), (5, 5), (7, 3), (7, 7)):
-        cx, cy = margin + col * grid, margin + row * grid
-        for y in range(cy - 4, cy + 5):
-            for x in range(cx - 4, cx + 5):
-                if (x - cx) ** 2 + (y - cy) ** 2 <= 16:
-                    set_pixel(x, y, line)
-    # 棋子以实心圆绘制，白棋保留深色边缘，不会和棋盘混淆。
-    for row, values in enumerate(board):
-        for col, stone in enumerate(values):
-            if stone == GomokuGame.EMPTY:
-                continue
-            cx, cy = margin + col * grid, margin + row * grid
-            radius = 19
-            fill = black if stone == GomokuGame.BLACK else white
-            for y in range(cy - radius - 2, cy + radius + 3):
-                for x in range(cx - radius - 2, cx + radius + 3):
-                    distance = (x - cx) ** 2 + (y - cy) ** 2
-                    if distance <= (radius + 2) ** 2:
-                        set_pixel(x, y, shadow)
-                    if distance <= radius ** 2:
-                        set_pixel(x, y, fill)
-    raw = b"".join(b"\x00" + bytes(pixels[row * canvas * 3:(row + 1) * canvas * 3]) for row in range(canvas))
-    image = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", canvas, canvas, 8, 2, 0, 0, 0)) + png_chunk(b"IDAT", zlib.compress(raw, 9)) + png_chunk(b"IEND", b"")
-    data = BytesIO(image)
-    data.name = "gomoku_board.png"
-    return data
 
 
 class GomokuGame:
@@ -1314,7 +1239,6 @@ class HorseRace:
             self.race_start_time = time.time()
             await safe_edit(app.bot, self.chat_id, self.game_msg_id, "🏇 比赛开始！正在奔跑中……", reply_markup=None)
             msg = await safe_send(app.bot, self.chat_id, "🏇 比赛开始！正在奔跑中……"); self.animation_msg_id = msg.message_id if msg else None
-            last_update = self.race_start_time
             # 先按胜率加权抽取完整名次，再分配有间隔的完赛时间。
             # 这样长期夺冠率接近显示胜率，同时不会出现开赛第一帧直接到终点。
             remaining = list(range(HORSE_COUNT))
@@ -1337,8 +1261,6 @@ class HorseRace:
             }
             while not self.cancelled and len(self.arrivals) < HORSE_COUNT:
                 now = time.time()
-                elapsed = max(0.05, now - last_update)
-                last_update = now
                 for i in range(HORSE_COUNT):
                     if i in self.arrival_times:
                         continue
@@ -1362,6 +1284,7 @@ class HorseRace:
         async with self.lock:
             if self.settled or self.cancelled: return
             self.settled, self.phase = True, "settling"
+            payouts_applied = False
             try:
                 if not self.arrivals: raise RuntimeError("赛马未产生到达顺序")
                 locked_odds = self.final_odds or self.odds()
@@ -1373,6 +1296,10 @@ class HorseRace:
                 lines = [f"🏆 赛马大赛 {race_id(self.create_time)} 结果 🏆", "━━━━━━━━━━━━━━━━━"]
                 lines.extend(f"{standings[index]} {HORSE_EMOJI[horse]} {HORSE_NAMES[horse]}" for index, horse in enumerate(self.arrivals))
 
+                # 先获取所有玩家名字：避免派彩后因取名字失败触发异常退款，导致已派彩玩家被双重派彩
+                for uid in self.bets:
+                    if uid not in self.name_cache: self.name_cache[uid] = await get_name(app, uid)
+
                 settlements, total_payout = [], 0
                 for uid, bets in self.bets.items():
                     stake, payout = sum(bets.values()), int(bets.get(winner, 0) * odd)
@@ -1381,9 +1308,8 @@ class HorseRace:
                     wallet[self.chat_id][uid] += payout; total_payout += payout
                     if self.mode == "official":
                         race_profit_by_date[date][self.chat_id][uid] += net
-                    name = self.name_cache.get(uid) or await get_name(app, uid)
-                    self.name_cache[uid] = name
-                    settlements.append((uid, name, stake, payout, net))
+                    settlements.append((uid, self.name_cache[uid], stake, payout, net))
+                payouts_applied = True
 
                 available_pool = self.jackpot + self.pool
                 supplement = max(0, total_payout - available_pool)
@@ -1402,7 +1328,7 @@ class HorseRace:
                     day_rank = sorted(total_profit_by_game(race_profit_by_date, self.chat_id).items(), key=lambda item: item[1], reverse=True)[:50]
                     lines.extend(["", "🏆 <b>赛马累计盈利榜（总数）</b>", "━━━━━━━━━━━━━━━━━"])
                     for index, (uid, amount) in enumerate(day_rank, 1):
-                        name = self.name_cache.get(uid) or await get_name(app, uid)
+                        name = self.name_cache.get(uid) or f"玩家{uid}"
                         lines.append(f"{rank_marker(index)} {name}：{amount:+d}")
                 else:
                     lines.extend(["", "🎮 娱乐局：本局不计入正式盈亏榜。"])
@@ -1416,12 +1342,15 @@ class HorseRace:
                     await safe_send(app.bot, self.chat_id, "⚠️ 赛马已完成结算，但详细结果消息发送失败。积分与当日盈亏已保存，可使用 /cx 查看排行榜。")
             except Exception:
                 logger.exception("赛马结算异常，群 %s", self.chat_id)
-                await safe_send(app.bot, self.chat_id, "⚠️ 赛马结算异常，请管理员检查日志；本局将退款以保护玩家积分。")
-                wallet = game_chips
-                for uid, bets in self.bets.items():
-                    wallet[self.chat_id][uid] += sum(bets.values())
-
-                if self.mode == "official": race_jackpot[self.chat_id] = self.jackpot
+                # 仅在尚未派彩时退款，避免已派彩玩家被双重派彩
+                if not payouts_applied:
+                    wallet = game_chips
+                    for uid, bets in self.bets.items():
+                        wallet[self.chat_id][uid] += sum(bets.values())
+                    if self.mode == "official": race_jackpot[self.chat_id] = self.jackpot
+                    await safe_send(app.bot, self.chat_id, "⚠️ 赛马结算异常，本局已退款以保护玩家积分。")
+                else:
+                    await safe_send(app.bot, self.chat_id, "⚠️ 赛马结算显示异常，派彩已保存，可使用 /cx 查看排行榜。")
                 save_data()
             finally:
                 await safe_delete(app.bot, self.chat_id, self.animation_msg_id)
@@ -1644,8 +1573,7 @@ async def update_blackjack_ui(game, app):
         msg = await safe_send(app.bot, game.chat_id, action_text, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode="HTML")
         if msg: game.action_msg_id = msg.message_id
     elif game.phase == "dealer_turn":
-        # 庄家补牌后直接进入结算
-        await safe_delete(app.bot, game.chat_id, game.action_msg_id)
+        # 庄家补牌后直接进入结算（消息删除由 finished 分支统一处理，避免重复删除）
         game.dealer_play()
         # 确保跳转到 finished 逻辑
         await update_blackjack_ui(game, app)
@@ -1739,15 +1667,15 @@ async def update_baccarat_ui(game, app):
         t_total = sum(b["tie"] for b in game.bets.values())
         
         text = [
-            f"👑 <b>百家乐 大赛</b> 👑",
+            "👑 <b>百家乐 大赛</b> 👑",
             "━━━━━━━━━━━━━━━━━",
-            f"📊 <b>当日胜率</b>",
+            "📊 <b>当日胜率</b>",
             f"{stats_text}",
             f"{percent_text}",
             "",
             f"📉 <b>历史路书</b>：{history_list}",
             "",
-            f"💰 <b>当前奖池</b>",
+            "💰 <b>当前奖池</b>",
             f"🔵 <b>闲家</b>：{p_total} 积分",
             f"🔴 <b>庄家</b>：{b_total} 积分",
             f"🟢 <b>和局</b>：{t_total} 积分",
@@ -1804,7 +1732,7 @@ async def settle_baccarat(game, app):
         total_bet = sum(bets.values())
         if result == "player": win_amount = bets["player"] * 2
         elif result == "banker":                     win_amount = round(bets["banker"] * 1.95)
-        elif result == "tie": win_amount = bets["tie"] * 9
+        elif result == "tie": win_amount = bets["tie"] * 9 + bets["player"] + bets["banker"]  # 押和9倍 + 庄闲投注退还
         
         net = win_amount - total_bet
         wallet[game.chat_id][uid] += win_amount
@@ -1857,8 +1785,6 @@ async def cmd_bjl(update, context):
     await update_baccarat_ui(game, context.application)  # 直接发送押注界面，无"准备中"占位
     await start_baccarat_timer(game, context.application)
 SLOT_SYMBOLS = ["🍒", "🍋", "🍊", "🍇", "🔔", "💎", "7️⃣"]
-SLOT_BET = 500  # 单次抽奖金额
-SLOT_COOLDOWN = 5 # 冷却时间（秒）
 
 
 def get_slot_result():
@@ -1907,11 +1833,11 @@ async def run_slot_spins(context, cid, uid, count, answer=None):
     now = time.time()
     if now - user_cooldowns[uid] < SLOT_COOLDOWN:
         if answer: await answer("🕒 冷却中，稍等几秒再抽", show_alert=True)
-        return False
+        return False, ""
     total_cost = SLOT_BET * count
     if wallet[cid][uid] < total_cost:
         if answer: await answer(f"❌ 积分不足，{count} 连抽需要 {total_cost} 积分", show_alert=True)
-        return False
+        return False, ""
     
     # 扣钱并设置冷却
     user_cooldowns[uid] = now
@@ -2068,6 +1994,7 @@ async def cmd_end(update, context):
 
     if bj and (target_all or arg in ["21", "bj", "21点"]):
         if uid == ADMIN_USER_ID or uid in bj.players:
+            bj.cancel_timer(); bj.cancel_wait()
             wallet = game_chips
             for p_uid, b in bj.bets.items():
                 wallet[cid][p_uid] += b
@@ -2079,6 +2006,7 @@ async def cmd_end(update, context):
     if bjl: # 百家乐特殊判断，因为 arg 可能对应 bjl
         if target_all or arg in ["bjl", "baccarat", "百家乐"]:
             if uid == ADMIN_USER_ID or uid in bjl.bets.keys():
+                bjl.cancel_timer()
                 wallet = game_chips
                 for p_uid, b_dict in bjl.bets.items():
                     for amount in b_dict.values(): wallet[cid][p_uid] += amount
@@ -2279,12 +2207,13 @@ async def on_button(update, context):
                 wallet[cid][uid] -= game.bets[uid]
                 game.double_down(uid)
                 await q.answer("双倍下注！摸牌并停牌")
-                await action_notice(cid, context.application, uid, f"选择了双倍下注！")
+                await action_notice(cid, context.application, uid, "选择了双倍下注！")
                 
                 if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
                 else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
             elif data == "bj_end":
                 if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
+                game.cancel_timer(); game.cancel_wait()
                 # 退还本局下注
                 wallet = game_chips
                 for p_uid, bet in game.bets.items():
@@ -2319,6 +2248,7 @@ async def on_button(update, context):
                 await settle_baccarat(game, context.application)
             elif data == "bjl_end":
                 if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
+                game.cancel_timer()
                 # 退还本局下注
                 wallet = game_chips
                 for p_uid, b_dict in game.bets.items():
