@@ -1114,13 +1114,8 @@ def poker_buttons(game, uid):
 
 
 async def update_poker_table(game, app):
-    # 游戏开始后：把等待房消息直接编辑成完整游戏界面（牌桌+行动提示+操作按钮）
-    uid = game.current()
-    text = await poker_table_text(game, app)
-    if uid:
-        text += f"\n\n⏰ <b>{await get_name(app, uid)}</b> 请在 {TURN_TIMEOUT} 秒内行动。"
-    await safe_edit(app.bot, game.chat_id, game.game_msg_id, text,
-                    reply_markup=poker_buttons(game, uid) if uid else None, parse_mode="HTML")
+    # 游戏开始后：把等待房消息直接编辑成牌桌（不删除；操作按钮在行动消息里）
+    await safe_edit(app.bot, game.chat_id, game.game_msg_id, await poker_table_text(game, app), reply_markup=None)
 
 
 async def start_turn_timer(game, app):
@@ -1129,7 +1124,12 @@ async def start_turn_timer(game, app):
     if uid is None:
         if game.phase == "showdown": await settle_poker(game, app)
         return
-    # 游戏界面（牌桌+提示+按钮）已由 update_poker_table 编辑进等待房消息，这里只启动超时计时
+    # 行动消息携带完整牌桌 + 行动提示 + 操作按钮（一条消息），操作完删除换下家
+    await safe_delete(app.bot, game.chat_id, game.action_msg_id)
+    text = f"{await poker_table_text(game, app)}\n\n⏰ <b>{await get_name(app, uid)}</b> 请在 {TURN_TIMEOUT} 秒内行动。"
+    msg = await safe_send(app.bot, game.chat_id, text, reply_markup=poker_buttons(game, uid), parse_mode="HTML")
+    game.action_msg_id = msg.message_id if msg else None
+
     # 真实超时任务：无需跟注自动过牌，否则自动弃牌，防止牌局卡死
     async def timeout_action():
         await asyncio.sleep(TURN_TIMEOUT)
