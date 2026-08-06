@@ -110,6 +110,7 @@ last_business_date = ""
 active_poker_games, active_horse_races, active_gomoku_games, active_minesweeper_games = {}, {}, {}, {}
 active_blackjack_games, active_baccarat_games = {}, {}
 active_sicbo_games, active_niuniu_games = {}, {}
+recent_poker_reveals = {}  # 德州单赢结算后临时保存赢家牌，供可选亮牌按钮使用
 # 用于老虎机等功能的冷却时间限制。
 user_cooldowns = defaultdict(float)
 # 高性能保存逻辑变量
@@ -1171,6 +1172,19 @@ async def settle_poker(game, app):
             lines.extend([f"{rank_marker(index)} {names.get(uid) or await get_name(app, uid)}：{amount:+d}" for index, (uid, amount) in enumerate(rank, 1)])
             
         delivered = await safe_send_long(app.bot, game.chat_id, "\n".join(lines), parse_mode="HTML")
+        # 单赢场景（只剩一人未弃牌）：提供可选亮牌按钮，尊重德州 muck 规则，不强制亮牌
+        if len(game.showdown_order) <= 1:
+            winner = game.showdown_order[0] if game.showdown_order else None
+            if winner is not None and game.hands.get(winner):
+                recent_poker_reveals[game.chat_id] = {
+                    "winner": winner,
+                    "hand": list(game.hands[winner]),
+                    "board": list(game.board),
+                }
+                btn = await safe_send(app.bot, game.chat_id,
+                    "💡 本局单挑收池，赢家可选择亮出底牌：",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🃏 亮牌", callback_data="texas_reveal")]]))
+                recent_poker_reveals[game.chat_id]["reveal_msg_id"] = btn.message_id if btn else None
         if delivered is None:
             await safe_send(app.bot, game.chat_id, "⚠️ 德州已完成结算，但详细结算消息发送失败。")
     except Exception:
@@ -1181,6 +1195,24 @@ async def settle_poker(game, app):
             for uid in game.players: await emergency_if_needed(game.chat_id, uid, app, texas_chips, game)
         save_data()
 
+
+
+async def handle_texas_reveal(cid, uid, q, context):
+    """德州单赢后，点击「亮牌」按钮，把赢家两张底牌发到群（可选，不强制）。"""
+    info = recent_poker_reveals.get(cid)
+    if not info:
+        await q.answer("本局亮牌数据已失效", show_alert=True); return
+    name = await get_name(context.application, info["winner"])
+    hand_text = "  ".join(card_str(c) for c in info["hand"])
+    board_text = "  ".join(card_str(c) for c in info["board"]) if info["board"] else "（未发公牌）"
+    await safe_send(context.bot, cid,
+        f"🃏 <b>{name} 亮牌</b>：{hand_text}\n🃏 公牌：{board_text}（收全部底池）",
+        parse_mode="HTML")
+    rid = info.get("reveal_msg_id")
+    if rid:
+        await safe_edit(context.bot, cid, rid, "🃏 已亮牌", reply_markup=None)
+    recent_poker_reveals.pop(cid, None)
+    await q.answer("已亮牌")
 
 
 # ==================== 赛马 ====================
@@ -1357,13 +1389,14 @@ class HorseRace:
 
                 settlements, total_payout = [], 0
                 for uid, bets in self.bets.items():
-                    stake, payout = sum(bets.values()), int(bets.get(winner, 0) * odd)
+                    stake = sum(bets.values()); bet_on_winner = bets.get(winner, 0)
+                    payout = int(bet_on_winner * odd)
                     net = payout - stake
                     wallet = game_chips
                     wallet[self.chat_id][uid] += payout; total_payout += payout
                     if self.mode == "official":
                         race_profit_by_date[date][self.chat_id][uid] += net
-                    settlements.append((uid, self.name_cache[uid], stake, payout, net))
+                    settlements.append((uid, self.name_cache[uid], stake, bet_on_winner, payout, net))
                 payouts_applied = True
 
                 available_pool = self.jackpot + self.pool
@@ -1376,8 +1409,8 @@ class HorseRace:
                     lines.extend(["", "🔄 无人押中，奖池滚入下一期。"])
 
                 lines.extend(["", "💰 本局结算："])
-                for _, name, stake, payout, net in settlements:
-                    lines.append(f"{name}：投注 {stake}｜派彩 {payout}｜盈亏 {net:+d}｜赔率 {odd:.2f}x")
+                for _, name, stake, bet_on_winner, payout, net in settlements:
+                    lines.append(f"{name}：总投注 {stake}（命中 {bet_on_winner}@{odd:.2f}x）｜派彩 {payout}｜净 {net:+d}")
 
                 if self.mode == "official":
                     day_rank = sorted(total_profit_by_game(race_profit_by_date, self.chat_id).items(), key=lambda item: item[1], reverse=True)[:50]
@@ -2609,6 +2642,7 @@ async def cmd_dz(update, context):
             await update_poker_waiting(game, context.application); await update.message.reply_text("已加入当前等待房间。")
         else: await update.message.reply_text("你已在等待房间中。")
         return
+    recent_poker_reveals.pop(cid, None)
     game = PokerGame(cid, uid, mode); game.add(uid); active_poker_games[cid] = game
     msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 加入游戏", callback_data="texas_join")], [InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")]]))
     if msg:
@@ -3123,6 +3157,8 @@ async def on_button(update, context):
             return
         if data.startswith("texas_"):
             game = active_poker_games.get(cid)
+            if data == "texas_reveal":
+                await handle_texas_reveal(cid, uid, q, context); return
             if not game: await q.answer("德州游戏已结束", show_alert=True); return
             if data == "texas_hand":
                 hand = game.hands.get(uid); await q.answer(f"你的手牌：{card_str(hand[0])}  {card_str(hand[1])}" if hand and uid not in game.folded else "当前无法查看手牌", show_alert=True); return
