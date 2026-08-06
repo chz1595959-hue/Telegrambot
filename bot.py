@@ -1374,7 +1374,10 @@ class HorseRace:
                     day_rank = sorted(total_profit_by_game(race_profit_by_date, self.chat_id).items(), key=lambda item: item[1], reverse=True)[:50]
                     lines.extend(["", "🏆 <b>赛马累计盈利榜（总数）</b>", "━━━━━━━━━━━━━━━━━"])
                     for index, (uid, amount) in enumerate(day_rank, 1):
-                        name = self.name_cache.get(uid) or f"玩家{uid}"
+                        name = self.name_cache.get(uid)
+                        if not name:
+                            name = await get_name(app, uid)
+                            self.name_cache[uid] = name
                         lines.append(f"{rank_marker(index)} {name}：{amount:+d}")
                 else:
                     lines.extend(["", "🎮 娱乐局：本局不计入正式盈亏榜。"])
@@ -1936,7 +1939,7 @@ async def update_sicbo_ui(game, app):
                     parts.append(f"🎯{n}{n}{n}×{amt}")
                 elif bt.startswith("sum_"):
                     s = bt.split("_")[1]
-                    parts.append(f"📊点{s}×{amt}")
+                    parts.append(f"总{s}×{amt}")
                 else:
                     parts.append(f"{SICBO_BET_NAMES.get(bt, bt)}×{amt}")
             text.append(f"👤 {name} | {' '.join(parts)}")
@@ -1951,9 +1954,13 @@ async def update_sicbo_ui(game, app):
         [InlineKeyboardButton("🟡 单 (1:1)", callback_data="sb_bet_odd"), InlineKeyboardButton("🟢 双 (1:1)", callback_data="sb_bet_even")],
         [InlineKeyboardButton("⚫ 任意豹子 (1:30)", callback_data="sb_bet_triple")],
         [InlineKeyboardButton(f"🎲{i}", callback_data=f"sb_bet_army_{i}") for i in range(1, 7)],
-        [InlineKeyboardButton(f"🎯{i}{i}{i}×150", callback_data=f"sb_bet_spec_{i}") for i in range(1, 7)],
-        [InlineKeyboardButton(f"📊{s}×{SICBO_SUM_PAYOUT[s]}", callback_data=f"sb_bet_sum_{s}") for s in range(4, 11)],
-        [InlineKeyboardButton(f"📊{s}×{SICBO_SUM_PAYOUT[s]}", callback_data=f"sb_bet_sum_{s}") for s in range(11, 18)],
+        [InlineKeyboardButton(f"{i}{i}{i}×150", callback_data=f"sb_bet_spec_{i}") for i in range(1, 7)],
+        [InlineKeyboardButton("4/17×60", callback_data="sb_bet_sumg_4_17"),
+         InlineKeyboardButton("5/16×30", callback_data="sb_bet_sumg_5_16"),
+         InlineKeyboardButton("6/15×17", callback_data="sb_bet_sumg_6_15")],
+        [InlineKeyboardButton("7/14×12", callback_data="sb_bet_sumg_7_14"),
+         InlineKeyboardButton("8/13×8", callback_data="sb_bet_sumg_8_13"),
+         InlineKeyboardButton("9-12×6", callback_data="sb_bet_sumg_9_10_11_12")],
         [InlineKeyboardButton("🎮 立即开牌", callback_data="sb_start"), InlineKeyboardButton("❌ 终止", callback_data="sb_end")],
     ]
     if game.game_msg_id:
@@ -2081,6 +2088,8 @@ NIUNIU_MAX_PLAYERS = 6
 NIUNIU_DEFAULT_ENTRY = 500
 NIUNIU_ENTRY_OPTIONS = [200, 500, 1000, 2000]
 NIU_NAMES = {0: "没牛", 1: "牛1", 2: "牛2", 3: "牛3", 4: "牛4", 5: "牛5", 6: "牛6", 7: "牛7", 8: "牛8", 9: "牛9", 10: "牛牛"}
+NIU_MULT = {0: 1, 1: 1, 2: 1, 3: 1, 4: 1, 5: 1, 6: 1, 7: 2, 8: 2, 9: 2, 10: 3}
+NIU_ROBOT_NAMES = ["🤖AI-阿牛", "🤖AI-小翠", "🤖AI-阿强", "🤖AI-阿珍", "🤖AI-大壮", "🤖AI-小芳"]
 
 
 class NiuNiuGame:
@@ -2088,38 +2097,49 @@ class NiuNiuGame:
         self.chat_id, self.owner_id, self.mode = cid, owner_id, mode or current_game_mode()
         self.entry_fee = entry_fee
         self.phase = "waiting"
-        self.players = []
+        self.players = []           # uid 正=真人，负=电脑人
         self.hands = {}
-        self.niu_info = {}   # {uid: (niu_value, combo_indices, remaining_indices)}
-        self.pot = 0
+        self.niu_info = {}
+        self.dealer_idx = 0
         self.game_msg_id = None
         self.create_time = time.time()
         self.wait_task = None
         self.settled = False
+        self.robot_names = {}       # {负uid: 名字}
 
     def add(self, uid):
         if self.phase != "waiting" or uid in self.players or len(self.players) >= NIUNIU_MAX_PLAYERS:
             return False
-        wallet = game_chips
-        if wallet[self.chat_id][uid] < self.entry_fee:
+        if game_chips[self.chat_id][uid] < self.entry_fee * 3:
             return False
-        wallet[self.chat_id][uid] -= self.entry_fee
         self.players.append(uid)
-        self.pot += self.entry_fee
+        return True
+
+    def add_robot(self):
+        if self.phase != "waiting" or len(self.players) >= NIUNIU_MAX_PLAYERS:
+            return False
+        robot_uid = -(100000 + random.randint(0, 899999))
+        while robot_uid in self.players:
+            robot_uid = -(100000 + random.randint(0, 899999))
+        used = set(self.robot_names.values())
+        available = [n for n in NIU_ROBOT_NAMES if n not in used]
+        name = random.choice(available) if available else f"🤖AI-{len(self.robot_names)+1}"
+        self.robot_names[robot_uid] = name
+        self.players.append(robot_uid)
         return True
 
     def leave(self, uid):
         if self.phase != "waiting" or uid not in self.players:
             return False
-        game_chips[self.chat_id][uid] += self.entry_fee
         self.players.remove(uid)
-        self.pot -= self.entry_fee
+        self.robot_names.pop(uid, None)
         return True
 
     def start(self):
         if len(self.players) < NIUNIU_MIN_PLAYERS:
             return False
         self.phase = "dealing"
+        self.dealer_idx = random.randint(0, len(self.players) - 1)
         deck = [Card.new(rank + suit) for rank in "23456789TJQKA" for suit in "shdc"]
         random.shuffle(deck)
         self.hands = {uid: [deck.pop() for _ in range(5)] for uid in self.players}
@@ -2152,6 +2172,9 @@ class NiuNiuGame:
     def max_card(self, uid):
         return max(self.hands[uid]) if uid in self.hands else 0
 
+    def is_robot(self, uid):
+        return uid < 0
+
     def cancel_wait(self):
         if self.wait_task and not self.wait_task.done():
             self.wait_task.cancel()
@@ -2162,22 +2185,27 @@ async def update_niuniu_ui(game, app):
     if game.phase != "waiting": return
     remain = max(0, int(ROOM_WAIT_TIMEOUT - (time.time() - game.create_time)))
     text = [
-        "🐂 <b>牛牛 玩家对战</b> 🐂",
+        "🐂 <b>牛牛 庄家模式</b> 🐂",
         "━━━━━━━━━━━━━━━━━",
-        f"💰 <b>入场费</b>：{game.entry_fee} 积分",
-        f"🏆 <b>奖池</b>：{game.pot} 积分",
-        f"👥 <b>已加入</b>：{len(game.players)}/{NIUNIU_MAX_PLAYERS}（最少 {NIUNIU_MIN_PLAYERS} 人开局）",
+        f"💰 <b>底注</b>：{game.entry_fee} 积分",
+        f"👥 <b>已加入</b>：{len(game.players)}/{NIUNIU_MAX_PLAYERS}（最少 {NIUNIU_MIN_PLAYERS} 人）",
         "",
     ]
     if game.players:
         text.append("📋 <b>玩家列表</b>")
         for uid in game.players:
-            text.append(f"👤 {await get_name(app, uid)}")
+            if uid < 0:
+                text.append(f"🤖 {game.robot_names.get(uid, 'AI')}")
+            else:
+                text.append(f"👤 {await get_name(app, uid)}")
         text.append("")
+    text.append("📌 庄家开局随机指定 · 庄家vs闲家独立结算")
+    text.append("📌 没牛~牛6=1倍 · 牛7~9=2倍 · 牛牛=3倍")
     text.append(f"⏰ <b>{remain} 秒后自动开始或解散</b>")
-    text.append("🔒 人齐自动开局，最大牛值赢走全部奖池，同牛比最大单张")
 
-    kb = [[InlineKeyboardButton("📥 加入游戏", callback_data="nn_join")]]
+    kb = [[InlineKeyboardButton("📥 加入", callback_data="nn_join")]]
+    if len(game.players) < NIUNIU_MAX_PLAYERS:
+        kb.append([InlineKeyboardButton("🤖 加电脑人", callback_data="nn_robot")])
     if len(game.players) >= NIUNIU_MIN_PLAYERS:
         kb.append([InlineKeyboardButton("🎮 开始游戏", callback_data="nn_start")])
     kb.append([InlineKeyboardButton("🚪 退出", callback_data="nn_leave"), InlineKeyboardButton("❌ 终止", callback_data="nn_end")])
@@ -2197,70 +2225,99 @@ async def settle_niuniu(game, app):
 
     name_map = {}
     for uid in game.players:
-        try: name_map[uid] = await get_name(app, uid)
-        except Exception: name_map[uid] = f"玩家{uid}"
+        if uid < 0:
+            name_map[uid] = game.robot_names.get(uid, "🤖AI")
+        else:
+            try: name_map[uid] = await get_name(app, uid)
+            except Exception: name_map[uid] = f"玩家{uid}"
 
-    # 找赢家：牛值最大，同牛值比最大单张
-    winners, max_niu, max_card_val = [], -1, -1
+    dealer_uid = game.players[game.dealer_idx]
+    dealer_niu = game.niu_info[dealer_uid][0]
+    dealer_mult = NIU_MULT[dealer_niu]
+
+    # 第一阶段：计算所有输赢（不操作钱包）
+    results = []
+    dealer_net = 0
     for uid in game.players:
-        niu = game.niu_info[uid][0]
-        card_val = game.max_card(uid)
-        if niu > max_niu or (niu == max_niu and card_val > max_card_val):
-            max_niu, max_card_val, winners = niu, card_val, [uid]
-        elif niu == max_niu and card_val == max_card_val:
-            winners.append(uid)
+        if uid == dealer_uid: continue
+        p_niu = game.niu_info[uid][0]
+        p_win = p_niu > dealer_niu or (p_niu == dealer_niu and game.max_card(uid) > game.max_card(dealer_uid))
+        if p_win:
+            amount = game.entry_fee * NIU_MULT[p_niu]
+        else:
+            amount = game.entry_fee * dealer_mult
+        net_player = amount if p_win else -amount
+        dealer_net -= net_player
+        results.append((uid, p_niu, p_win, amount, net_player))
 
+    # 第二阶段：操作钱包 + 记录盈亏
     wallet = game_chips
     date = business_date()
-    share = game.pot // len(winners)
-    remainder = game.pot - share * len(winners)
     payouts_applied = False
     lines = []
 
     try:
-        for uid in game.players:
-            niu, combo_idx, rem_idx = game.niu_info[uid]
-            hand = game.hands[uid]
-            cards_display = []
-            for i, card in enumerate(hand):
+        for uid, p_niu, p_win, amount, net_player in results:
+            if p_win:
+                if uid >= 0: wallet[game.chat_id][uid] += amount
+                if dealer_uid >= 0: wallet[game.chat_id][dealer_uid] -= amount
+            else:
+                if uid >= 0: wallet[game.chat_id][uid] -= amount
+                if dealer_uid >= 0: wallet[game.chat_id][dealer_uid] += amount
+            if game.mode == "official":
+                if uid >= 0: niuniu_profit_by_date[date][game.chat_id][uid] += net_player
+                if dealer_uid >= 0: niuniu_profit_by_date[date][game.chat_id][dealer_uid] -= net_player
+
+            p_combo = game.niu_info[uid][1]
+            p_hand = game.hands[uid]
+            p_cards = []
+            for i, card in enumerate(p_hand):
                 cs = card_str(card)
-                cards_display.append(f"【{cs}】" if i in combo_idx else f" {cs} ")
-            is_winner = uid in winners
-            win_amount = share + (remainder if (is_winner and uid == winners[0]) else 0)
-            net = win_amount - game.entry_fee
-            wallet[game.chat_id][uid] += win_amount
-            if game.mode == "official": niuniu_profit_by_date[date][game.chat_id][uid] += net
-            marker = "🏆" if is_winner else "  "
-            lines.append(f"{marker} {name_map[uid]} | {' '.join(cards_display)} | <b>{NIU_NAMES[niu]}</b> | {net:+d}")
+                p_cards.append(f"【{cs}】" if i in p_combo else f" {cs} ")
+            result_icon = "✅" if p_win else "❌"
+            lines.append(f"  {result_icon} {name_map[uid]} | {' '.join(p_cards)} | <b>{NIU_NAMES[p_niu]}</b> | {net_player:+d}")
 
         payouts_applied = True
-        winner_names = "、".join(name_map[u] for u in winners)
+
+        # 庄家牌展示
+        d_combo = game.niu_info[dealer_uid][1]
+        d_hand = game.hands[dealer_uid]
+        d_cards = []
+        for i, card in enumerate(d_hand):
+            cs = card_str(card)
+            d_cards.append(f"【{cs}】" if i in d_combo else f" {cs} ")
+
         text = [
-            "🐂 <b>牛牛 结算</b>",
+            "🐂 <b>牛牛 庄家结算</b>",
             "━━━━━━━━━━━━━━━━━",
-            f"🏆 <b>赢家</b>：{winner_names}",
-            f"💰 <b>奖池</b>：{game.pot} 积分 → 每人 {share}" + (f"（+{remainder}余数）" if remainder else ""),
+            f"🎰 <b>庄家</b>：{name_map[dealer_uid]} | {' '.join(d_cards)} | <b>{NIU_NAMES[dealer_niu]}</b>（{dealer_mult}倍）| {dealer_net:+d}",
             "",
-            "📋 <b>牌局</b>（【】为凑牛的3张）",
+            "📋 <b>闲家结算</b>（【】为凑牛的3张）",
         ]
         text.extend(lines)
         if game.mode == "official":
             rank = sorted(total_profit_by_game(niuniu_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
             text.append("")
             text.append("🏆 <b>牛牛 累计盈利榜</b>")
-            text.extend([f"{rank_marker(i)} {name_map.get(u, f'玩家{u}')}：{a:+d}" for i, (u, a) in enumerate(rank, 1)])
+            for i, (u, a) in enumerate(rank, 1):
+                if u < 0: continue
+                uname = name_map.get(u)
+                if not uname:
+                    try: uname = await get_name(app, u)
+                    except Exception: uname = f"玩家{u}"
+                text.append(f"{rank_marker(i)} {uname}：{a:+d}")
 
         await safe_delete(app.bot, game.chat_id, game.game_msg_id)
         await safe_send_long(app.bot, game.chat_id, "\n".join(text), parse_mode="HTML")
         if game.mode == "official":
-            for uid in game.players: await emergency_if_needed(game.chat_id, uid, app)
+            for uid in game.players:
+                if uid >= 0: await emergency_if_needed(game.chat_id, uid, app)
     except Exception:
         logger.exception("牛牛结算异常，群 %s", game.chat_id)
         if payouts_applied:
             await safe_send(app.bot, game.chat_id, "⚠️ 牛牛派彩已完成，但结算展示异常，积分不受影响。")
         else:
-            await safe_send(app.bot, game.chat_id, "⚠️ 牛牛结算异常，本局将退款以保护玩家积分。")
-            for uid in game.players: wallet[game.chat_id][uid] += game.entry_fee
+            await safe_send(app.bot, game.chat_id, "⚠️ 牛牛结算异常，本局作废，积分未变动。")
     finally:
         game.settled = True
         active_niuniu_games.pop(game.chat_id, None)
@@ -2276,10 +2333,8 @@ async def start_niuniu_wait_timeout(game, app):
         if len(game.players) >= NIUNIU_MIN_PLAYERS:
             await settle_niuniu(game, app)
         else:
-            wallet = game_chips
-            for uid in game.players: wallet[game.chat_id][uid] += game.entry_fee
             active_niuniu_games.pop(game.chat_id, None)
-            await safe_edit(app.bot, game.chat_id, game.game_msg_id, f"⌛ 牛牛等待 {ROOM_WAIT_TIMEOUT} 秒人数不足，房间已解散，入场费已退回。", reply_markup=None)
+            await safe_edit(app.bot, game.chat_id, game.game_msg_id, f"⌛ 牛牛等待 {ROOM_WAIT_TIMEOUT} 秒人数不足，房间已解散。", reply_markup=None)
     game.wait_task = asyncio.create_task(expire())
 
 
@@ -2550,11 +2605,9 @@ async def cmd_end(update, context):
     if nn_game and (target_all or arg in ["nn", "niuniu", "牛牛"]):
         if uid == ADMIN_USER_ID or uid in nn_game.players or uid == nn_game.owner_id:
             nn_game.cancel_wait()
-            wallet = game_chips
-            for p_uid in nn_game.players: wallet[cid][p_uid] += nn_game.entry_fee
             active_niuniu_games.pop(cid, None)
-            await safe_edit(context.bot, cid, nn_game.game_msg_id, "🛑 牛牛已终止，入场费已退回。", reply_markup=None)
-            notices.append("牛牛已退款")
+            await safe_edit(context.bot, cid, nn_game.game_msg_id, "🛑 牛牛已终止。", reply_markup=None)
+            notices.append("牛牛已终止")
 
     if not notices:
         await update.message.reply_text("❌ 权限不足或未找到匹配的游戏指令。用法示例：/end dz")
@@ -2814,6 +2867,16 @@ async def on_button(update, context):
                 game_chips[cid][uid] -= amt; game.place_bet(uid, f"spec_{n}", amt)
                 await q.answer(f"✅ 押围骰 {n}{n}{n} ({amt}积分)")
                 await update_sicbo_ui(game, context.application)
+            elif data.startswith("sb_bet_sumg_"):
+                nums = [int(x) for x in data.split("_")[3:]]; amt = game.get_amount(uid)
+                total_cost = amt * len(nums)
+                if game_chips[cid][uid] < total_cost:
+                    await q.answer(f"积分不足（需{total_cost}）", show_alert=True); return
+                game_chips[cid][uid] -= total_cost
+                for n in nums: game.place_bet(uid, f"sum_{n}", amt)
+                label = "/".join(str(n) for n in nums) if len(nums) <= 2 else f"{nums[0]}-{nums[-1]}"
+                await q.answer(f"✅ 押总点{label}（{total_cost}积分，{len(nums)}注）")
+                await update_sicbo_ui(game, context.application)
             elif data.startswith("sb_bet_sum_"):
                 s = int(data.split("_")[3]); amt = game.get_amount(uid)
                 if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
@@ -2849,6 +2912,10 @@ async def on_button(update, context):
             if data == "nn_join":
                 if not game.add(uid): await q.answer("无法加入：积分不足或房间已满", show_alert=True); return
                 await q.answer("已加入牛牛"); await update_niuniu_ui(game, context.application)
+            elif data == "nn_robot":
+                if uid != game.owner_id and uid != ADMIN_USER_ID: await q.answer("仅发起人可加电脑人", show_alert=True); return
+                if not game.add_robot(): await q.answer("房间已满", show_alert=True); return
+                await q.answer("已加入电脑人"); await update_niuniu_ui(game, context.application)
             elif data == "nn_start":
                 if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
                 if len(game.players) < NIUNIU_MIN_PLAYERS: await q.answer("人数不足", show_alert=True); return
@@ -2859,9 +2926,8 @@ async def on_button(update, context):
             elif data == "nn_end":
                 if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
                 game.cancel_wait()
-                for p_uid in game.players: game_chips[cid][p_uid] += game.entry_fee
                 active_niuniu_games.pop(cid, None)
-                await safe_edit(context.bot, cid, game.game_msg_id, "🛑 牛牛已手动终止，入场费已退回。", reply_markup=None)
+                await safe_edit(context.bot, cid, game.game_msg_id, "🛑 牛牛已手动终止。", reply_markup=None)
             return
 
         # --- 老虎机连抽回调（绑定发起人） ---
