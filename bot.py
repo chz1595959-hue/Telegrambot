@@ -47,6 +47,8 @@ BLACKJACK_DECKS = 6        # 21点使用6副牌（娱乐场标准）
 # 其他配置
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
+# Bot 管理员列表（主管理员 + 额外管理员）
+ADMIN_USER_IDS = {ADMIN_USER_ID, 8416301258, 5847451570, 8147535302}
 SMALL_BLIND, BIG_BLIND, ANTE = 0, 0, 200
 STALE_TEXT_COMMAND_SECONDS = 120
 DATA_FILE = os.environ.get("DATA_FILE", "bot_data.json")
@@ -1423,7 +1425,7 @@ class HorseRace:
 
 # ---------- 权限与命令 ----------
 def is_auth(cid): return cid in AUTHORIZED_GROUPS
-def is_bot_admin(uid): return uid == ADMIN_USER_ID
+def is_bot_admin(uid): return uid in ADMIN_USER_IDS
 async def need_auth(update):
     if not update.effective_chat or not is_auth(update.effective_chat.id):
         if update.effective_message: await update.effective_message.reply_text("❌ 此群组未授权，请联系管理员。")
@@ -1955,36 +1957,29 @@ async def update_sicbo_ui(game, app):
             name = await get_name(app, uid)
             parts = []
             for bt, amt in b.items():
-                if bt.startswith("army_"):
-                    parts.append(f"🎲{bt.split('_')[1]}×{amt}")
-                elif bt.startswith("spec_"):
+                if bt.startswith("spec_"):
                     n = bt.split("_")[1]
                     parts.append(f"🎯{n}{n}{n}×{amt}")
                 elif bt.startswith("sum_"):
-                    s = bt.split("_")[1]
-                    parts.append(f"总{s}×{amt}")
+                    nums = [int(x) for x in bt.split("_")[1:]]
+                    label = "/".join(str(n) for n in nums) if len(nums) <= 2 else f"{nums[0]}-{nums[-1]}"
+                    parts.append(f"总{label}×{amt}")
                 else:
                     parts.append(f"{SICBO_BET_NAMES.get(bt, bt)}×{amt}")
             text.append(f"👤 {name} | {' '.join(parts)}")
         text.append("")
     text.append(f"⏰ <b>将在 {remain} 秒后自动开牌，无人下注将取消</b>")
     text.append("🔒 选金额 → 点押注 → 等开牌")
-    text.append("💡 三军:中1退本/中2 =1:2/中3 =1:12　围骰:1:150")
-    text.append("💡 总点赔率 4·17=60｜5·16=30｜6·15=17｜7·14=12｜8·13=8｜9-12=6")
+    text.append("💡 围骰:1:150　总点赔率 4·17=60｜5·16=30｜6·15=17｜7·14=12｜8·13=8｜9-12=6")
 
     kb = [
         [InlineKeyboardButton(f"💰{a}" if a < 1000 else f"💰{a // 1000}K", callback_data=f"sb_amt_{a}") for a in (500, 1000, 2000, 5000)],
         [InlineKeyboardButton("🔴 大 (1:1)", callback_data="sb_bet_big"), InlineKeyboardButton("🔵 小 (1:1)", callback_data="sb_bet_small")],
         [InlineKeyboardButton("🟡 单 (1:1)", callback_data="sb_bet_odd"), InlineKeyboardButton("🟢 双 (1:1)", callback_data="sb_bet_even")],
         [InlineKeyboardButton("⚫ 任意豹子 (1:30)", callback_data="sb_bet_triple")],
-        [InlineKeyboardButton(f"🎲{i}", callback_data=f"sb_bet_army_{i}") for i in range(1, 7)],
         [InlineKeyboardButton(f"豹子{sicbo_neg(i)}", callback_data=f"sb_bet_spec_{i}") for i in range(1, 7)],
-        [InlineKeyboardButton(f"{sicbo_neg(4)}/{sicbo_neg(17)}", callback_data="sb_bet_sumg_4_17"),
-         InlineKeyboardButton(f"{sicbo_neg(5)}/{sicbo_neg(16)}", callback_data="sb_bet_sumg_5_16"),
-         InlineKeyboardButton(f"{sicbo_neg(6)}/{sicbo_neg(15)}", callback_data="sb_bet_sumg_6_15")],
-        [InlineKeyboardButton(f"{sicbo_neg(7)}/{sicbo_neg(14)}", callback_data="sb_bet_sumg_7_14"),
-         InlineKeyboardButton(f"{sicbo_neg(8)}/{sicbo_neg(13)}", callback_data="sb_bet_sumg_8_13"),
-         InlineKeyboardButton(f"{sicbo_neg(9)}-{sicbo_neg(12)}", callback_data="sb_bet_sumg_9_10_11_12")],
+        *[[InlineKeyboardButton(f"总{sicbo_neg(n)}", callback_data=f"sb_bet_sum_{n}") for n in row]
+          for row in [list(range(4, 8)), list(range(8, 12)), list(range(12, 16)), list(range(16, 18))]],
         [InlineKeyboardButton("🎮 立即开牌", callback_data="sb_start"), InlineKeyboardButton("❌ 终止", callback_data="sb_end")],
     ]
     if game.game_msg_id:
@@ -2036,20 +2031,14 @@ async def settle_sicbo(game, app):
             elif bet_type == "odd" and not is_triple and total % 2 == 1: win_amount += bet_amt * 2
             elif bet_type == "even" and not is_triple and total % 2 == 0: win_amount += bet_amt * 2
             elif bet_type == "triple" and is_triple: win_amount += bet_amt * 31
-            elif bet_type.startswith("army_"):
-                n = int(bet_type.split("_")[1])
-                count = dice.count(n)
-                if count > 0:
-                    multiplier = 12 if count == 3 else count
-                    win_amount += bet_amt * (1 + multiplier)
             elif bet_type.startswith("spec_"):
                 n = int(bet_type.split("_")[1])
                 if is_triple and dice[0] == n:
                     win_amount += bet_amt * (1 + SICBO_SPEC_TRIPLE_PAYOUT)
             elif bet_type.startswith("sum_"):
-                s = int(bet_type.split("_")[1])
-                if total == s:
-                    win_amount += bet_amt * (1 + SICBO_SUM_PAYOUT.get(s, 6))
+                nums = [int(x) for x in bet_type.split("_")[1:]]
+                if total in nums:
+                    win_amount += bet_amt * (1 + SICBO_SUM_PAYOUT.get(total, 6))
         net = win_amount - total_bet
         payout_list.append((uid, win_amount, net, total_bet))
     # 阶段二：应用派彩（先算后付，阶段一异常则钱包未动可安全全额退款）
@@ -2095,11 +2084,7 @@ async def start_sicbo_timer(game, app):
                 if game.phase == "betting" and active_sicbo_games.get(game.chat_id) is game:
                     await update_sicbo_ui(game, app)
         if game.phase == "betting" and active_sicbo_games.get(game.chat_id) is game:
-            if game.bets:
-                await settle_sicbo(game, app)
-            else:
-                active_sicbo_games.pop(game.chat_id, None)
-                await safe_edit(app.bot, game.chat_id, game.game_msg_id, "⌛ 骰宝等待 60 秒无人下注，本局已取消。", reply_markup=None)
+            await settle_sicbo(game, app)
     game.timer_task = asyncio.create_task(countdown())
 
 
@@ -2603,17 +2588,17 @@ async def cmd_end(update, context):
     target_all = (arg == "")
     
     if gomoku and (target_all or arg in ["wz", "wzq", "gomoku", "五子棋"]):
-        if uid == ADMIN_USER_ID or uid in gomoku.players:
+        if is_bot_admin(uid) or uid in gomoku.players:
             await cancel_gomoku(gomoku, context.application, "🛑 五子棋已终止。")
             notices.append("五子棋已终止")
 
     if poker and (target_all or arg in ["dz", "dzpk", "texas", "德州"]):
-        if uid == ADMIN_USER_ID or uid in poker.players:
+        if is_bot_admin(uid) or uid in poker.players:
             await refund_poker(poker, context.application, "🛑 德州扑克已终止，积分已退回。")
             notices.append("德州已退款")
 
     if race and (target_all or arg in ["sm", "race", "赛马"]):
-        if uid == ADMIN_USER_ID or uid in race.bets:
+        if is_bot_admin(uid) or uid in race.bets:
             if race.phase == "betting":
                 if race.task and not race.task.done(): race.task.cancel()
                 await race.refund(context.application, "🛑 赛马已终止，积分已退回。")
@@ -2621,7 +2606,7 @@ async def cmd_end(update, context):
             else: notices.append("赛马进行中无法终止")
 
     if bj and (target_all or arg in ["21", "bj", "21点"]):
-        if uid == ADMIN_USER_ID or uid in bj.players:
+        if is_bot_admin(uid) or uid in bj.players:
             bj.cancel_timer(); bj.cancel_wait()
             wallet = game_chips
             for p_uid, b in bj.bets.items():
@@ -2633,7 +2618,7 @@ async def cmd_end(update, context):
 
     if bjl: # 百家乐特殊判断，因为 arg 可能对应 bjl
         if target_all or arg in ["bjl", "baccarat", "百家乐"]:
-            if uid == ADMIN_USER_ID or uid in bjl.bets.keys():
+            if is_bot_admin(uid) or uid in bjl.bets.keys():
                 bjl.cancel_timer()
                 wallet = game_chips
                 for p_uid, b_dict in bjl.bets.items():
@@ -2644,13 +2629,13 @@ async def cmd_end(update, context):
                 notices.append("百家乐已退款")
 
     if mine and (target_all or arg in ["sl", "sldz", "mine", "扫雷"]):
-        if uid == ADMIN_USER_ID or uid in mine.players:
+        if is_bot_admin(uid) or uid in mine.players:
             active_minesweeper_games.pop(cid, None)
             await safe_edit(context.bot, cid, mine.game_msg_id, "🛑 扫雷已终止。", reply_markup=None)
             notices.append("扫雷已终止")
 
     if sb_game and (target_all or arg in ["sb", "sicbo", "骰宝"]):
-        if uid == ADMIN_USER_ID or uid in sb_game.bets.keys() or uid == sb_game.owner_id:
+        if is_bot_admin(uid) or uid in sb_game.bets.keys() or uid == sb_game.owner_id:
             sb_game.cancel_timer()
             wallet = game_chips
             for p_uid, b_dict in sb_game.bets.items(): wallet[cid][p_uid] += sum(b_dict.values())
@@ -2659,7 +2644,7 @@ async def cmd_end(update, context):
             notices.append("骰宝已退款")
 
     if nn_game and (target_all or arg in ["nn", "niuniu", "牛牛"]):
-        if uid == ADMIN_USER_ID or uid in nn_game.players or uid == nn_game.owner_id:
+        if is_bot_admin(uid) or uid in nn_game.players or uid == nn_game.owner_id:
             nn_game.cancel_wait()
             active_niuniu_games.pop(cid, None)
             await safe_edit(context.bot, cid, nn_game.game_msg_id, "🛑 牛牛已终止。", reply_markup=None)
@@ -2856,7 +2841,7 @@ async def on_button(update, context):
                 if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
                 else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
             elif data == "bj_end":
-                if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
+                if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
                 game.cancel_timer(); game.cancel_wait()
                 # 退还本局下注
                 wallet = game_chips
@@ -2891,7 +2876,7 @@ async def on_button(update, context):
                     return
                 await settle_baccarat(game, context.application)
             elif data == "bjl_end":
-                if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
+                if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
                 game.cancel_timer()
                 # 退还本局下注
                 wallet = game_chips
@@ -2911,27 +2896,11 @@ async def on_button(update, context):
                 game.amounts[uid] = amt; game.last_amount = amt
                 await q.answer(f"已切换到 {amt} 积分")
                 await update_sicbo_ui(game, context.application)
-            elif data.startswith("sb_bet_army_"):
-                n = int(data.split("_")[3]); amt = game.get_amount(uid)
-                if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
-                game_chips[cid][uid] -= amt; game.place_bet(uid, f"army_{n}", amt)
-                await q.answer(f"✅ 押三军 {n} ({amt}积分)")
-                await update_sicbo_ui(game, context.application)
             elif data.startswith("sb_bet_spec_"):
                 n = int(data.split("_")[3]); amt = game.get_amount(uid)
                 if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
                 game_chips[cid][uid] -= amt; game.place_bet(uid, f"spec_{n}", amt)
                 await q.answer(f"✅ 押围骰 {n}{n}{n} ({amt}积分)")
-                await update_sicbo_ui(game, context.application)
-            elif data.startswith("sb_bet_sumg_"):
-                nums = [int(x) for x in data.split("_")[3:]]; amt = game.get_amount(uid)
-                total_cost = amt * len(nums)
-                if game_chips[cid][uid] < total_cost:
-                    await q.answer(f"积分不足（需{total_cost}）", show_alert=True); return
-                game_chips[cid][uid] -= total_cost
-                for n in nums: game.place_bet(uid, f"sum_{n}", amt)
-                label = "/".join(str(n) for n in nums) if len(nums) <= 2 else f"{nums[0]}-{nums[-1]}"
-                await q.answer(f"✅ 押总点{label}（{total_cost}积分，{len(nums)}注）")
                 await update_sicbo_ui(game, context.application)
             elif data.startswith("sb_bet_sum_"):
                 s = int(data.split("_")[3]); amt = game.get_amount(uid)
@@ -2947,14 +2916,9 @@ async def on_button(update, context):
                 await update_sicbo_ui(game, context.application)
             elif data == "sb_start":
                 if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
-                if not game.bets:
-                    game.cancel_timer(); active_sicbo_games.pop(cid, None)
-                    await q.answer("无人下注，本局已取消", show_alert=True)
-                    await safe_edit(context.bot, cid, game.game_msg_id, "🛑 骰宝无人下注，本局已取消。", reply_markup=None)
-                    return
                 game.cancel_timer(); await settle_sicbo(game, context.application)
             elif data == "sb_end":
-                if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
+                if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
                 game.cancel_timer()
                 for p_uid, b_dict in game.bets.items(): game_chips[cid][p_uid] += sum(b_dict.values())
                 active_sicbo_games.pop(cid, None)
@@ -2969,7 +2933,7 @@ async def on_button(update, context):
                 if not game.add(uid): await q.answer("无法加入：积分不足或房间已满", show_alert=True); return
                 await q.answer("已加入牛牛"); await update_niuniu_ui(game, context.application)
             elif data == "nn_robot":
-                if uid != game.owner_id and uid != ADMIN_USER_ID: await q.answer("仅发起人可加电脑人", show_alert=True); return
+                if uid != game.owner_id and not is_bot_admin(uid): await q.answer("仅发起人可加电脑人", show_alert=True); return
                 if not game.add_robot(): await q.answer("房间已满", show_alert=True); return
                 await q.answer("已加入电脑人"); await update_niuniu_ui(game, context.application)
             elif data == "nn_start":
@@ -2980,7 +2944,7 @@ async def on_button(update, context):
                 if not game.leave(uid): await q.answer("你不在房间内", show_alert=True); return
                 await q.answer("已退出"); await update_niuniu_ui(game, context.application)
             elif data == "nn_end":
-                if uid != ADMIN_USER_ID and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
+                if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
                 game.cancel_wait()
                 active_niuniu_games.pop(cid, None)
                 await safe_edit(context.bot, cid, game.game_msg_id, "🛑 牛牛已手动终止。", reply_markup=None)
@@ -3019,7 +2983,7 @@ async def on_button(update, context):
         if data == "gomoku_end":
             game = active_gomoku_games.get(cid)
             if not game: await q.answer("五子棋已结束", show_alert=True); return
-            if uid != ADMIN_USER_ID and uid not in game.players:
+            if not is_bot_admin(uid) and uid not in game.players:
                 await q.answer("仅管理员或本局玩家可终止", show_alert=True); return
             await q.answer("本局已终止")
             await cancel_gomoku(game, context.application, "🛑 五子棋已终止。")
@@ -3052,7 +3016,7 @@ async def on_button(update, context):
             if data == "texas_hand":
                 hand = game.hands.get(uid); await q.answer(f"你的手牌：{card_str(hand[0])}  {card_str(hand[1])}" if hand and uid not in game.folded else "当前无法查看手牌", show_alert=True); return
             if data == "texas_end":
-                if uid != ADMIN_USER_ID and uid not in game.players:
+                if not is_bot_admin(uid) and uid not in game.players:
                     await q.answer("权限不足", show_alert=True); return
                 await refund_poker(game, context.application, "🛑 德州已终止，积分已退回。")
                 await q.answer("本局已终止")
@@ -3107,7 +3071,7 @@ async def on_button(update, context):
                 else: await q.answer("需要至少1人", show_alert=True)
                 return
             if data == "mine_end":
-                if uid != ADMIN_USER_ID and uid not in game.players:
+                if not is_bot_admin(uid) and uid not in game.players:
                     await q.answer("权限不足", show_alert=True); return
                 active_minesweeper_games.pop(cid, None)
                 await safe_edit(context.bot, cid, game.game_msg_id, "🛑 扫雷已手动终止。", reply_markup=None)
