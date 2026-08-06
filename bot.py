@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest, RetryAfter, TelegramError
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 from treys import Card, Evaluator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -96,7 +96,7 @@ baccarat_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(in
 slot_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 sicbo_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 niuniu_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-sicbo_history = defaultdict(list)  # 骰宝路书：大🔴 小🔵 单🟡 双🟢 豹子⚫
+sicbo_history = defaultdict(list)  # 骰子路书：大🔴 小🔵 单🟡 双🟢 豹子⚫
 sicbo_daily_stats = defaultdict(lambda: {"big": 0, "small": 0, "triple": 0})
 race_jackpot = defaultdict(int)
 hourly_race_enabled = defaultdict(lambda: False)
@@ -1432,7 +1432,7 @@ async def need_auth(update):
         return False
     return True
 
-async def cmd_start(update, context): await update.message.reply_text("🎮 欢迎使用娱乐机器人！\n\n可用命令：\n/dz - 发起德州扑克\n/sm - 发起赛马\n/wz - 发起五子棋\n/sl - 发起扫雷\n/lhj - 老虎机抽奖\n/21 - 发起21点\n/bjl - 发起百家乐\n\n📊 数据查询：\n/cx - 当日盈亏榜\n/ph - 总积分榜\n/end - 终止当前游戏")
+async def cmd_start(update, context): await update.message.reply_text("🎮 欢迎使用娱乐机器人！\n\n🎲 发起游戏：\n/开始 或 /菜单 - 查看本帮助\n/德州 - 发起德州扑克\n/赛马 - 发起赛马\n/五子棋 - 发起五子棋\n/扫雷 - 发起扫雷\n/老虎机 - 老虎机抽奖\n/21点 - 发起21点\n/百家乐 - 发起百家乐\n/骰子 - 发起骰子\n/牛牛 - 发起牛牛\n\n📊 数据查询：\n/盈亏 - 当日盈亏榜\n/排行 - 总积分榜\n/结束 - 终止当前游戏\n\n（旧英文命令 /dz /sm /sb … 仍可继续使用）")
 
 async def gomoku_wait_timeout(game, app):
     await asyncio.sleep(ROOM_WAIT_TIMEOUT)
@@ -1867,7 +1867,7 @@ async def cmd_bjl(update, context):
     active_baccarat_games[cid] = game
     await update_baccarat_ui(game, context.application)  # 直接发送押注界面，无"准备中"占位
     await start_baccarat_timer(game, context.application)
-# ==================== 骰宝 ====================
+# ==================== 骰子 ====================
 
 SICBO_FIXED_BET = 500
 SICBO_BET_NAMES = {"big": "🔴大", "small": "🔵小", "odd": "🟡单", "even": "🟢双", "triple": "⚫豹子"}
@@ -1911,7 +1911,7 @@ class SicboGame:
         if uid not in self.bets:
             self.bets[uid] = {}
         self.bets[uid][bet_type] = self.bets[uid].get(bet_type, 0) + amount
-        # 退款保护：记录该玩家在骰宝的累计下注额，重启时据此退还，避免丢积分
+        # 退款保护：记录该玩家在骰子的累计下注额，重启时据此退还，避免丢积分
         pending_game_bets[self.chat_id][uid]["sicbo"] = {
             "amount": sum(self.bets[uid].values()),
             "mode": self.mode,
@@ -1942,7 +1942,7 @@ async def update_sicbo_ui(game, app):
     pool_total = sum(sum(b.values()) for b in game.bets.values())
 
     text = [
-        "🎲 <b>骰宝 大赛</b> 🎲",
+        "🎲 <b>骰子 大赛</b> 🎲",
         "━━━━━━━━━━━━━━━━━",
         "📊 <b>当日统计</b>",
         f"{stats_text}",
@@ -1994,7 +1994,7 @@ async def settle_sicbo(game, app):
     if getattr(game, "settled", False):
         return
     game.settled = True
-    await safe_edit(app.bot, game.chat_id, game.game_msg_id, "🎲 <b>骰宝</b>\n━━━━━━━━━━━━━━━━━\n🎲 <b>正在摇骰子...</b>", reply_markup=None, parse_mode="HTML")
+    await safe_edit(app.bot, game.chat_id, game.game_msg_id, "🎲 <b>骰子</b>\n━━━━━━━━━━━━━━━━━\n🎲 <b>正在摇骰子...</b>", reply_markup=None, parse_mode="HTML")
     await asyncio.sleep(1.5)
     dice, total, is_triple = game.play()
     if is_triple:
@@ -2010,7 +2010,7 @@ async def settle_sicbo(game, app):
     dice_display = " ".join(f"🎲{d}" for d in dice)
     result_names = {"big": "🔴 大", "small": "🔵 小", "triple": "⚫ 豹子"}
     parity = "单" if total % 2 == 1 else "双"
-    text = f"🎲 <b>骰宝 结算</b>\n\n{dice_display}\n点数总和：<b>{total}</b> ({parity})\n结果：<b>{result_names[result]}</b>"
+    text = f"🎲 <b>骰子 结算</b>\n\n{dice_display}\n点数总和：<b>{total}</b> ({parity})\n结果：<b>{result_names[result]}</b>"
     if is_triple: text += f" (豹子 {dice[0]})"
     text += "\n━━━━━━━━━━━━━━━━━\n"
 
@@ -2055,18 +2055,18 @@ async def settle_sicbo(game, app):
         text += "\n\n".join(lines) if lines else "本局无人盈亏。"
         if game.mode == "official":
             rank = sorted(total_profit_by_game(sicbo_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
-            text += "\n\n🏆 <b>骰宝 累计盈利榜</b>\n"
+            text += "\n\n🏆 <b>骰子 累计盈利榜</b>\n"
             text += "\n".join([f"{rank_marker(i)} {name_map.get(u, f'玩家{u}')}：{a:+d}" for i, (u, a) in enumerate(rank, 1)])
         await safe_delete(app.bot, game.chat_id, game.game_msg_id)
         await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
         if game.mode == "official":
             for uid in game.bets.keys(): await emergency_if_needed(game.chat_id, uid, app)
     except Exception:
-        logger.exception("骰宝结算异常，群 %s", game.chat_id)
+        logger.exception("骰子结算异常，群 %s", game.chat_id)
         if payouts_applied:
-            await safe_send(app.bot, game.chat_id, "⚠️ 骰宝派彩已完成，但结算展示异常，积分不受影响。")
+            await safe_send(app.bot, game.chat_id, "⚠️ 骰子派彩已完成，但结算展示异常，积分不受影响。")
         else:
-            await safe_send(app.bot, game.chat_id, "⚠️ 骰宝结算异常，本局将退款以保护玩家积分。")
+            await safe_send(app.bot, game.chat_id, "⚠️ 骰子结算异常，本局将退款以保护玩家积分。")
             for uid, bets in game.bets.items(): wallet[game.chat_id][uid] += sum(bets.values())
     finally:
         active_sicbo_games.pop(game.chat_id, None)
@@ -2092,7 +2092,7 @@ async def cmd_sb(update, context):
     if not await need_auth(update): return
     cid, uid = update.effective_chat.id, update.effective_user.id
     if cid in active_sicbo_games:
-        await update.message.reply_text("当前已有 骰宝 进行中。"); return
+        await update.message.reply_text("当前已有 骰子 进行中。"); return
     game = SicboGame(cid, uid, current_game_mode())
     active_sicbo_games[cid] = game
     await update_sicbo_ui(game, context.application)
@@ -2634,14 +2634,14 @@ async def cmd_end(update, context):
             await safe_edit(context.bot, cid, mine.game_msg_id, "🛑 扫雷已终止。", reply_markup=None)
             notices.append("扫雷已终止")
 
-    if sb_game and (target_all or arg in ["sb", "sicbo", "骰宝"]):
+    if sb_game and (target_all or arg in ["sb", "sicbo", "骰子"]):
         if is_bot_admin(uid) or uid in sb_game.bets.keys() or uid == sb_game.owner_id:
             sb_game.cancel_timer()
             wallet = game_chips
             for p_uid, b_dict in sb_game.bets.items(): wallet[cid][p_uid] += sum(b_dict.values())
             active_sicbo_games.pop(cid, None)
-            await safe_edit(context.bot, cid, sb_game.game_msg_id, "🛑 骰宝已终止，积分已退回。", reply_markup=None)
-            notices.append("骰宝已退款")
+            await safe_edit(context.bot, cid, sb_game.game_msg_id, "🛑 骰子已终止，积分已退回。", reply_markup=None)
+            notices.append("骰子已退款")
 
     if nn_game and (target_all or arg in ["nn", "niuniu", "牛牛"]):
         if is_bot_admin(uid) or uid in nn_game.players or uid == nn_game.owner_id:
@@ -2887,7 +2887,7 @@ async def on_button(update, context):
                 await safe_edit(context.bot, cid, game.game_msg_id, "🛑 百家乐已手动终止，积分已退回。", reply_markup=None)
             return
 
-        # --- 骰宝 回调 ---
+        # --- 骰子 回调 ---
         if data.startswith("sb_"):
             game = active_sicbo_games.get(cid)
             if not game: await q.answer("游戏已结束", show_alert=True); return
@@ -2922,7 +2922,7 @@ async def on_button(update, context):
                 game.cancel_timer()
                 for p_uid, b_dict in game.bets.items(): game_chips[cid][p_uid] += sum(b_dict.values())
                 active_sicbo_games.pop(cid, None)
-                await safe_edit(context.bot, cid, game.game_msg_id, "🛑 骰宝已手动终止，积分已退回。", reply_markup=None)
+                await safe_edit(context.bot, cid, game.game_msg_id, "🛑 骰子已手动终止，积分已退回。", reply_markup=None)
             return
 
         # --- 牛牛 回调 ---
@@ -3112,6 +3112,12 @@ async def on_text(update, context):
         if message.date and (datetime.now(timezone.utc) - message.date).total_seconds() > STALE_TEXT_COMMAND_SECONDS:
             return
         cid, text = update.effective_chat.id, message.text.strip()
+
+        # 不带 / 的命令直达：若首词是已知命令别名，按命令处理
+        _words = text.split()
+        if _words and _words[0] in CMD_ALIASES:
+            await _dispatch_alias(_words[0], _words[1:], update, context)
+            return
         
         # 统一刷新逻辑
         if text in ["棋盘", "刷新", "看棋", "board", "qp"]:
@@ -3392,6 +3398,62 @@ async def post_shutdown(app):
     force_save_now()
 
 
+# 命令路由：支持中文命令（Telegram 命令菜单只认拉丁字符，故用 MessageHandler 解析 /中文）
+CMD_ALIASES = {
+    # 中文命令
+    "开始": cmd_start, "菜单": cmd_start, "帮助": cmd_start,
+    "德州": cmd_dz, "德州扑克": cmd_dz,
+    "赛马": cmd_sm,
+    "五子棋": cmd_wz,
+    "扫雷": cmd_sl,
+    "老虎机": cmd_lhj,
+    "21点": cmd_21, "二十一点": cmd_21,
+    "百家乐": cmd_bjl,
+    "结束": cmd_end,
+    "加积分": cmd_add, "加分": cmd_add,
+    "加德州": cmd_adddz,
+    "减积分": cmd_reduce, "减分": cmd_reduce,
+    "盈亏": cmd_cx, "查询": cmd_cx,
+    "排行": cmd_ph, "排行榜": cmd_ph, "积分榜": cmd_ph, "积分": cmd_ph,
+    "授权": cmd_sq,
+    "取消授权": cmd_qxshouquan,
+    "自动扫雷": cmd_autosm,
+    "备份": cmd_backup,
+    "恢复": cmd_restore,
+    "骰子": cmd_sb,
+    "牛牛": cmd_nn,
+    # 旧英文/数字别名（保留兼容，仍可用）
+    "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm, "wz": cmd_wz, "sl": cmd_sl,
+    "lhj": cmd_lhj, "21": cmd_21, "bjl": cmd_bjl, "gomoku": cmd_wz, "end": cmd_end,
+    "END": cmd_end, "add": cmd_add, "adddz": cmd_adddz, "reduce": cmd_reduce,
+    "cx": cmd_cx, "ph": cmd_ph, "sq": cmd_sq, "qxshouquan": cmd_qxshouquan,
+    "autosm": cmd_autosm, "backup": cmd_backup, "restore": cmd_restore,
+    "sb": cmd_sb, "nn": cmd_nn,
+}
+
+async def _dispatch_alias(cmd, args, update, context):
+    """根据命令别名（无论带不带 /）分发到对应处理函数，并填充 context.args。"""
+    handler = CMD_ALIASES.get(cmd)
+    if not handler:
+        await update.message.reply_text("❓ 未知命令，发送 /开始 查看可用命令")
+        return
+    context.args = args
+    await handler(update, context)
+
+
+async def route_command(update, context):
+    """把 /中文 或 /英文 命令路由到对应处理函数。"""
+    if not update.message or not update.message.text:
+        return
+    parts = update.message.text.strip().split()
+    if not parts or not parts[0].startswith("/"):
+        return
+    cmd = parts[0][1:]
+    if "@" in cmd:
+        cmd = cmd.split("@", 1)[0]
+    await _dispatch_alias(cmd, parts[1:], update, context)
+
+
 def main():
     global save_event
     token = os.environ.get("BOT_TOKEN")
@@ -3405,8 +3467,8 @@ def main():
         builder = builder.max_concurrent_updates(8)  # 新版 PTB：并发上限 8
     app = builder.build()  # 旧版 PTB：concurrent_updates(True) 默认上限 4
 
-    for command, handler in [("start",cmd_start),("dz",cmd_dz),("sm",cmd_sm),("wz",cmd_wz),("sl",cmd_sl),("lhj",cmd_lhj),("21",cmd_21),("bjl",cmd_bjl),("gomoku",cmd_wz),("end",cmd_end),("END",cmd_end),("add",cmd_add),("adddz",cmd_adddz),("reduce",cmd_reduce),("cx",cmd_cx),("ph",cmd_ph),("sq",cmd_sq),("qxshouquan",cmd_qxshouquan),("autosm",cmd_autosm),("backup",cmd_backup),("restore",cmd_restore),("sb",cmd_sb),("nn",cmd_nn)]: app.add_handler(CommandHandler(command, handler))
-    app.add_handler(CallbackQueryHandler(on_button)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^/'), route_command))
+    app.add_handler(CallbackQueryHandler(on_button)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(r'^/'), on_text))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__": main()
