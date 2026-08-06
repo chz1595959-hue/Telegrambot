@@ -1868,11 +1868,20 @@ async def cmd_bjl(update, context):
 # ==================== 骰宝 ====================
 
 SICBO_FIXED_BET = 500
-DICE_FACES = {1: "⚀", 2: "⚁", 3: "⚂", 4: "⚃", 5: "⚄", 6: "⚅"}
 SICBO_BET_NAMES = {"big": "🔴大", "small": "🔵小", "odd": "🟡单", "even": "🟢双", "triple": "⚫豹子"}
 SICBO_SPEC_TRIPLE_PAYOUT = 150  # 围骰（特定豹子）1赔150
 SICBO_SUM_PAYOUT = {4: 60, 5: 30, 6: 17, 7: 12, 8: 8, 9: 6, 10: 6,
                     11: 6, 12: 6, 13: 8, 14: 12, 15: 17, 16: 30, 17: 60}
+
+
+def sicbo_history_token(entry):
+    """路书单条渲染：旧格式字符串 big/small/triple，新格式 [sum, is_triple]"""
+    if isinstance(entry, str):
+        return {"big": "🔴", "small": "🔵", "triple": "⚫"}.get(entry, "")
+    s, trip = entry[0], entry[1]
+    if trip:
+        return f"⚫{s}"
+    return f"🔴{s}" if s >= 11 else f"🔵{s}"
 
 
 def sicbo_neg(n):
@@ -1888,6 +1897,7 @@ class SicboGame:
     def __init__(self, cid, owner_id, mode=None):
         self.chat_id, self.owner_id, self.mode = cid, owner_id, mode or current_game_mode()
         self.phase = "betting"
+        self.settled = False
         self.bets = {}      # {uid: {bet_type: amount}}
         self.amounts = {}   # {uid: selected_amount} 每玩家自选金额
         self.last_amount = SICBO_FIXED_BET  # 界面参考值
@@ -1899,6 +1909,11 @@ class SicboGame:
         if uid not in self.bets:
             self.bets[uid] = {}
         self.bets[uid][bet_type] = self.bets[uid].get(bet_type, 0) + amount
+        # 退款保护：记录该玩家在骰宝的累计下注额，重启时据此退还，避免丢积分
+        pending_game_bets[self.chat_id][uid]["sicbo"] = {
+            "amount": sum(self.bets[uid].values()),
+            "mode": self.mode,
+        }
 
     def get_amount(self, uid):
         return self.amounts.get(uid, SICBO_FIXED_BET)
@@ -1918,8 +1933,7 @@ class SicboGame:
 async def update_sicbo_ui(game, app):
     if game.phase != "betting": return
     remain = max(0, int(ROOM_WAIT_TIMEOUT - (time.time() - game.create_time)))
-    history_icons = {"big": "🔴", "small": "🔵", "triple": "⚫"}
-    history_list = "".join(history_icons.get(r, "") for r in sicbo_history[game.chat_id][-12:]) or "暂无"
+    history_list = "".join(sicbo_history_token(r) for r in sicbo_history[game.chat_id][-12:]) or "暂无"
     stats = sicbo_daily_stats[game.chat_id]
     total_stats = sum(stats.values())
     stats_text = f"🔵小{stats['small']} | 🔴大{stats['big']} | ⚫豹子{stats['triple']} (共{total_stats}局)" if total_stats > 0 else "暂无数据"
@@ -1981,6 +1995,10 @@ async def update_sicbo_ui(game, app):
 
 
 async def settle_sicbo(game, app):
+    # 重入保护：手动开牌与 60 秒定时器可能同时触发，只派一次彩
+    if getattr(game, "settled", False):
+        return
+    game.settled = True
     await safe_edit(app.bot, game.chat_id, game.game_msg_id, "🎲 <b>骰宝</b>\n━━━━━━━━━━━━━━━━━\n🎲 <b>正在摇骰子...</b>", reply_markup=None, parse_mode="HTML")
     await asyncio.sleep(1.5)
     dice, total, is_triple = game.play()
@@ -1991,10 +2009,10 @@ async def settle_sicbo(game, app):
     else:
         result = "small"
     if game.mode == "official":
-        sicbo_history[game.chat_id] = (sicbo_history[game.chat_id] + [result])[-12:]
+        sicbo_history[game.chat_id] = (sicbo_history[game.chat_id] + [(total, is_triple)])[-12:]
         sicbo_daily_stats[game.chat_id][result] += 1
 
-    dice_display = " ".join(DICE_FACES[d] for d in dice)
+    dice_display = " ".join(f"🎲{d}" for d in dice)
     result_names = {"big": "🔴 大", "small": "🔵 小", "triple": "⚫ 豹子"}
     parity = "单" if total % 2 == 1 else "双"
     text = f"🎲 <b>骰宝 结算</b>\n\n{dice_display}\n点数总和：<b>{total}</b> ({parity})\n结果：<b>{result_names[result]}</b>"
@@ -2002,39 +2020,44 @@ async def settle_sicbo(game, app):
     text += "\n━━━━━━━━━━━━━━━━━\n"
 
     date = business_date()
-    wallet = game_chips
-    lines = []
-    payouts_applied = False
     bet_uids = list(game.bets.keys())
     name_map = {}
     for uid in bet_uids:
         try: name_map[uid] = await get_name(app, uid)
         except Exception: name_map[uid] = f"玩家{uid}"
+    # 阶段一：先计算每位玩家派彩（不动钱包，异常时不会误退已发放玩家的钱）
+    payout_list = []
+    for uid, bets in game.bets.items():
+        win_amount = 0
+        total_bet = sum(bets.values())
+        for bet_type, bet_amt in bets.items():
+            if bet_type == "big" and result == "big": win_amount += bet_amt * 2
+            elif bet_type == "small" and result == "small": win_amount += bet_amt * 2
+            elif bet_type == "odd" and not is_triple and total % 2 == 1: win_amount += bet_amt * 2
+            elif bet_type == "even" and not is_triple and total % 2 == 0: win_amount += bet_amt * 2
+            elif bet_type == "triple" and is_triple: win_amount += bet_amt * 31
+            elif bet_type.startswith("army_"):
+                n = int(bet_type.split("_")[1])
+                count = dice.count(n)
+                if count > 0:
+                    multiplier = 12 if count == 3 else count
+                    win_amount += bet_amt * (1 + multiplier)
+            elif bet_type.startswith("spec_"):
+                n = int(bet_type.split("_")[1])
+                if is_triple and dice[0] == n:
+                    win_amount += bet_amt * (1 + SICBO_SPEC_TRIPLE_PAYOUT)
+            elif bet_type.startswith("sum_"):
+                s = int(bet_type.split("_")[1])
+                if total == s:
+                    win_amount += bet_amt * (1 + SICBO_SUM_PAYOUT.get(s, 6))
+        net = win_amount - total_bet
+        payout_list.append((uid, win_amount, net, total_bet))
+    # 阶段二：应用派彩（先算后付，阶段一异常则钱包未动可安全全额退款）
+    wallet = game_chips
+    lines = []
+    payouts_applied = False
     try:
-        for uid, bets in game.bets.items():
-            win_amount = 0
-            total_bet = sum(bets.values())
-            for bet_type, bet_amt in bets.items():
-                if bet_type == "big" and result == "big": win_amount += bet_amt * 2
-                elif bet_type == "small" and result == "small": win_amount += bet_amt * 2
-                elif bet_type == "odd" and not is_triple and total % 2 == 1: win_amount += bet_amt * 2
-                elif bet_type == "even" and not is_triple and total % 2 == 0: win_amount += bet_amt * 2
-                elif bet_type == "triple" and is_triple: win_amount += bet_amt * 31
-                elif bet_type.startswith("army_"):
-                    n = int(bet_type.split("_")[1])
-                    count = dice.count(n)
-                    if count > 0:
-                        multiplier = 12 if count == 3 else count
-                        win_amount += bet_amt * (1 + multiplier)
-                elif bet_type.startswith("spec_"):
-                    n = int(bet_type.split("_")[1])
-                    if is_triple and dice[0] == n:
-                        win_amount += bet_amt * (1 + SICBO_SPEC_TRIPLE_PAYOUT)
-                elif bet_type.startswith("sum_"):
-                    s = int(bet_type.split("_")[1])
-                    if total == s:
-                        win_amount += bet_amt * (1 + SICBO_SUM_PAYOUT.get(s, 6))
-            net = win_amount - total_bet
+        for uid, win_amount, net, total_bet in payout_list:
             wallet[game.chat_id][uid] += win_amount
             if game.mode == "official": sicbo_profit_by_date[date][game.chat_id][uid] += net
             if net != 0: lines.append(f"👤 {name_map[uid]}\n盈亏：{net:+d}")
@@ -2146,6 +2169,8 @@ class NiuNiuGame:
         return True
 
     def start(self):
+        if self.phase != "waiting":
+            return False
         if len(self.players) < NIUNIU_MIN_PLAYERS:
             return False
         self.phase = "dealing"
@@ -2239,6 +2264,8 @@ async def update_niuniu_ui(game, app):
 
 
 async def settle_niuniu(game, app):
+    if game.settled or game.phase != "waiting":
+        return
     if not game.start():
         return
     await safe_edit(app.bot, game.chat_id, game.game_msg_id, "🐂 <b>牛牛</b>\n━━━━━━━━━━━━━━━━━\n🎴 <b>正在发牌...</b>", reply_markup=None, parse_mode="HTML")
@@ -2258,45 +2285,58 @@ async def settle_niuniu(game, app):
 
     # 第一阶段：计算所有输赢（不操作钱包）
     results = []
-    dealer_net = 0
     for uid in game.players:
         if uid == dealer_uid: continue
         p_niu = game.niu_info[uid][0]
         p_win = p_niu > dealer_niu or (p_niu == dealer_niu and game.max_card(uid) > game.max_card(dealer_uid))
-        if p_win:
-            amount = game.entry_fee * NIU_MULT[p_niu]
-        else:
-            amount = game.entry_fee * dealer_mult
-        net_player = amount if p_win else -amount
-        dealer_net -= net_player
-        results.append((uid, p_niu, p_win, amount, net_player))
+        amount = game.entry_fee * (NIU_MULT[p_niu] if p_win else dealer_mult)
+        results.append((uid, p_niu, p_win, amount))
 
-    # 第二阶段：操作钱包 + 记录盈亏
+    # 第二阶段：操作钱包 + 记录盈亏（庄家余额不足时按余额封顶赔付，杜绝负积分）
     wallet = game_chips
     date = business_date()
     payouts_applied = False
     lines = []
+    actual_dealer_delta = 0
 
     try:
-        for uid, p_niu, p_win, amount, net_player in results:
+        for uid, p_niu, p_win, amount in results:
             if p_win:
-                if uid >= 0: wallet[game.chat_id][uid] += amount
-                if dealer_uid >= 0: wallet[game.chat_id][dealer_uid] -= amount
+                # 闲家赢：从庄家获得 amount；庄家余额不足则按余额封顶
+                if dealer_uid >= 0:
+                    pay = min(amount, wallet[game.chat_id][dealer_uid])
+                    wallet[game.chat_id][dealer_uid] -= pay
+                    actual_dealer_delta -= pay
+                    gained = pay
+                else:
+                    gained = amount
+                if uid >= 0:
+                    wallet[game.chat_id][uid] += gained
+                actual_net = gained
             else:
-                if uid >= 0: wallet[game.chat_id][uid] -= amount
-                if dealer_uid >= 0: wallet[game.chat_id][dealer_uid] += amount
+                # 闲家输：向庄家支付 amount
+                if uid >= 0:
+                    wallet[game.chat_id][uid] -= amount
+                    paid = amount
+                else:
+                    paid = 0
+                if dealer_uid >= 0:
+                    wallet[game.chat_id][dealer_uid] += paid
+                    actual_dealer_delta += paid
+                actual_net = -paid
             if game.mode == "official":
-                if uid >= 0: niuniu_profit_by_date[date][game.chat_id][uid] += net_player
-                if dealer_uid >= 0: niuniu_profit_by_date[date][game.chat_id][dealer_uid] -= net_player
+                if uid >= 0: niuniu_profit_by_date[date][game.chat_id][uid] += actual_net
+                if dealer_uid >= 0: niuniu_profit_by_date[date][game.chat_id][dealer_uid] -= actual_net
 
             p_hand = game.hands[uid]
             p_combo = game.niu_info[uid][1]
             p_cards = format_niu_cards(p_hand, p_combo)
             result_icon = "✅" if p_win else "❌"
-            lines.append(f"  {result_icon} {name_map[uid]} | {p_cards} | <b>{NIU_NAMES[p_niu]}</b> | {net_player:+d}")
+            lines.append(f"  {result_icon} {name_map[uid]} | {p_cards} | <b>{NIU_NAMES[p_niu]}</b> | {actual_net:+d}")
             lines.append("")
 
         payouts_applied = True
+        dealer_net = actual_dealer_delta
 
         # 庄家牌展示
         d_hand = game.hands[dealer_uid]
