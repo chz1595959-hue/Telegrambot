@@ -1875,6 +1875,15 @@ SICBO_SUM_PAYOUT = {4: 60, 5: 30, 6: 17, 7: 12, 8: 8, 9: 6, 10: 6,
                     11: 6, 12: 6, 13: 8, 14: 12, 15: 17, 16: 30, 17: 60}
 
 
+def sicbo_neg(n):
+    """数字转 keycap 表情数字：1-9 直映，10=🔟，11-17 拆为 1️⃣+个位"""
+    if n <= 9:
+        return f"{n}\uFE0F\u20E3"
+    if n == 10:
+        return "\U0001F51F"
+    return "1\uFE0F\u20E3" + f"{n - 10}\uFE0F\u20E3"
+
+
 class SicboGame:
     def __init__(self, cid, owner_id, mode=None):
         self.chat_id, self.owner_id, self.mode = cid, owner_id, mode or current_game_mode()
@@ -1946,7 +1955,8 @@ async def update_sicbo_ui(game, app):
         text.append("")
     text.append(f"⏰ <b>将在 {remain} 秒后自动开牌，无人下注将取消</b>")
     text.append("🔒 选金额 → 点押注 → 等开牌")
-    text.append("💡 三军1/2/12 · 围骰1:150 · 总点4-17各不同赔率")
+    text.append("💡 三军:中1退本/中2 =1:2/中3 =1:12　围骰:1:150")
+    text.append("💡 总点赔率 4·17=60｜5·16=30｜6·15=17｜7·14=12｜8·13=8｜9-12=6")
 
     kb = [
         [InlineKeyboardButton(f"💰{a}" if a < 1000 else f"💰{a // 1000}K", callback_data=f"sb_amt_{a}") for a in (500, 1000, 2000, 5000)],
@@ -1954,13 +1964,13 @@ async def update_sicbo_ui(game, app):
         [InlineKeyboardButton("🟡 单 (1:1)", callback_data="sb_bet_odd"), InlineKeyboardButton("🟢 双 (1:1)", callback_data="sb_bet_even")],
         [InlineKeyboardButton("⚫ 任意豹子 (1:30)", callback_data="sb_bet_triple")],
         [InlineKeyboardButton(f"🎲{i}", callback_data=f"sb_bet_army_{i}") for i in range(1, 7)],
-        [InlineKeyboardButton(f"{i}{i}{i}×150", callback_data=f"sb_bet_spec_{i}") for i in range(1, 7)],
-        [InlineKeyboardButton("4/17×60", callback_data="sb_bet_sumg_4_17"),
-         InlineKeyboardButton("5/16×30", callback_data="sb_bet_sumg_5_16"),
-         InlineKeyboardButton("6/15×17", callback_data="sb_bet_sumg_6_15")],
-        [InlineKeyboardButton("7/14×12", callback_data="sb_bet_sumg_7_14"),
-         InlineKeyboardButton("8/13×8", callback_data="sb_bet_sumg_8_13"),
-         InlineKeyboardButton("9-12×6", callback_data="sb_bet_sumg_9_10_11_12")],
+        [InlineKeyboardButton(f"豹子{sicbo_neg(i)}", callback_data=f"sb_bet_spec_{i}") for i in range(1, 7)],
+        [InlineKeyboardButton(f"{sicbo_neg(4)}/{sicbo_neg(17)}", callback_data="sb_bet_sumg_4_17"),
+         InlineKeyboardButton(f"{sicbo_neg(5)}/{sicbo_neg(16)}", callback_data="sb_bet_sumg_5_16"),
+         InlineKeyboardButton(f"{sicbo_neg(6)}/{sicbo_neg(15)}", callback_data="sb_bet_sumg_6_15")],
+        [InlineKeyboardButton(f"{sicbo_neg(7)}/{sicbo_neg(14)}", callback_data="sb_bet_sumg_7_14"),
+         InlineKeyboardButton(f"{sicbo_neg(8)}/{sicbo_neg(13)}", callback_data="sb_bet_sumg_8_13"),
+         InlineKeyboardButton(f"{sicbo_neg(9)}-{sicbo_neg(12)}", callback_data="sb_bet_sumg_9_10_11_12")],
         [InlineKeyboardButton("🎮 立即开牌", callback_data="sb_start"), InlineKeyboardButton("❌ 终止", callback_data="sb_end")],
     ]
     if game.game_msg_id:
@@ -2181,6 +2191,17 @@ class NiuNiuGame:
             self.wait_task = None
 
 
+def format_niu_cards(hand, combo):
+    """把凑牛的3张按牌点排序后用括号聚拢，其余牌跟在后面。没牛则全部平铺。"""
+    if combo:
+        combo_cards = sorted([hand[i] for i in combo], key=lambda c: NiuNiuGame.card_point(c))
+        combo_str = " ".join(card_str(c) for c in combo_cards)
+        rest = [hand[i] for i in range(5) if i not in combo]
+        rest_str = " ".join(card_str(c) for c in rest)
+        return f"({combo_str}) {rest_str}"
+    return " ".join(card_str(c) for c in hand)
+
+
 async def update_niuniu_ui(game, app):
     if game.phase != "waiting": return
     remain = max(0, int(ROOM_WAIT_TIMEOUT - (time.time() - game.create_time)))
@@ -2268,31 +2289,26 @@ async def settle_niuniu(game, app):
                 if uid >= 0: niuniu_profit_by_date[date][game.chat_id][uid] += net_player
                 if dealer_uid >= 0: niuniu_profit_by_date[date][game.chat_id][dealer_uid] -= net_player
 
-            p_combo = game.niu_info[uid][1]
             p_hand = game.hands[uid]
-            p_cards = []
-            for i, card in enumerate(p_hand):
-                cs = card_str(card)
-                p_cards.append(f"【{cs}】" if i in p_combo else f" {cs} ")
+            p_combo = game.niu_info[uid][1]
+            p_cards = format_niu_cards(p_hand, p_combo)
             result_icon = "✅" if p_win else "❌"
-            lines.append(f"  {result_icon} {name_map[uid]} | {' '.join(p_cards)} | <b>{NIU_NAMES[p_niu]}</b> | {net_player:+d}")
+            lines.append(f"  {result_icon} {name_map[uid]} | {p_cards} | <b>{NIU_NAMES[p_niu]}</b> | {net_player:+d}")
+            lines.append("")
 
         payouts_applied = True
 
         # 庄家牌展示
-        d_combo = game.niu_info[dealer_uid][1]
         d_hand = game.hands[dealer_uid]
-        d_cards = []
-        for i, card in enumerate(d_hand):
-            cs = card_str(card)
-            d_cards.append(f"【{cs}】" if i in d_combo else f" {cs} ")
+        d_combo = game.niu_info[dealer_uid][1]
+        d_cards = format_niu_cards(d_hand, d_combo)
 
         text = [
             "🐂 <b>牛牛 庄家结算</b>",
             "━━━━━━━━━━━━━━━━━",
             f"🎰 <b>庄家</b>：{name_map[dealer_uid]} | {' '.join(d_cards)} | <b>{NIU_NAMES[dealer_niu]}</b>（{dealer_mult}倍）| {dealer_net:+d}",
             "",
-            "📋 <b>闲家结算</b>（【】为凑牛的3张）",
+            "📋 <b>闲家结算</b>（括号内为凑牛的3张）",
         ]
         text.extend(lines)
         if game.mode == "official":
