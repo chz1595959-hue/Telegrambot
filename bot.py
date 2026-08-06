@@ -1202,6 +1202,8 @@ async def handle_texas_reveal(cid, uid, q, context):
     info = recent_poker_reveals.get(cid)
     if not info:
         await q.answer("本局亮牌数据已失效", show_alert=True); return
+    if uid != info["winner"]:
+        await q.answer("只有赢家本人能亮牌", show_alert=True); return
     name = await get_name(context.application, info["winner"])
     hand_text = "  ".join(card_str(c) for c in info["hand"])
     board_text = "  ".join(card_str(c) for c in info["board"]) if info["board"] else "（未发公牌）"
@@ -1227,6 +1229,7 @@ class HorseRace:
         self.game_msg_id = self.animation_msg_id = None
         self.task, self.settled, self.cancelled, self.lock = None, False, False, asyncio.Lock()
         self.final_odds = None
+        self.bet_odds = defaultdict(dict)  # 每注下注瞬间锁定的赔率（uid->horse 金额加权平均）
         rates = [random.uniform(.18, .35) for _ in range(HORSE_COUNT)]; total = sum(rates)
         self.rates = [value / total for value in rates]
         # 用胜率抽样每匹对象的精确完赛时间：长期获胜概率更接近显示胜率，仍保留随机爆冷。
@@ -1245,9 +1248,14 @@ class HorseRace:
         if self.phase != "betting" or self.cancelled: return False, "当前不是下注阶段"
         wallet = game_chips
         if not 0 <= horse < HORSE_COUNT or amount <= 0 or amount > wallet[self.chat_id][uid]: return False, "马号、金额或积分无效"
+        # 先按「下注前」赔率锁定（即玩家在界面上看到的赔率），确保看到=拿到
+        o = self.odds()[horse]
         wallet[self.chat_id][uid] -= amount; self.pool += amount; self.total_bets[horse] += amount
         self.bets[uid][horse] = self.bets[uid].get(horse, 0) + amount
-        
+        prev_amt = self.bets[uid][horse] - amount
+        prev_odd = self.bet_odds[uid].get(horse)
+        self.bet_odds[uid][horse] = o if prev_odd is None else (prev_amt * prev_odd + amount * o) / (prev_amt + amount)
+
         # 记录退款保护
         curr_pending = pending_game_bets[self.chat_id][uid].get("horse", {}).get("amount", 0)
         pending_game_bets[self.chat_id][uid]["horse"] = {"amount": curr_pending + amount, "mode": self.mode}
@@ -1286,7 +1294,7 @@ class HorseRace:
                 self.name_cache[uid] = name
                 lines.append(f"{name}: " + " ".join(f"{HORSE_EMOJI[h]}{amount}" for h, amount in bets.items()))
             lines.append("")
-        lines.extend([f"⏰ 距离开赛还有 {minutes} 分 {seconds:02d} 秒", "🔒 开赛后无法投注"])
+        lines.extend([f"⏰ 距离开赛还有 {minutes} 分 {seconds:02d} 秒", "🔒 开赛后无法投注", "💡 赔率随下注实时浮动，下注瞬间锁定"])
         return "\n".join(lines)
 
     def animation(self):
@@ -1374,8 +1382,8 @@ class HorseRace:
             payouts_applied = False
             try:
                 if not self.arrivals: raise RuntimeError("赛马未产生到达顺序")
-                locked_odds = self.final_odds or self.odds()
-                winner, odd, date = self.arrivals[0], locked_odds[self.arrivals[0]], business_date()
+                winner, date = self.arrivals[0], business_date()
+                fallback_odd = (self.final_odds or self.odds())[winner]
                 if self.mode == "official":
                     race_daily_stats[self.chat_id][winner] += 1
                     race_history[self.chat_id] = (race_history[self.chat_id] + [winner])[-10:]
@@ -1390,13 +1398,14 @@ class HorseRace:
                 settlements, total_payout = [], 0
                 for uid, bets in self.bets.items():
                     stake = sum(bets.values()); bet_on_winner = bets.get(winner, 0)
-                    payout = int(bet_on_winner * odd)
+                    bet_odd = self.bet_odds[uid].get(winner, fallback_odd)
+                    payout = int(bet_on_winner * bet_odd)
                     net = payout - stake
                     wallet = game_chips
                     wallet[self.chat_id][uid] += payout; total_payout += payout
                     if self.mode == "official":
                         race_profit_by_date[date][self.chat_id][uid] += net
-                    settlements.append((uid, self.name_cache[uid], stake, bet_on_winner, payout, net))
+                    settlements.append((uid, self.name_cache[uid], stake, bet_on_winner, payout, net, bet_odd))
                 payouts_applied = True
 
                 available_pool = self.jackpot + self.pool
@@ -1409,8 +1418,8 @@ class HorseRace:
                     lines.extend(["", "🔄 无人押中，奖池滚入下一期。"])
 
                 lines.extend(["", "💰 本局结算："])
-                for _, name, stake, bet_on_winner, payout, net in settlements:
-                    lines.append(f"{name}：总投注 {stake}（命中 {bet_on_winner}@{odd:.2f}x）｜派彩 {payout}｜净 {net:+d}")
+                for _, name, stake, bet_on_winner, payout, net, bo in settlements:
+                    lines.append(f"{name}：总投注 {stake}（命中 {bet_on_winner}@{bo:.2f}x）｜派彩 {payout}｜净 {net:+d}")
 
                 if self.mode == "official":
                     day_rank = sorted(total_profit_by_game(race_profit_by_date, self.chat_id).items(), key=lambda item: item[1], reverse=True)[:50]
