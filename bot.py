@@ -1239,13 +1239,28 @@ class HorseRace:
         self.finish_durations = {}
 
     def odds(self):
-        total = sum(self.total_bets); smoothing = 1000
-        values = []
+        # 赔率 = 真实胜率的公平赔率(1/rate) × 注额压力因子
+        # - 不设上限（用户要求），仅保留 1.05 地板防止「赢了还亏本」
+        # - 注额越多 -> 因子越小 -> 赔率越低（热门马赔得少，标准押注池逻辑）
+        # - 单调约束：胜率越低赔率必须越高，杜绝「低胜率马赔率反而更低」的怪象
+        total = sum(self.total_bets)
+        avg = 1.0 / HORSE_COUNT
+        raw = []
         for i in range(HORSE_COUNT):
-            likelihood = self.total_bets[i] / total if total else 1 / HORSE_COUNT
-            posterior = (self.rates[i] * smoothing + likelihood * total) / (smoothing + total)
-            values.append(max(1.6, min(1 / max(posterior, .01), 8)))
-        return values
+            base = 1.0 / self.rates[i]                       # 自然公平赔率，无封顶
+            if total > 0 and self.total_bets[i] > 0:
+                share = self.total_bets[i] / total
+                factor = (avg / share) ** 0.5                # 押注占比越高 -> 因子越小
+                factor = max(0.4, min(factor, 2.5))          # 限制单匹摆动幅度，保证可读
+            else:
+                factor = 1.0
+            raw.append(base * factor)
+        # 单调约束：按胜率升序，确保低胜率马的赔率不低于高胜率马
+        order = sorted(range(HORSE_COUNT), key=lambda i: self.rates[i])
+        for a, b in zip(order, order[1:]):
+            if raw[a] < raw[b]:
+                raw[b] = raw[a]
+        return [max(1.05, v) for v in raw]
 
     def bet(self, uid, horse, amount):
         if self.phase != "betting" or self.cancelled: return False, "当前不是下注阶段"
