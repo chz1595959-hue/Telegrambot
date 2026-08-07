@@ -1422,7 +1422,10 @@ class HorseRace:
 
                 lines.extend(["", "💰 本局结算："])
                 for _, name, stake, bet_on_winner, payout, net, bo in settlements:
-                    lines.append(f"{name}：总投注 {stake}（命中 {bet_on_winner}@{bo:.2f}x）｜派彩 {payout}｜净 {net:+d}")
+                    if bet_on_winner > 0:
+                        lines.append(f"{name}：总投注 {stake}｜命中 {bet_on_winner}（{bo:.2f}x）｜派彩 {payout}｜净 {net:+d}")
+                    else:
+                        lines.append(f"{name}：总投注 {stake}｜未命中｜净 {net:+d}")
 
                 if self.mode == "official":
                     day_rank = sorted(total_profit_by_game(race_profit_by_date, self.chat_id).items(), key=lambda item: item[1], reverse=True)[:50]
@@ -2885,6 +2888,7 @@ class DouDizhuGame:
             return False, "压不过上家"
         self.remove_cards(uid, cards)
         self.last_combo = combo; self.last_player = uid; self.pass_count = 0
+        self._last_cards = cards  # 与上家归属同步，人和机器人出牌都走这里，避免张冠李戴
         self.selected.clear()
         if combo[0] == "bomb": self.multiplier *= 2; self.bomb_count += 1
         elif combo[0] == "rocket": self.multiplier *= 2; self.rocket_count += 1
@@ -2922,6 +2926,7 @@ async def ddz_apply_bid(game, app, uid, value):
             await ddz_group(app, game, custom="⌛ 三家都不叫，本局流局。")
             active_ddz_games.pop(game.chat_id, None)
             for u in list(game.players): ddz_user_game.pop(u, None)
+            await ddz_notify_dms_ended(app, game.chat_id)
             return
         await ddz_refresh_all(app, game)
         await ddz_maybe_bot(app, game)
@@ -2990,6 +2995,17 @@ async def ddz_dm(app, game, uid):
         game.public_hands.add(uid)
         ddz_dm_msgs.pop((game.chat_id, uid), None)
         await ddz_group(app, game, custom=f"⚠️ 无法向 {await get_name(app, uid)} 私聊发牌（请先私聊机器人 /start），其手牌改为群内公开。")
+
+
+async def ddz_notify_dms_ended(app, group_cid, text="⚠️ 此局斗地主已结束，请到群里发起新一局。"):
+    """对某群所有真人私聊的牌局消息改为「已结束」并去掉键盘，避免僵尸按钮继续触发弹窗。"""
+    for (cid, uid) in [k for k in list(ddz_dm_msgs) if k[0] == group_cid]:
+        msg_id = ddz_dm_msgs.pop((cid, uid), None)
+        if msg_id:
+            try:
+                await safe_edit(app.bot, uid, msg_id, text, reply_markup=None)
+            except Exception:
+                pass
 
 
 def ddz_dm_board(game, uid):
@@ -3153,6 +3169,7 @@ async def ddz_settle(game, app, winner):
     for u in list(game.players): ddz_user_game.pop(u, None)
     for key in list(ddz_dm_msgs):
         if key[0] == game.chat_id: ddz_dm_msgs.pop(key, None)
+    await ddz_notify_dms_ended(app, game.chat_id)
     await safe_delete(app.bot, game.chat_id, game.group_msg_id)
     await safe_send_long(app.bot, game.chat_id, "\n".join(lines), parse_mode="HTML")
     save_data()
@@ -3180,6 +3197,7 @@ async def cmd_ddz(update, context):
         if game.phase != "waiting" or active_ddz_games.get(cid) is not game: return
         active_ddz_games.pop(cid, None)
         for u in list(game.players): ddz_user_game.pop(u, None)
+        await ddz_notify_dms_ended(context.application, cid)
         await safe_edit(context.bot, cid, game.group_msg_id, f"⌛ 斗地主等待 {ROOM_WAIT_TIMEOUT} 秒人数不足，房间已解散。", reply_markup=None)
     game.wait_task = asyncio.create_task(expire())
 
@@ -3224,6 +3242,7 @@ async def ddz_handle_button(update, context, q, cid, uid, data):
         if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
         game.cancel_wait(); active_ddz_games.pop(cid, None)
         for u in list(game.players): ddz_user_game.pop(u, None)
+        await ddz_notify_dms_ended(app, cid)
         await safe_edit(context.bot, cid, game.group_msg_id, "🛑 斗地主已手动终止。", reply_markup=None); return
 
     if game.phase == "bidding":
@@ -3258,7 +3277,6 @@ async def ddz_handle_button(update, context, q, cid, uid, data):
             if not cards: await q.answer("请先选牌", show_alert=True); return
             ok, msg = game.do_play(uid, cards)
             if not ok: await q.answer(msg or "出牌无效", show_alert=True); return
-            game._last_cards = cards
             await q.answer("出牌"); await ddz_after_action(app, game, uid, True, "", played=cards); return
         if data == "ddz_pass":
             ok, msg = game.do_pass(uid)
@@ -3724,7 +3742,12 @@ async def on_button(update, context):
         if data.startswith("ddz_") and cid not in active_ddz_games:
             gcid = ddz_user_game.get(uid)
             if gcid is None:
-                await q.answer("未参与斗地主对局", show_alert=True); return
+                # 兜底：用户没有任何进行中的对局（重启/已结束/未加入），把这条 DM 改成"已结束"并去掉按钮
+                try:
+                    await safe_edit(context.bot, cid, q.message.message_id, "⚠️ 此局斗地主已结束，请到群里发起新一局。", reply_markup=None)
+                except Exception:
+                    pass
+                await q.answer("⚠️ 游戏已结束，请到群里重开新局。", show_alert=True); return
             cid = gcid
         if not is_auth(cid): await q.answer("未授权", show_alert=True); return
         
