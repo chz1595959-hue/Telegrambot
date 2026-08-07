@@ -2154,13 +2154,17 @@ async def settle_sicbo(game, app):
             if net != 0: lines.append(f"👤 {name_map[uid]}\n盈亏：{net:+d}")
             pending_game_bets[game.chat_id].get(uid, {}).pop("sicbo", None)
         payouts_applied = True
-        text += "\n\n".join(lines) if lines else "本局无人盈亏。"
+        text += "\n\n".join(lines) if lines else "本局无人下注，已取消。"
         if game.mode == "official":
             rank = sorted(total_profit_by_game(sicbo_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
             text += "\n\n🏆 <b>骰子 累计盈利榜</b>\n"
             text += "\n".join([f"{rank_marker(i)} {name_map.get(u, f'玩家{u}')}：{a:+d}" for i, (u, a) in enumerate(rank, 1)])
-        await safe_delete(app.bot, game.chat_id, game.game_msg_id)
-        await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
+        # 原地编辑为结算结果（不再「删旧消息+发新消息」）：骰子此前唯一用删+重发，
+        # 群里删除/重发任一步失败就会只剩“正在摇骰子”而结果丢失，看着像“不能结算”。
+        # 优先原地编辑；编辑失败（超长/消息过旧等）再降级为发新消息，结果绝不丢失。
+        edited = await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=None, parse_mode="HTML")
+        if edited is None:
+            await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
         if game.mode == "official":
             for uid in game.bets.keys(): await emergency_if_needed(game.chat_id, uid, app)
     except Exception:
@@ -3873,6 +3877,7 @@ async def on_button(update, context):
                 await update_sicbo_ui(game, context.application)
             elif data == "sb_start":
                 if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
+                await q.answer("🎲 正在开牌...")
                 game.cancel_timer(); await settle_sicbo(game, context.application)
             elif data == "sb_end":
                 if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
