@@ -2816,7 +2816,10 @@ class DouDizhuGame:
 
     def team(self, uid): return "landlord" if uid == self.landlord else "farmer"
 
-    def current_uid(self): return self.seat_order[self.turn_idx]
+    def current_uid(self):
+        if self.phase == "bidding":
+            return self.seat_order[self.bid_idx]
+        return self.seat_order[self.turn_idx]
 
     def cancel_wait(self):
         if self.wait_task and not self.wait_task.done():
