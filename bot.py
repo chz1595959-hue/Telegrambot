@@ -2528,6 +2528,7 @@ DDZ_SUIT_IDX = {"♠": 0, "♥": 1, "♣": 2, "♦": 3, None: 4}  # 回调编码
 DDZ_RANK_CHARS = {3:"3",4:"4",5:"5",6:"6",7:"7",8:"8",9:"9",10:"10",11:"J",12:"Q",13:"K",14:"A",15:"2",16:"🃏",17:"🃏"}
 DDZ_SUIT_CHARS = {"♠":"♠️","♥":"♥️","♦":"♦️","♣":"♣️"}
 ddz_dm_msgs = {}  # {(cid, uid): dm_msg_id} 私聊手牌消息ID（人类玩家）
+ddz_user_game = {}  # {uid: group_cid} 人类玩家当前所属斗地主对局（用于私聊按钮回查授权与游戏）
 
 def ddz_make_deck():
     deck = [(r, s) for r in range(3, 16) for s in ("♠", "♥", "♦", "♣")]
@@ -2784,7 +2785,7 @@ class DouDizhuGame:
         self.rocket_count = 0
         self.farmer_played = False
         self.landlord_plays = 0
-        self.private = True
+        self.private = True  # 默认私聊发牌（隐藏手牌，公平对战）；私聊失败自动降级群内公开
         self.public_hands = set()  # 私聊失败降级后公开手牌的玩家
         self.group_msg_id = None
         self.create_time = time.time()
@@ -2827,6 +2828,8 @@ class DouDizhuGame:
         self.hands = {uid: [deck.pop() for _ in range(17)] for uid in self.players}
         self.bottom = [deck.pop() for _ in range(3)]
         self.seat_order = self.players[:]
+        for uid in self.players:
+            if uid >= 0: ddz_user_game[uid] = self.chat_id
         self.phase = "bidding"
         self.bids = {}; self.max_bid = 0; self.landlord_candidate = None
         self.bid_idx = 0; self.bid_actions = 0
@@ -2915,6 +2918,7 @@ async def ddz_apply_bid(game, app, uid, value):
         if not game.finalize_bid():
             await ddz_group(app, game, custom="⌛ 三家都不叫，本局流局。")
             active_ddz_games.pop(game.chat_id, None)
+            for u in list(game.players): ddz_user_game.pop(u, None)
             return
         await ddz_refresh_all(app, game)
         await ddz_maybe_bot(app, game)
@@ -2990,7 +2994,11 @@ def ddz_dm_board(game, uid):
     sel = game.selected if game.current_uid() == uid else set()
     my_turn = game.current_uid() == uid
     text = [f"🃏 <b>你的斗地主手牌</b>（{len(hand)} 张）", "━"*14]
-    if game.phase == "playing":
+    if game.phase == "bidding":
+        bidding = game.seat_order[game.bid_idx] == uid
+        text.append(f"{'👉 轮到你叫分' if bidding else '⏳ 等待其他玩家叫分'}")
+        text.append(f"当前最高分：{game.max_bid or '无'}")
+    elif game.phase == "playing":
         text.append(f"{'👉 轮到你出牌' if my_turn else '⏳ 等待其他玩家出牌'}")
         if game.last_combo and game.last_player is not None:
             text.append(f"上家出：{ddz_hand_str(getattr(game, '_last_cards', []) or [])}（{game.last_combo[0]}）")
@@ -3000,7 +3008,12 @@ def ddz_dm_board(game, uid):
     for i in range(0, len(hand), 5):
         chunk = hand[i:i+5]
         rows.append([InlineKeyboardButton(("✅" if c in sel else "") + ddz_card_str(c), callback_data=f"ddz_c_{c[0]}_{DDZ_SUIT_IDX.get(c[1])}") for c in chunk])
-    if game.phase == "playing" and my_turn:
+    if game.phase == "bidding" and game.seat_order[game.bid_idx] == uid:
+        rows.append([InlineKeyboardButton("1分", callback_data="ddz_bid_1"),
+                     InlineKeyboardButton("2分", callback_data="ddz_bid_2"),
+                     InlineKeyboardButton("3分", callback_data="ddz_bid_3"),
+                     InlineKeyboardButton("不叫", callback_data="ddz_bid_0")])
+    elif game.phase == "playing" and my_turn:
         rows.append([InlineKeyboardButton("🎯 出牌", callback_data="ddz_play"),
                      InlineKeyboardButton("⏭️ 不出", callback_data="ddz_pass"),
                      InlineKeyboardButton("💡 提示", callback_data="ddz_hint")])
@@ -3043,13 +3056,15 @@ async def ddz_group_board(app, game, custom=None):
         bidder = game.seat_order[game.bid_idx]
         text.append(f"📢 叫分轮到：{names.get(bidder)}")
         text.append(f"当前最高分：{game.max_bid or '无'}")
-        text.append("👇 请在群里点击（叫分公开）：")
+        if bidder in game.public_hands or not game.private:
+            text.append(f"🃏 {names.get(bidder)} 的手牌：{ddz_hand_str(ddz_sort_hand(game.hands[bidder]))}")
+        else:
+            text.append("💡 请去私聊查看你的手牌后再叫分（其他人看不到）。")
+        text.append("👇 叫分（公开操作，按钮所有人可见）：")
         kb = [[InlineKeyboardButton("1分", callback_data="ddz_bid_1"),
                InlineKeyboardButton("2分", callback_data="ddz_bid_2"),
                InlineKeyboardButton("3分", callback_data="ddz_bid_3"),
                InlineKeyboardButton("不叫", callback_data="ddz_bid_0")]]
-        if not game.is_robot(bidder):
-            kb.append([InlineKeyboardButton("🎴 查看我的手牌", callback_data="ddz_myhand")])
         return "\n".join(text), InlineKeyboardMarkup(kb)
 
     # playing
@@ -3082,7 +3097,10 @@ async def ddz_group_board(app, game, custom=None):
                          InlineKeyboardButton("💡 提示", callback_data="ddz_hint")])
         return "\n".join(text), InlineKeyboardMarkup(rows)
     else:
-        text.append(f"👉 轮到 {cur_name} 出牌（请去私聊选牌）")
+        if game.is_robot(cur):
+            text.append(f"👉 轮到 {cur_name} 出牌（电脑人思考中…）")
+        else:
+            text.append(f"👉 轮到 {cur_name} 出牌（请去私聊选牌）")
         text.append("💡 其他人看不到任何人的手牌，公平对战。")
         kb = [[InlineKeyboardButton("🎴 查看我的手牌", callback_data="ddz_myhand")]]
         return "\n".join(text), InlineKeyboardMarkup(kb)
@@ -3129,6 +3147,7 @@ async def ddz_settle(game, app, winner):
             un = names.get(u) or await get_name(app, u)
             lines.append(f"{rank_marker(i)} {un}：{a:+d}")
     active_ddz_games.pop(game.chat_id, None)
+    for u in list(game.players): ddz_user_game.pop(u, None)
     for key in list(ddz_dm_msgs):
         if key[0] == game.chat_id: ddz_dm_msgs.pop(key, None)
     await safe_delete(app.bot, game.chat_id, game.group_msg_id)
@@ -3157,6 +3176,7 @@ async def cmd_ddz(update, context):
         await asyncio.sleep(ROOM_WAIT_TIMEOUT)
         if game.phase != "waiting" or active_ddz_games.get(cid) is not game: return
         active_ddz_games.pop(cid, None)
+        for u in list(game.players): ddz_user_game.pop(u, None)
         await safe_edit(context.bot, cid, game.group_msg_id, f"⌛ 斗地主等待 {ROOM_WAIT_TIMEOUT} 秒人数不足，房间已解散。", reply_markup=None)
     game.wait_task = asyncio.create_task(expire())
 
@@ -3192,15 +3212,7 @@ async def ddz_handle_button(update, context, q, cid, uid, data):
         if len(game.players) < DDZ_MIN_PLAYERS: await q.answer("人数不足", show_alert=True); return
         while len(game.players) < DDZ_MAX_PLAYERS: game.add_robot()
         game.cancel_wait(); game.deal()
-        # 私聊发牌可行性检测；任一真人私聊失败则整体降级为群内公开
-        if game.private:
-            for p in game.seat_order:
-                if p >= 0:
-                    try: await safe_send(app.bot, p, "🎴 斗地主发牌中…", parse_mode="HTML")
-                    except Exception: game.private = False; break
         await ddz_refresh_all(app, game)
-        if not game.private:
-            await ddz_group(app, game, custom="⚠️ 部分玩家无法私聊，已切换为群内公开手牌模式。")
         await ddz_maybe_bot(app, game); return
     if data == "ddz_leave":
         if not game.leave(uid): await q.answer("你不在房间内", show_alert=True); return
@@ -3208,6 +3220,7 @@ async def ddz_handle_button(update, context, q, cid, uid, data):
     if data == "ddz_end":
         if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
         game.cancel_wait(); active_ddz_games.pop(cid, None)
+        for u in list(game.players): ddz_user_game.pop(u, None)
         await safe_edit(context.bot, cid, game.group_msg_id, "🛑 斗地主已手动终止。", reply_markup=None); return
 
     if game.phase == "bidding":
@@ -3701,6 +3714,12 @@ async def on_button(update, context):
             if q: await q.answer("该操作已过期", show_alert=True)
             return
         cid, uid, data = q.message.chat.id, q.from_user.id, q.data or ""
+        # 斗地主手牌经私聊按钮操作：私聊 chat 不在授权群组，需按用户所属对局定位群 cid
+        if data.startswith("ddz_") and cid not in active_ddz_games:
+            gcid = ddz_user_game.get(uid)
+            if gcid is None:
+                await q.answer("未参与斗地主对局", show_alert=True); return
+            cid = gcid
         if not is_auth(cid): await q.answer("未授权", show_alert=True); return
         
         # --- 21点 回调 ---
