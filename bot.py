@@ -3318,10 +3318,12 @@ async def cmd_lhj(update, context):
         [InlineKeyboardButton("🎯 1 次", callback_data=f"lhj_spin_1_{uid}"), InlineKeyboardButton("🎮 5 次", callback_data=f"lhj_spin_5_{uid}")],
         [InlineKeyboardButton("⚡ 10 次", callback_data=f"lhj_spin_10_{uid}"), InlineKeyboardButton("💥 20 次", callback_data=f"lhj_spin_20_{uid}")],
         [InlineKeyboardButton("🎲 50 次", callback_data=f"lhj_spin_50_{uid}"), InlineKeyboardButton("💯 100 次", callback_data=f"lhj_spin_100_{uid}")],
-        [InlineKeyboardButton("🔥 500 次", callback_data=f"lhj_spin_500_{uid}"), InlineKeyboardButton("🌟 1000 次", callback_data=f"lhj_spin_1000_{uid}")],
+        [InlineKeyboardButton("🃏 200 次", callback_data=f"lhj_spin_200_{uid}"), InlineKeyboardButton("🔥 500 次", callback_data=f"lhj_spin_500_{uid}")],
+        [InlineKeyboardButton("🌟 1000 次", callback_data=f"lhj_spin_1000_{uid}"), InlineKeyboardButton("💠 2000 次", callback_data=f"lhj_spin_2000_{uid}")],
+        [InlineKeyboardButton("🌈 5000 次", callback_data=f"lhj_spin_5000_{uid}"), InlineKeyboardButton("👑 10000 次", callback_data=f"lhj_spin_10000_{uid}")],
     ])
     await update.message.reply_text(
-        f"🎰 <b>老虎机</b>（单次 {SLOT_BET} 积分）\n\n请选择转动次数：\n💡 5次={SLOT_BET*5}｜10次={SLOT_BET*10}｜20次={SLOT_BET*20}｜50次={SLOT_BET*50}｜100次={SLOT_BET*100}｜500次={SLOT_BET*500}｜1000次={SLOT_BET*1000}",
+        f"🎰 <b>老虎机</b>（单次 {SLOT_BET} 积分）\n\n请选择转动次数：\n💡 5次={SLOT_BET*5}｜10次={SLOT_BET*10}｜20次={SLOT_BET*20}｜50次={SLOT_BET*50}｜100次={SLOT_BET*100}｜200次={SLOT_BET*200}｜500次={SLOT_BET*500}｜1000次={SLOT_BET*1000}｜2000次={SLOT_BET*2000}｜5000次={SLOT_BET*5000}｜10000次={SLOT_BET*10000}",
         reply_markup=kb, parse_mode="HTML")
 
 
@@ -3896,7 +3898,7 @@ async def on_button(update, context):
                 await q.answer("无效操作", show_alert=True); return
             if uid != owner:
                 await q.answer("这是别人的老虎机界面，请自己发送 /lhj", show_alert=True); return
-            if count not in (1, 5, 10, 20, 50, 100, 500, 1000):
+            if count not in (1, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000):
                 await q.answer("无效操作", show_alert=True); return
             ok, result_text = await run_slot_spins(context, cid, uid, count, answer=q.answer)
             if ok and q.message:
