@@ -52,6 +52,13 @@ ADMIN_USER_IDS = {ADMIN_USER_ID, 8416301258, 5847451570, 8147535302}  # 种子�
 BOT_ADMINS = set(ADMIN_USER_IDS)  # 运行时管理员集合 = 种子 ∪ 持久化新增，可经 /addadmin /deladmin 动态管理
 SMALL_BLIND, BIG_BLIND, ANTE = 0, 0, 200
 STALE_TEXT_COMMAND_SECONDS = 120
+# ---------- 德州排位赛 ----------
+SEASON_START_CHIPS = 20000     # 排位赛起始分（独立账本，7天不清零）
+SEASON_MIN_PLAYERS = 20        # 报名满 20 人自动开赛
+SEASON_MIN_GAMES = 5           # 上榜最少局数
+SEASON_REBUY_COUNT = 3         # 破产应急补分次数
+SEASON_REBUY_AMOUNT = 2000     # 每次应急补分
+SEASON_DAYS = 7                # 赛季周期（天）
 DATA_FILE = os.environ.get("DATA_FILE", "bot_data.json")
 # --------------------------------
 
@@ -97,7 +104,6 @@ baccarat_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(in
 slot_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 sicbo_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 niuniu_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
-ddz_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 sicbo_history = defaultdict(list)  # 骰子路书：大🔴 小🔵 单🟡 双🟢 豹子⚫
 sicbo_daily_stats = defaultdict(lambda: {"big": 0, "small": 0, "triple": 0})
 race_jackpot = defaultdict(int)
@@ -110,8 +116,20 @@ pending_game_bets = defaultdict(lambda: defaultdict(dict))
 last_business_date = ""
 active_poker_games, active_horse_races, active_gomoku_games, active_minesweeper_games = {}, {}, {}, {}
 active_blackjack_games, active_baccarat_games = {}, {}
-active_sicbo_games, active_niuniu_games, active_ddz_games = {}, {}, {}
+active_sicbo_games, active_niuniu_games = {}, {}
 recent_poker_reveals = {}  # 德州单赢结算后临时保存赢家牌，供可选亮牌按钮使用
+# ---------- 德州排位赛状态（独立账本，每日重置不触碰） ----------
+season_active = False
+season_id = None
+season_name = ""
+season_start_ts = 0
+season_end_ts = 0
+season_points = defaultdict(lambda: defaultdict(int))    # season_points[cid][uid] 排位分（下注用）
+season_games = defaultdict(lambda: defaultdict(int))     # season_games[cid][uid] 参赛局数
+season_joined = defaultdict(set)                          # season_joined[cid] = {uid} 报名集合
+season_rebuy = defaultdict(lambda: defaultdict(int))      # season_rebuy[cid][uid] 已用应急补分次数
+season_eliminated = defaultdict(set)                      # season_eliminated[cid] = {uid} 淘汰集合
+season_lobby_msg = {}                                       # season_lobby_msg[cid] = 排位大厅看板消息 id（UI 态，不持久化）
 # 用于老虎机等功能的冷却时间限制。
 user_cooldowns = defaultdict(float)
 # 高性能保存逻辑变量
@@ -168,7 +186,6 @@ def force_save_now():
                 "slot_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in slot_profit_by_date.items()},
                 "sicbo_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in sicbo_profit_by_date.items()},
                 "niuniu_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in niuniu_profit_by_date.items()},
-                "ddz_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in ddz_profit_by_date.items()},
                 "sicbo_history": {str(cid): value[-12:] for cid, value in sicbo_history.items()},
                 "sicbo_daily_stats": {str(cid): dict(value) for cid, value in sicbo_daily_stats.items()},
                 "authorized_groups": list(AUTHORIZED_GROUPS),
@@ -184,6 +201,16 @@ def force_save_now():
                 "last_business_date": last_business_date,
                 "pending_game_bets": {str(cid): {str(uid): val for uid, val in users.items()} for cid, users in pending_game_bets.items()},
                 "user_cooldowns": {str(uid): ts for uid, ts in user_cooldowns.items()},
+                "season_active": season_active,
+                "season_id": season_id,
+                "season_name": season_name,
+                "season_start_ts": season_start_ts,
+                "season_end_ts": season_end_ts,
+                "season_points": {str(cid): dict(users) for cid, users in season_points.items()},
+                "season_games": {str(cid): dict(users) for cid, users in season_games.items()},
+                "season_joined": {str(cid): list(users) for cid, users in season_joined.items()},
+                "season_rebuy": {str(cid): dict(users) for cid, users in season_rebuy.items()},
+                "season_eliminated": {str(cid): list(users) for cid, users in season_eliminated.items()},
             }
             os.makedirs(os.path.dirname(os.path.abspath(DATA_FILE)), exist_ok=True)
             with open(DATA_TEMP_FILE, "w", encoding="utf-8") as file:
@@ -214,7 +241,7 @@ async def data_save_worker():
 
 
 def load_data():
-    global last_business_date
+    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts
     source = DATA_FILE if os.path.exists(DATA_FILE) else DATA_BACKUP_FILE
     if not os.path.exists(source): return
     try:
@@ -238,7 +265,19 @@ def load_data():
         for date, chats in data.get("slot_profit_by_date", {}).items(): restore_nested(slot_profit_by_date[date], chats)
         for date, chats in data.get("sicbo_profit_by_date", {}).items(): restore_nested(sicbo_profit_by_date[date], chats)
         for date, chats in data.get("niuniu_profit_by_date", {}).items(): restore_nested(niuniu_profit_by_date[date], chats)
-        for date, chats in data.get("ddz_profit_by_date", {}).items(): restore_nested(ddz_profit_by_date[date], chats)
+        # 德州排位赛状态恢复
+        season_active = data.get("season_active", False)
+        season_id = data.get("season_id")
+        season_name = data.get("season_name", "")
+        season_start_ts = data.get("season_start_ts", 0)
+        season_end_ts = data.get("season_end_ts", 0)
+        restore_nested(season_points, data.get("season_points", {}))
+        restore_nested(season_games, data.get("season_games", {}))
+        restore_nested(season_rebuy, data.get("season_rebuy", {}))
+        for cid, uids in data.get("season_joined", {}).items():
+            season_joined[int(cid)] = set(int(u) for u in uids)
+        for cid, uids in data.get("season_eliminated", {}).items():
+            season_eliminated[int(cid)] = set(int(u) for u in uids)
         for cid, value in data.get("sicbo_history", {}).items(): sicbo_history[int(cid)] = list(value)[-12:]
         for cid, value in data.get("sicbo_daily_stats", {}).items():
             sicbo_daily_stats[int(cid)] = {"big": int(value.get("big", 0)), "small": int(value.get("small", 0)), "triple": int(value.get("triple", 0))}
@@ -276,7 +315,7 @@ def archive_old_profit_data(keep_days=90):
     cutoff = (now_bj() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
     for profit_dict in (race_profit_by_date, blackjack_profit_by_date,
                         baccarat_profit_by_date, slot_profit_by_date,
-                        sicbo_profit_by_date, niuniu_profit_by_date, ddz_profit_by_date):
+                        sicbo_profit_by_date, niuniu_profit_by_date):
         old_dates = [d for d in list(profit_dict.keys()) if d != "_archive" and d < cutoff]
         if not old_dates:
             continue
@@ -886,8 +925,9 @@ def distribute_side_pots(total_bets, scores):
 
 
 class PokerGame:
-    def __init__(self, cid, owner, mode=None):
+    def __init__(self, cid, owner, mode=None, season=False):
         self.chat_id, self.owner_id, self.mode, self.phase = cid, owner, mode or current_game_mode(), "waiting"
+        self.season = season  # 排位赛模式：用独立 season_points 下注，单手总投入不封顶
         self.players, self.chips, self.initial_chips = [], {}, {}
         self.total_bet, self.round_bets, self.hands = {}, {}, {}
         self.folded, self.all_in, self.acted = set(), set(), set()
@@ -901,8 +941,15 @@ class PokerGame:
 
     def add(self, uid):
         if self.phase != "waiting" or uid in self.players: return False
-        wallet = texas_chips
-        if wallet[self.chat_id][uid] < MIN_ENTRY_CHIPS: return False
+        if self.season:
+            # 排位赛：必须已报名、未淘汰、且排位分 > 0
+            if uid not in season_joined.get(self.chat_id, set()) or uid in season_eliminated.get(self.chat_id, set()):
+                return False
+            wallet = season_points
+            if wallet[self.chat_id][uid] <= 0: return False
+        else:
+            wallet = texas_chips
+            if wallet[self.chat_id][uid] < MIN_ENTRY_CHIPS: return False
         self.players.append(uid); self.chips[uid] = wallet[self.chat_id][uid]; self.total_bet[uid] = 0
         return True
 
@@ -910,7 +957,7 @@ class PokerGame:
         if len(self.players) < 2: return False
         random.shuffle(self.players)
         self.cancel_auto(); self.cancel_wait(); self.folded.clear(); self.all_in.clear(); self.acted.clear(); self.raise_locked.clear(); self.board = []; self.pot = 0; self.settled = False
-        wallet = texas_chips
+        wallet = season_points if self.season else texas_chips
         for uid in self.players:
             self.chips[uid] = wallet[self.chat_id][uid]; self.initial_chips[uid] = self.chips[uid]
             self.total_bet[uid] = self.round_bets[uid] = 0
@@ -959,7 +1006,8 @@ class PokerGame:
             if not self.chips[uid]: self.all_in.add(uid)
             self.acted.add(uid); desc = f"跟注 {paid}"
         elif kind == "allin":
-            paid, old_bet = self.chips[uid], self.current_bet; new_total = self.round_bets[uid] + paid
+            paid = self.chips[uid]
+            old_bet = self.current_bet; new_total = self.round_bets[uid] + paid
             self.chips[uid] = 0; self.round_bets[uid] = new_total; self.total_bet[uid] += paid; self.pot += paid; self.all_in.add(uid)
             if new_total > old_bet:
                 raise_size = new_total - old_bet
@@ -1016,7 +1064,7 @@ class PokerGame:
         if len(alive) == 1:
             winner = alive[0]
             self.chips[winner] += self.pot
-            wallet = texas_chips
+            wallet = season_points if self.season else texas_chips
             for uid in self.players:
                 wallet[self.chat_id][uid] = self.chips[uid]
             save_data()
@@ -1033,7 +1081,7 @@ class PokerGame:
         names = {uid: HAND_NAME_CN.get(self.evaluator.class_to_string(self.evaluator.get_rank_class(score)), "未知") for uid, score in scores.items()}
         payouts = distribute_side_pots(self.total_bet, scores)
         for uid, item in payouts.items(): self.chips[uid] += item["amount"]
-        wallet = texas_chips
+        wallet = season_points if self.season else texas_chips
         for uid in self.players: wallet[self.chat_id][uid] = self.chips[uid]
         save_data(); return [(uid, names[uid], item["amount"], item["details"], names) for uid, item in payouts.items()]
 
@@ -1053,7 +1101,8 @@ class PokerGame:
 # ---------- 德州界面 / 流程 ----------
 async def poker_waiting_text(game, app):
     players = [f"{i}. {await get_name(app, uid)}" for i, uid in enumerate(game.players, 1)]
-    return f"🃏 新一局积分德州扑克\n发起人：{await get_name(app, game.owner_id)}\n\n已加入：\n" + "\n".join(players) + "\n\n点击加入，发起人可立即开始。\n⏰ 满 2 人后 60 秒自动开局，不足 2 人 60 秒后自动解散。"
+    prefix = "🏆 排位赛｜" if game.season else "🃏 新一局积分德州扑克"
+    return f"{prefix}\n发起人：{await get_name(app, game.owner_id)}\n\n已加入：\n" + "\n".join(players) + "\n\n点击加入，发起人可立即开始。\n⏰ 满 2 人后 60 秒自动开局，不足 2 人 60 秒后自动解散。"
 
 
 async def update_poker_waiting(game, app):
@@ -1066,7 +1115,7 @@ async def update_poker_waiting(game, app):
 async def poker_table_text(game, app):
     phase = {"preflop":"翻牌前", "flop":"翻牌圈", "turn":"转牌圈", "river":"河牌圈"}.get(game.phase, game.phase)
     lines = [
-        f"🃏 积分德州｜{phase}",
+        f"{'🏆 排位赛｜' if game.season else '🃏 积分德州'}｜{phase}",
         "",
         "━━━━━━━━━━━━━━━━━",
         f"🃏 公牌：{'  '.join(card_str(card) for card in game.board) or '未发牌'}",
@@ -1165,11 +1214,29 @@ async def settle_poker(game, app):
         lines.append("投入 / 盈亏：")
         for uid in game.players:
             net = game.chips[uid] - game.initial_chips[uid]
-            if game.mode == "official":
+            if game.season:
+                pass  # 排位分已在 showdown 写回 season_points，不写当日榜
+            elif game.mode == "official":
                 poker_profit_by_date[date][game.chat_id][uid] += net
             lines.extend([f"{names[uid]}：投入 {game.total_bet[uid]}｜盈亏 {net:+d}", ""])
-            
-        if game.mode == "official":
+
+        # 排位赛：累计局数 + 破产应急补分 / 淘汰处理（赛季已结束的进行中牌局只正常派奖、不计入、不误判破产）
+        if game.season and season_active:
+            for p in game.players:
+                if p < 0: continue
+                season_games[game.chat_id][p] += 1
+            for p in game.players:
+                if p < 0: continue
+                if season_points[game.chat_id][p] <= 0:
+                    if season_rebuy[game.chat_id][p] < SEASON_REBUY_COUNT:
+                        season_rebuy[game.chat_id][p] += 1
+                        season_points[game.chat_id][p] = SEASON_REBUY_AMOUNT
+                        lines.append(f"⚠️ {names[p]} 破产，启用应急筹码 +{SEASON_REBUY_AMOUNT}（剩 {SEASON_REBUY_COUNT - season_rebuy[game.chat_id][p]} 次）")
+                    else:
+                        season_eliminated[game.chat_id].add(p)
+                        lines.append(f"💀 {names[p]} 应急筹码用尽，已淘汰出本赛季")
+
+        if game.mode == "official" and not game.season:
             rank = sorted(poker_profit_by_date[date][game.chat_id].items(), key=lambda item: item[1], reverse=True)[:50]
             lines.extend(["", "🏆 <b>当日德州累计盈利榜</b>", "━━━━━━━━━━━━━━━━━"])
             lines.extend([f"{rank_marker(index)} {names.get(uid) or await get_name(app, uid)}：{amount:+d}" for index, (uid, amount) in enumerate(rank, 1)])
@@ -1194,7 +1261,7 @@ async def settle_poker(game, app):
         logger.exception("德州结算异常")
     finally:
         if active_poker_games.get(game.chat_id) is game: active_poker_games.pop(game.chat_id, None)
-        if game.mode == "official":
+        if game.mode == "official" and not game.season:
             for uid in game.players: await emergency_if_needed(game.chat_id, uid, app, texas_chips, game)
         save_data()
 
@@ -2536,788 +2603,6 @@ async def cmd_nn(update, context):
     await start_niuniu_wait_timeout(game, context.application)
 
 
-# ==================== 斗地主 ====================
-# 牌点编码：3..10, J=11, Q=12, K=13, A=14, 2=15, 小王=16, 大王=17
-# 每张牌用元组 (rank, suit) 表示，suit ∈ {"♠","♥","♦","♣"}，大小王 suit=None
-from collections import Counter
-
-DDZ_ROBOT_NAMES = ["🤖AI-阿牛", "🤖AI-小翠", "🤖AI-阿强"]
-DDZ_MIN_PLAYERS = 1      # 1 真人起，不足 3 人自动用电脑人补
-DDZ_MAX_PLAYERS = 3
-DDZ_BID_OPTIONS = [1, 2, 3]
-DDZ_SUIT_ORDER = {"♠": 4, "♥": 3, "♣": 2, "♦": 1, None: 0}
-DDZ_SUIT_IDX = {"♠": 0, "♥": 1, "♣": 2, "♦": 3, None: 4}  # 回调编码专用，避免与排序值冲突
-DDZ_RANK_CHARS = {3:"3",4:"4",5:"5",6:"6",7:"7",8:"8",9:"9",10:"10",11:"J",12:"Q",13:"K",14:"A",15:"2",16:"🃏",17:"🃏"}
-DDZ_SUIT_CHARS = {"♠":"♠️","♥":"♥️","♦":"♦️","♣":"♣️"}
-ddz_dm_msgs = {}  # {(cid, uid): dm_msg_id} 私聊手牌消息ID（人类玩家）
-ddz_user_game = {}  # {uid: group_cid} 人类玩家当前所属斗地主对局（用于私聊按钮回查授权与游戏）
-
-def ddz_make_deck():
-    deck = [(r, s) for r in range(3, 16) for s in ("♠", "♥", "♦", "♣")]
-    deck.append((16, None)); deck.append((17, None))
-    return deck
-
-def ddz_card_str(card):
-    r, s = card
-    if r == 16: return "🃏小"
-    if r == 17: return "🃏大"
-    return f"{DDZ_SUIT_CHARS[s]}{DDZ_RANK_CHARS[r]}"
-
-def ddz_sort_key(card):
-    return (card[0], DDZ_SUIT_ORDER.get(card[1], 0))
-
-def ddz_sort_hand(cards):
-    return sorted(cards, key=ddz_sort_key)
-
-def ddz_hand_str(cards):
-    return " ".join(ddz_card_str(c) for c in ddz_sort_hand(cards))
-
-def ddz_classify(cards):
-    """返回 (type, key, length) 或 None（非法牌型）。
-    type: rocket/bomb/single/pair/triple/triple_single/triple_pair/
-          straight/double_straight/airplane/airplane_single/airplane_pair/
-          four_two_single/four_two_pair
-    """
-    if not cards: return None
-    n = len(cards)
-    ranks = [c[0] for c in cards]
-    cnt = Counter(ranks)
-    if n == 2 and cnt.get(16) and cnt.get(17):
-        return ("rocket", 17, 2)
-    if n == 4 and len(cnt) == 1:
-        return ("bomb", ranks[0], 4)
-    if n == 1: return ("single", ranks[0], 1)
-    if n == 2 and len(cnt) == 1: return ("pair", ranks[0], 2)
-    if n == 3 and len(cnt) == 1: return ("triple", ranks[0], 3)
-    if n == 4 and any(c == 3 for c in cnt.values()):
-        trip = [r for r, c in cnt.items() if c == 3]
-        if len(trip) == 1: return ("triple_single", trip[0], 4)
-    if n == 5:
-        trip = [r for r, c in cnt.items() if c == 3]
-        pair = [r for r, c in cnt.items() if c == 2]
-        if len(trip) == 1 and len(pair) == 1: return ("triple_pair", trip[0], 5)
-    if n >= 5 and len(cnt) == n and max(ranks) <= 14 and (max(ranks) - min(ranks) == n - 1):
-        return ("straight", max(ranks), n)
-    if n >= 6 and n % 2 == 0 and all(c == 2 for c in cnt.values()) and max(ranks) <= 14 and (max(ranks) - min(ranks) == len(cnt) - 1):
-        return ("double_straight", max(ranks), n // 2)
-    if n >= 6 and n % 3 == 0 and all(c == 3 for c in cnt.values()) and max(ranks) <= 14 and (max(ranks) - min(ranks) == len(cnt) - 1):
-        return ("airplane", max(ranks), n // 3)
-    trips = sorted([r for r, c in cnt.items() if c >= 3])
-    if trips:
-        for k in range(min(len(trips), n // 4), 0, -1):
-            for start in range(0, len(trips) - k + 1):
-                seq = trips[start:start + k]
-                if all(seq[i + 1] - seq[i] == 1 for i in range(len(seq) - 1)) and max(seq) <= 14:
-                    leftover = n - 3 * k
-                    has_rocket_wing = (cnt.get(16, 0) > 0 and cnt.get(17, 0) > 0 and 16 not in seq and 17 not in seq)
-                    if leftover == k and not has_rocket_wing:
-                        return ("airplane_single", max(seq), k)
-                    if leftover == 2 * k:
-                        ok_pair = True
-                        for r, c in cnt.items():
-                            rem = c - (3 if r in seq else 0)
-                            if rem not in (0, 2):
-                                ok_pair = False; break
-                        if ok_pair and not has_rocket_wing:
-                            return ("airplane_pair", max(seq), k)
-    bombs4 = [r for r, c in cnt.items() if c == 4]
-    if bombs4:
-        r = bombs4[0]; rem = n - 4
-        if rem == 2: return ("four_two_single", r, 6)
-        if rem == 4 and len([c for c in cnt.values() if c == 2]) == 2: return ("four_two_pair", r, 8)
-    return None
-
-def ddz_can_beat(new, old):
-    if not new or not old: return False
-    nt, nk, nl = new; ot, ok, ol = old
-    if nt == "rocket": return True
-    if ot == "rocket": return False
-    if nt == "bomb":
-        return nk > ok if ot == "bomb" else True
-    if ot == "bomb": return False
-    if nt != ot or nl != ol: return False
-    return nk > ok
-
-def ddz_enumerate_type(hand, t, length=None):
-    cnt = Counter(c[0] for c in hand)
-    res = []
-    if t == "single":
-        res = [[c] for c in hand]
-    elif t == "pair":
-        for r, c in cnt.items():
-            if c >= 2: res.append([c2 for c2 in hand if c2[0] == r][:2])
-    elif t == "triple":
-        for r, c in cnt.items():
-            if c >= 3: res.append([c2 for c2 in hand if c2[0] == r][:3])
-    elif t == "triple_single":
-        for r, c in cnt.items():
-            if c >= 3:
-                tri = [c2 for c2 in hand if c2[0] == r][:3]
-                for r2 in cnt:
-                    if r2 != r: res.append(tri + [c2 for c2 in hand if c2[0] == r2][:1])
-    elif t == "triple_pair":
-        for r, c in cnt.items():
-            if c >= 3:
-                tri = [c2 for c2 in hand if c2[0] == r][:3]
-                for r2, c2 in cnt.items():
-                    if r2 != r and c2 >= 2: res.append(tri + [c3 for c3 in hand if c3[0] == r2][:2])
-    elif t == "bomb":
-        for r, c in cnt.items():
-            if c >= 4: res.append([c2 for c2 in hand if c2[0] == r][:4])
-    elif t == "rocket":
-        if cnt.get(16) and cnt.get(17): res.append([c for c in hand if c[0] in (16, 17)])
-    elif t in ("straight", "double_straight", "airplane"):
-        unit = {"straight": 1, "double_straight": 2, "airplane": 3}[t]
-        min_len = {"straight": 5, "double_straight": 3, "airplane": 2}[t]
-        max_len = 12 if t == "straight" else (10 if t == "double_straight" else 6)
-        for L in (range(length, length + 1) if length else range(min_len, max_len + 1)):
-            start = 3
-            while start + L - 1 <= 14:
-                seq = list(range(start, start + L))
-                ok = (t == "straight" and all(c in cnt for c in seq)) or (t == "double_straight" and all(cnt.get(c, 0) >= 2 for c in seq)) or (t == "airplane" and all(cnt.get(c, 0) >= 3 for c in seq))
-                if ok:
-                    cards = []
-                    for r in seq:
-                        cards += [c for c in hand if c[0] == r][:unit]
-                    res.append(cards)
-                start += 1
-    elif t == "airplane_single":
-        for L in range(2, 7):
-            start = 3
-            while start + L - 1 <= 14:
-                seq = list(range(start, start + L))
-                if all(cnt.get(r, 0) >= 3 for r in seq):
-                    tri = [c for r in seq for c in [c2 for c2 in hand if c2[0] == r][:3]]
-                    rem = [c for c in hand if c[0] not in seq]
-                    if len(rem) >= L:
-                        wings = ddz_sort_hand(rem)[:L]
-                        if not (any(w[0] == 16 for w in wings) and any(w[0] == 17 for w in wings)):
-                            res.append(tri + wings)
-                start += 1
-    elif t == "airplane_pair":
-        for L in range(2, 7):
-            start = 3
-            while start + L - 1 <= 14:
-                seq = list(range(start, start + L))
-                if all(cnt.get(r, 0) >= 3 for r in seq):
-                    tri = [c for r in seq for c in [c2 for c2 in hand if c2[0] == r][:3]]
-                    rem = [c for c in hand if c[0] not in seq]
-                    rc = Counter(c[0] for c in rem)
-                    pairs = sorted([r for r, c in rc.items() if c >= 2])
-                    if len(pairs) >= L:
-                        wings = []
-                        for r in pairs[:L]: wings += [c for c in rem if c[0] == r][:2]
-                        res.append(tri + wings)
-                start += 1
-    elif t == "four_two_single":
-        for r, c in cnt.items():
-            if c >= 4:
-                four = [c2 for c2 in hand if c2[0] == r][:4]
-                rem = [c2 for c2 in hand if c2[0] != r]
-                if len(rem) >= 2:
-                    wings = ddz_sort_hand(rem)[:2]
-                    if not (any(w[0] == 16 for w in wings) and any(w[0] == 17 for w in wings)):
-                        res.append(four + wings)
-    elif t == "four_two_pair":
-        for r, c in cnt.items():
-            if c >= 4:
-                four = [c2 for c2 in hand if c2[0] == r][:4]
-                rem = [c2 for c2 in hand if c2[0] != r]
-                rc = Counter(c[0] for c in rem)
-                pairs = sorted([r2 for r2, c2 in rc.items() if c2 >= 2])
-                if len(pairs) >= 2:
-                    wings = []
-                    for r2 in pairs[:2]: wings += [c3 for c3 in rem if c3[0] == r2][:2]
-                    res.append(four + wings)
-    return res
-
-def ddz_find_plays(hand, last_combo):
-    """给定手牌与需压制的牌型（None=首出），返回 [(cards, combo)] 候选。"""
-    if last_combo is None:
-        types = ["single", "pair", "triple", "triple_single", "triple_pair", "straight",
-                 "double_straight", "airplane", "airplane_single", "airplane_pair",
-                 "four_two_single", "four_two_pair", "bomb", "rocket"]
-        out = []
-        for t in types:
-            for cards in ddz_enumerate_type(hand, t):
-                c = ddz_classify(cards)
-                if c: out.append((cards, c))
-        return out
-    t, ok, ol = last_combo
-    out = []
-    for cards in ddz_enumerate_type(hand, t, ol):
-        c = ddz_classify(cards)
-        if c and ddz_can_beat(c, last_combo): out.append((cards, c))
-    return out
-
-def ddz_ai_choose(game, uid):
-    hand = game.hands[uid]
-    last = game.last_combo
-    # 队友保护：当前是农民且上家（last_player）也是农民 → 不压队友
-    if last is not None and game.team(uid) == "farmer" and game.last_player is not None and game.team(game.last_player) == "farmer":
-        # 除非这一手能让自己直接出完
-        cands = ddz_find_plays(hand, last)
-        finisher = [c for c, _ in cands if len(c) == len(hand)]
-        if finisher:
-            return finisher[0], ddz_classify(finisher[0])
-        return None
-    if last is None:
-        cands = ddz_find_plays(hand, None)
-        if not cands: return None
-        # 优先出长牌型甩牌，避免拆炸弹/火箭，挑最小点数
-        normal = [x for x in cands if x[1][0] not in ("bomb", "rocket")]
-        pool = normal if normal else cands
-        pool.sort(key=lambda x: (-len(x[0]), x[1][1]))
-        return pool[0]
-    cands = ddz_find_plays(hand, last)
-    if not cands: return None
-    normal = [x for x in cands if x[1][0] not in ("bomb", "rocket")]
-    if normal:
-        normal.sort(key=lambda x: (x[1][1], len(x[0])))
-        return normal[0]
-    # 只剩炸弹/火箭能压：手牌较多时保留，否则用
-    if len(hand) <= 4:
-        cands.sort(key=lambda x: (0 if x[1][0] == "rocket" else 1, x[1][1]))
-        return cands[0]
-    return None
-
-
-class DouDizhuGame:
-    def __init__(self, cid, owner_id, mode=None):
-        self.chat_id, self.owner_id, self.mode = cid, owner_id, mode or current_game_mode()
-        self.phase = "waiting"
-        self.players = []          # 座位顺序 uid（真人>0，电脑<0）
-        self.hands = {}
-        self.robot_names = {}
-        self.bottom = []
-        self.landlord = None
-        self.seat_order = []
-        self.turn_idx = 0
-        self.last_combo = None
-        self.last_player = None
-        self.pass_count = 0
-        self.selected = set()      # 当前出牌者选中的牌 (rank, suit)
-        self.bids = {}
-        self.max_bid = 0
-        self.landlord_candidate = None
-        self.bid_idx = 0
-        self.bid_actions = 0
-        self.multiplier = 1
-        self.bomb_count = 0
-        self.rocket_count = 0
-        self.farmer_played = False
-        self.landlord_plays = 0
-        self.private = True  # 默认私聊发牌（隐藏手牌，公平对战）；私聊失败自动降级群内公开
-        self.public_hands = set()  # 私聊失败降级后公开手牌的玩家
-        self.group_msg_id = None
-        self.create_time = time.time()
-        self.wait_task = None
-        self.busy = False          # 防止并发出牌重入
-        self.settled = False
-
-    # ---- 房间管理 ----
-    def add(self, uid):
-        if self.phase != "waiting" or uid in self.players or len(self.players) >= DDZ_MAX_PLAYERS:
-            return False
-        self.players.append(uid); return True
-
-    def add_robot(self):
-        if self.phase != "waiting" or len(self.players) >= DDZ_MAX_PLAYERS:
-            return False
-        rid = -(200000 + random.randint(0, 899999))
-        while rid in self.players: rid = -(200000 + random.randint(0, 899999))
-        used = set(self.robot_names.values())
-        name = next((n for n in DDZ_ROBOT_NAMES if n not in used), f"🤖AI-{len(self.robot_names)+1}")
-        self.robot_names[rid] = name; self.players.append(rid); return True
-
-    def leave(self, uid):
-        if self.phase != "waiting" or uid not in self.players: return False
-        self.players.remove(uid); self.robot_names.pop(uid, None); return True
-
-    def is_robot(self, uid): return uid < 0
-
-    def team(self, uid): return "landlord" if uid == self.landlord else "farmer"
-
-    def current_uid(self):
-        if self.phase == "bidding":
-            return self.seat_order[self.bid_idx]
-        return self.seat_order[self.turn_idx]
-
-    def cancel_wait(self):
-        if self.wait_task and not self.wait_task.done():
-            self.wait_task.cancel(); self.wait_task = None
-
-    # ---- 发牌 + 叫分 ----
-    def deal(self):
-        deck = ddz_make_deck(); random.shuffle(deck)
-        self.hands = {uid: [deck.pop() for _ in range(17)] for uid in self.players}
-        self.bottom = [deck.pop() for _ in range(3)]
-        self.seat_order = self.players[:]
-        for uid in self.players:
-            if uid >= 0: ddz_user_game[uid] = self.chat_id
-        self.phase = "bidding"
-        self.bids = {}; self.max_bid = 0; self.landlord_candidate = None
-        self.bid_idx = 0; self.bid_actions = 0
-        self.turn_idx = random.randrange(len(self.seat_order))
-
-    def apply_bid(self, uid, value):
-        """value: 0=不叫, 1/2/3=叫分。返回 'continue'/'finalize'/'done'。"""
-        if uid != self.seat_order[self.bid_idx]: return "done"
-        self.bids[uid] = value; self.bid_actions += 1
-        if value > self.max_bid:
-            self.max_bid = value; self.landlord_candidate = uid
-        if value == 3 or self.bid_actions >= len(self.seat_order):
-            return "finalize"
-        self.bid_idx = (self.bid_idx + 1) % len(self.seat_order)
-        return "continue"
-
-    def finalize_bid(self):
-        if self.max_bid == 0:
-            return False  # 全部不叫，流局
-        self.landlord = self.landlord_candidate
-        self.hands[self.landlord] += self.bottom
-        self.multiplier = self.max_bid
-        self.phase = "playing"
-        self.turn_idx = self.seat_order.index(self.landlord)
-        self.last_combo = None; self.last_player = None; self.pass_count = 0
-        self.selected.clear()
-        return True
-
-    def ai_bid(self, uid):
-        hand = self.hands[uid]
-        hi = sum(1 for c in hand if c[0] >= 15)  # 2 与王
-        bombs = sum(1 for r, c in Counter(c[0] for c in hand).items() if c == 4)
-        strength = hi + bombs * 2
-        bid = 0
-        if strength >= 5 or bombs >= 1: bid = 3
-        elif strength >= 3: bid = 2
-        elif strength >= 1: bid = 1
-        if bid <= self.max_bid: bid = 0
-        return bid
-
-    # ---- 出牌 / 过牌 ----
-    def remove_cards(self, uid, cards):
-        for c in cards:
-            self.hands[uid].remove(c)
-
-    def do_play(self, uid, cards):
-        combo = ddz_classify(cards)
-        if not combo: return False, "牌型不合法"
-        if self.last_combo and not ddz_can_beat(combo, self.last_combo):
-            return False, "压不过上家"
-        self.remove_cards(uid, cards)
-        self.last_combo = combo; self.last_player = uid; self.pass_count = 0
-        self._last_cards = cards  # 与上家归属同步，人和机器人出牌都走这里，避免张冠李戴
-        self.selected.clear()
-        if combo[0] == "bomb": self.multiplier *= 2; self.bomb_count += 1
-        elif combo[0] == "rocket": self.multiplier *= 2; self.rocket_count += 1
-        if self.team(uid) == "farmer": self.farmer_played = True
-        else: self.landlord_plays += 1
-        return True, ""
-
-    def do_pass(self, uid):
-        if self.last_combo is None: return False, "你是首出，必须出牌"
-        self.pass_count += 1
-        if self.pass_count >= 2:
-            self.last_combo = None; self.last_player = None; self.pass_count = 0
-        return True, ""
-
-    def advance(self):
-        self.turn_idx = (self.turn_idx + 1) % len(self.seat_order)
-
-    def check_winner(self):
-        for uid in self.seat_order:
-            if not self.hands[uid]: return uid
-        return None
-
-
-async def ddz_ai_bid_action(game, app, uid):
-    await asyncio.sleep(1.2)
-    val = game.ai_bid(uid)
-    await ddz_apply_bid(game, app, uid, val)
-
-async def ddz_apply_bid(game, app, uid, value):
-    if game.phase != "bidding": return
-    if uid != game.seat_order[game.bid_idx]: return
-    result = game.apply_bid(uid, value)
-    if result == "finalize":
-        if not game.finalize_bid():
-            await ddz_group(app, game, custom="⌛ 三家都不叫，本局流局。")
-            active_ddz_games.pop(game.chat_id, None)
-            for u in list(game.players): ddz_user_game.pop(u, None)
-            await ddz_notify_dms_ended(app, game.chat_id)
-            return
-        await ddz_refresh_all(app, game)
-        await ddz_maybe_bot(app, game)
-    else:
-        await ddz_refresh_all(app, game)
-        await ddz_maybe_bot(app, game)
-
-
-async def ddz_maybe_bot(app, game):
-    """若当前行动者是电脑人，则安排其自动行动（叫分或出牌）。"""
-    if game.phase not in ("bidding", "playing"): return
-    uid = game.current_uid()
-    if not game.is_robot(uid): return
-    if game.phase == "bidding":
-        asyncio.create_task(ddz_ai_bid_action(game, app, uid))
-    else:
-        asyncio.create_task(ddz_bot_play(game, app, uid))
-
-async def ddz_bot_play(game, app, uid):
-    await asyncio.sleep(1.5)
-    if game.phase != "playing" or game.current_uid() != uid: return
-    choice = ddz_ai_choose(game, uid)
-    if choice is None:
-        ok, msg = game.do_pass(uid)
-        await ddz_after_action(app, game, uid, ok, msg, passed=True)
-    else:
-        cards, _ = choice
-        ok, msg = game.do_play(uid, cards)
-        await ddz_after_action(app, game, uid, ok, msg, played=cards)
-
-async def ddz_after_action(app, game, uid, ok, msg, played=None, passed=False):
-    if not ok:
-        # 出错不入栈，交由调用方提示
-        return
-    winner = game.check_winner()
-    if winner is not None:
-        await ddz_settle(game, app, winner)
-        return
-    game.advance()
-    await ddz_refresh_all(app, game)
-    await ddz_maybe_bot(app, game)
-
-
-async def ddz_refresh_all(app, game):
-    """刷新群消息 + 各真人私聊手牌。"""
-    await ddz_group(app, game)
-    if game.private:
-        for uid in game.seat_order:
-            if not game.is_robot(uid):
-                await ddz_dm(app, game, uid)
-
-
-async def ddz_dm(app, game, uid):
-    """给真人私聊发/更新其手牌与操作键。失败则降级为群内公开。"""
-    if uid in game.public_hands: return
-    text, kb = ddz_dm_board(game, uid)
-    msg_id = ddz_dm_msgs.get((game.chat_id, uid))
-    try:
-        if msg_id:
-            await safe_edit(app.bot, uid, msg_id, text, reply_markup=kb, parse_mode="HTML")
-        else:
-            msg = await safe_send(app.bot, uid, text, reply_markup=kb, parse_mode="HTML")
-            if msg: ddz_dm_msgs[(game.chat_id, uid)] = msg.message_id
-    except Exception:
-        # 私聊失败（用户未 /start 机器人等）→ 降级群内公开该玩家手牌
-        game.public_hands.add(uid)
-        ddz_dm_msgs.pop((game.chat_id, uid), None)
-        await ddz_group(app, game, custom=f"⚠️ 无法向 {await get_name(app, uid)} 私聊发牌（请先私聊机器人 /start），其手牌改为群内公开。")
-
-
-async def ddz_notify_dms_ended(app, group_cid, text="⚠️ 此局斗地主已结束，请到群里发起新一局。"):
-    """对某群所有真人私聊的牌局消息改为「已结束」并去掉键盘，避免僵尸按钮继续触发弹窗。"""
-    for (cid, uid) in [k for k in list(ddz_dm_msgs) if k[0] == group_cid]:
-        msg_id = ddz_dm_msgs.pop((cid, uid), None)
-        if msg_id:
-            try:
-                await safe_edit(app.bot, uid, msg_id, text, reply_markup=None)
-            except Exception:
-                pass
-
-
-def ddz_dm_board(game, uid):
-    hand = ddz_sort_hand(game.hands[uid])
-    sel = game.selected if game.current_uid() == uid else set()
-    my_turn = game.current_uid() == uid
-    text = [f"🃏 <b>你的斗地主手牌</b>（{len(hand)} 张）", "━"*14]
-    if game.phase == "bidding":
-        bidding = game.seat_order[game.bid_idx] == uid
-        text.append(f"{'👉 轮到你叫分' if bidding else '⏳ 等待其他玩家叫分'}")
-        text.append(f"当前最高分：{game.max_bid or '无'}")
-    elif game.phase == "playing":
-        text.append(f"{'👉 轮到你出牌' if my_turn else '⏳ 等待其他玩家出牌'}")
-        if game.last_combo and game.last_player is not None:
-            text.append(f"上家出：{ddz_hand_str(getattr(game, '_last_cards', []) or [])}（{game.last_combo[0]}）")
-    text.append("")
-    text.append(ddz_hand_str(hand))
-    rows = []
-    for i in range(0, len(hand), 5):
-        chunk = hand[i:i+5]
-        rows.append([InlineKeyboardButton(("✅" if c in sel else "") + ddz_card_str(c), callback_data=f"ddz_c_{c[0]}_{DDZ_SUIT_IDX.get(c[1])}") for c in chunk])
-    if game.phase == "bidding" and game.seat_order[game.bid_idx] == uid:
-        rows.append([InlineKeyboardButton("1分", callback_data="ddz_bid_1"),
-                     InlineKeyboardButton("2分", callback_data="ddz_bid_2"),
-                     InlineKeyboardButton("3分", callback_data="ddz_bid_3"),
-                     InlineKeyboardButton("不叫", callback_data="ddz_bid_0")])
-    elif game.phase == "playing" and my_turn:
-        rows.append([InlineKeyboardButton("🎯 出牌", callback_data="ddz_play"),
-                     InlineKeyboardButton("⏭️ 不出", callback_data="ddz_pass"),
-                     InlineKeyboardButton("💡 提示", callback_data="ddz_hint")])
-    return "\n".join(text), InlineKeyboardMarkup(rows)
-
-
-async def ddz_group(app, game, custom=None):
-    text, kb = await ddz_group_board(app, game, custom)
-    if game.group_msg_id:
-        await safe_edit(app.bot, game.chat_id, game.group_msg_id, text, reply_markup=kb, parse_mode="HTML")
-    else:
-        msg = await safe_send(app.bot, game.chat_id, text, reply_markup=kb, parse_mode="HTML")
-        if msg: game.group_msg_id = msg.message_id
-
-
-async def ddz_group_board(app, game, custom=None):
-    if game.phase == "waiting":
-        remain = max(0, int(ROOM_WAIT_TIMEOUT - (time.time() - game.create_time)))
-        text = ["🎴 <b>斗地主</b> 🎴", "━"*14,
-                f"👥 已加入：{len(game.players)}/{DDZ_MAX_PLAYERS}", ""]
-        for uid in game.players:
-            text.append(f"🤖 {game.robot_names.get(uid)}" if uid < 0 else f"👤 {await get_name(app, uid)}")
-        text.append("")
-        text.append(f"⏰ {remain} 秒后自动开始或解散")
-        kb = [[InlineKeyboardButton("📥 加入", callback_data="ddz_join")]]
-        if len(game.players) < DDZ_MAX_PLAYERS:
-            kb.append([InlineKeyboardButton("🤖 加电脑人", callback_data="ddz_robot")])
-        if len(game.players) >= DDZ_MIN_PLAYERS:
-            kb.append([InlineKeyboardButton("🎮 开始", callback_data="ddz_start")])
-        kb.append([InlineKeyboardButton("🚪 退出", callback_data="ddz_leave"), InlineKeyboardButton("❌ 终止", callback_data="ddz_end")])
-        return "\n".join(text), InlineKeyboardMarkup(kb)
-
-    names = {}
-    for uid in game.seat_order:
-        names[uid] = game.robot_names.get(uid) if uid < 0 else await get_name(app, uid)
-    text = ["🎴 <b>斗地主</b> 🎴", "━"*14]
-    if custom:
-        text.extend([custom, ""])
-    if game.phase == "bidding":
-        bidder = game.seat_order[game.bid_idx]
-        text.append(f"📢 叫分轮到：{names.get(bidder)}")
-        text.append(f"当前最高分：{game.max_bid or '无'}")
-        if bidder in game.public_hands or not game.private:
-            text.append(f"🃏 {names.get(bidder)} 的手牌：{ddz_hand_str(ddz_sort_hand(game.hands[bidder]))}")
-        else:
-            text.append("💡 请去私聊查看你的手牌后再叫分（其他人看不到）。")
-        text.append("👇 叫分（公开操作，按钮所有人可见）：")
-        kb = [[InlineKeyboardButton("1分", callback_data="ddz_bid_1"),
-               InlineKeyboardButton("2分", callback_data="ddz_bid_2"),
-               InlineKeyboardButton("3分", callback_data="ddz_bid_3"),
-               InlineKeyboardButton("不叫", callback_data="ddz_bid_0")]]
-        return "\n".join(text), InlineKeyboardMarkup(kb)
-
-    # playing
-    cur = game.current_uid()
-    text.append(f"👑 地主：{names.get(game.landlord)} ｜ 倍数：{game.multiplier} ｜ 底分：{game.max_bid}")
-    text.append("")
-    for uid in game.seat_order:
-        tag = "👑" if uid == game.landlord else "👤"
-        text.append(f"{tag} {names.get(uid)}：剩 {len(game.hands[uid])} 张")
-    text.append("")
-    if game.last_combo and game.last_player is not None:
-        text.append(f"🂠 上家（{names.get(game.last_player)}）出：{ddz_hand_str(getattr(game, '_last_cards', []) or [])}")
-    else:
-        text.append("🂠 当前为首出")
-    text.append("")
-    cur_name = names.get(cur)
-    if cur in game.public_hands or not game.private:
-        # 公开模式下当前玩家手牌可交互
-        text.append(f"👉 轮到 {cur_name} 出牌（手牌公开如下）：")
-        hand = ddz_sort_hand(game.hands[cur])
-        sel = game.selected if (cur == game.current_uid()) else set()
-        text.append(ddz_hand_str(hand))
-        rows = []
-        for i in range(0, len(hand), 5):
-            chunk = hand[i:i+5]
-            rows.append([InlineKeyboardButton(("✅" if c in sel else "") + ddz_card_str(c), callback_data=f"ddz_c_{c[0]}_{DDZ_SUIT_IDX.get(c[1])}") for c in chunk])
-        if cur == game.current_uid():
-            rows.append([InlineKeyboardButton("🎯 出牌", callback_data="ddz_play"),
-                         InlineKeyboardButton("⏭️ 不出", callback_data="ddz_pass"),
-                         InlineKeyboardButton("💡 提示", callback_data="ddz_hint")])
-        return "\n".join(text), InlineKeyboardMarkup(rows)
-    else:
-        if game.is_robot(cur):
-            text.append(f"👉 轮到 {cur_name} 出牌（电脑人思考中…）")
-        else:
-            text.append(f"👉 轮到 {cur_name} 出牌（请去私聊选牌）")
-        text.append("💡 其他人看不到任何人的手牌，公平对战。")
-        kb = [[InlineKeyboardButton("🎴 查看我的手牌", callback_data="ddz_myhand")]]
-        return "\n".join(text), InlineKeyboardMarkup(kb)
-
-
-async def ddz_settle(game, app, winner):
-    if game.settled: return
-    game.settled = True
-    game.phase = "finished"
-    mode = game.mode
-    stake = game.max_bid * game.multiplier
-    landlord_win = game.team(winner) == "landlord"
-    # 春天判定
-    if landlord_win and not game.farmer_played: stake *= 2
-    if (not landlord_win) and game.landlord_plays <= 1: stake *= 2
-    wallet = game_chips
-    date = business_date()
-    lines = ["🏁 <b>斗地主 结算</b>", "━"*14]
-    names = {}
-    for uid in game.seat_order:
-        names[uid] = game.robot_names.get(uid) if uid < 0 else await get_name(app, uid)
-    results = []
-    for uid in game.seat_order:
-        if uid == game.landlord:
-            net = stake * 2 if landlord_win else -stake * 2
-        else:
-            net = -stake if landlord_win else stake
-        results.append((uid, net))
-        if uid >= 0 and mode == "official":
-            ddz_profit_by_date[date][game.chat_id][uid] += net
-        if uid >= 0:
-            wallet[game.chat_id][uid] += net
-    win_side = "👑 地主" if landlord_win else "👤 农民"
-    lines.append(f"🎉 胜方：{win_side}（{names.get(winner)}）｜ 底分 {game.max_bid} × 倍数 {game.multiplier} = <b>{stake}</b>")
-    lines.append("")
-    for uid, net in results:
-        lines.append(f"{names.get(uid)}：{net:+d}")
-    lines.append("")
-    rank = sorted(total_profit_by_game(ddz_profit_by_date, game.chat_id).items(), key=lambda x: x[1], reverse=True)[:50]
-    if rank:
-        lines.append("🏆 <b>斗地主 累计盈利榜</b>")
-        for i, (u, a) in enumerate(rank, 1):
-            if u < 0: continue
-            un = names.get(u) or await get_name(app, u)
-            lines.append(f"{rank_marker(i)} {un}：{a:+d}")
-    active_ddz_games.pop(game.chat_id, None)
-    for u in list(game.players): ddz_user_game.pop(u, None)
-    for key in list(ddz_dm_msgs):
-        if key[0] == game.chat_id: ddz_dm_msgs.pop(key, None)
-    await ddz_notify_dms_ended(app, game.chat_id)
-    await safe_delete(app.bot, game.chat_id, game.group_msg_id)
-    await safe_send_long(app.bot, game.chat_id, "\n".join(lines), parse_mode="HTML")
-    save_data()
-
-
-async def cmd_ddz(update, context):
-    if not await need_auth(update): return
-    if not await require_group_chat(update, "斗地主", "ddz"): return
-    cid, uid = update.effective_chat.id, update.effective_user.id
-    if cid in active_ddz_games:
-        g = active_ddz_games[cid]
-        if g.phase == "waiting":
-            text, kb = await ddz_group_board(context.application, g)
-            msg = await safe_send(context.bot, cid, text, reply_markup=kb, parse_mode="HTML")
-            if msg: g.group_msg_id = msg.message_id
-        else:
-            await update.message.reply_text("当前已有 斗地主 进行中。")
-        return
-    game = DouDizhuGame(cid, uid, current_game_mode())
-    active_ddz_games[cid] = game
-    await ddz_group(context.application, game)
-    game.cancel_wait()
-    async def expire():
-        await asyncio.sleep(ROOM_WAIT_TIMEOUT)
-        if game.phase != "waiting" or active_ddz_games.get(cid) is not game: return
-        active_ddz_games.pop(cid, None)
-        for u in list(game.players): ddz_user_game.pop(u, None)
-        await ddz_notify_dms_ended(context.application, cid)
-        await safe_edit(context.bot, cid, game.group_msg_id, f"⌛ 斗地主等待 {ROOM_WAIT_TIMEOUT} 秒人数不足，房间已解散。", reply_markup=None)
-    game.wait_task = asyncio.create_task(expire())
-
-
-async def cmd_ddz_rank(update, context):
-    if not await need_auth(update): return
-    cid = update.effective_chat.id
-    lines = ["🏆 斗地主 累计盈利榜", "━"*14]
-    rank = sorted(total_profit_by_game(ddz_profit_by_date, cid).items(), key=lambda x: x[1], reverse=True)[:50]
-    if not rank:
-        lines.append("暂无记录"); await safe_send_long(context.bot, cid, "\n".join(lines)); return
-    for i, (u, a) in enumerate(rank, 1):
-        if u < 0: continue
-        lines.append(f"{rank_marker(i)} {await get_name(context.application, u)}：{a:+d}")
-    await safe_send_long(context.bot, cid, "\n".join(lines))
-
-
-async def ddz_handle_button(update, context, q, cid, uid, data):
-    game = active_ddz_games.get(cid)
-    if not game:
-        await q.answer("斗地主已结束", show_alert=True); return
-    app = context.application
-    # 等待房
-    if data == "ddz_join":
-        if not game.add(uid): await q.answer("房间已满或已开始", show_alert=True); return
-        await q.answer("已加入"); await ddz_group(app, game); return
-    if data == "ddz_robot":
-        if uid != game.owner_id and not is_bot_admin(uid): await q.answer("仅发起人可加电脑人", show_alert=True); return
-        if not game.add_robot(): await q.answer("房间已满", show_alert=True); return
-        await q.answer("已加入电脑人"); await ddz_group(app, game); return
-    if data == "ddz_start":
-        if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
-        if len(game.players) < DDZ_MIN_PLAYERS: await q.answer("人数不足", show_alert=True); return
-        while len(game.players) < DDZ_MAX_PLAYERS: game.add_robot()
-        game.cancel_wait(); game.deal()
-        await ddz_refresh_all(app, game)
-        await ddz_maybe_bot(app, game); return
-    if data == "ddz_leave":
-        if not game.leave(uid): await q.answer("你不在房间内", show_alert=True); return
-        await q.answer("已退出"); await ddz_group(app, game); return
-    if data == "ddz_end":
-        if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
-        game.cancel_wait(); active_ddz_games.pop(cid, None)
-        for u in list(game.players): ddz_user_game.pop(u, None)
-        await ddz_notify_dms_ended(app, cid)
-        await safe_edit(context.bot, cid, game.group_msg_id, "🛑 斗地主已手动终止。", reply_markup=None); return
-
-    if game.phase == "bidding":
-        if data.startswith("ddz_bid_"):
-            val = int(data.split("_")[2])
-            if uid != game.seat_order[game.bid_idx]: await q.answer("还没轮到你叫分", show_alert=True); return
-            await q.answer(f"你叫了 {val or '不叫'}"); await ddz_apply_bid(game, app, uid, val); return
-        if data == "ddz_myhand":
-            if uid < 0: return
-            text, kb = ddz_dm_board(game, uid)
-            await q.answer(text, show_alert=True); return
-
-    if game.phase == "playing":
-        cur = game.current_uid()
-        if data == "ddz_myhand":
-            if uid < 0: return
-            text, kb = ddz_dm_board(game, uid)
-            await q.answer(text, show_alert=True); return
-        if uid != cur:
-            await q.answer("还没轮到你", show_alert=True); return
-        if data.startswith("ddz_c_"):
-            parts = data.split("_"); r = int(parts[2]); s_idx = int(parts[3])
-            suit = {0:"♠",1:"♥",2:"♣",3:"♦",4:None}.get(s_idx)
-            card = (r, suit)
-            if card in game.selected: game.selected.discard(card)
-            else: game.selected.add(card)
-            await q.answer(); 
-            if game.private and uid not in game.public_hands: await ddz_dm(app, game, uid)
-            else: await ddz_group(app, game); return
-        if data == "ddz_play":
-            cards = [c for c in game.hands[uid] if (c[0], c[1]) in game.selected]
-            if not cards: await q.answer("请先选牌", show_alert=True); return
-            ok, msg = game.do_play(uid, cards)
-            if not ok: await q.answer(msg or "出牌无效", show_alert=True); return
-            await q.answer("出牌"); await ddz_after_action(app, game, uid, True, "", played=cards); return
-        if data == "ddz_pass":
-            ok, msg = game.do_pass(uid)
-            if not ok: await q.answer(msg or "不能过牌", show_alert=True); return
-            await q.answer("不出"); await ddz_after_action(app, game, uid, True, "", passed=True); return
-        if data == "ddz_hint":
-            choice = ddz_ai_choose(game, uid)
-            game.selected.clear()
-            if choice is None:
-                await q.answer("没有能压过的牌，建议不出", show_alert=True); return
-            cards, _ = choice
-            for c in cards: game.selected.add((c[0], c[1]))
-            await q.answer(f"建议：{ddz_hand_str(cards)}"); 
-            if game.private and uid not in game.public_hands: await ddz_dm(app, game, uid)
-            else: await ddz_group(app, game); return
-    await q.answer()
-
-
-# 给 DouDizhuGame 补一个名字查询helper（避免循环依赖）
-def _ddz_seat_name(self, uid, app=None):
-    return self.robot_names.get(uid) if uid < 0 else "玩家"
-DouDizhuGame.seat_name = _ddz_seat_name
 
 SLOT_SYMBOLS = ["🍒", "🍋", "🍊", "🍇", "🔔", "💎", "7️⃣"]
 
@@ -3457,6 +2742,8 @@ async def cmd_dz(update, context):
         label = "积分"
         await update.message.reply_text(f"❌ 进入德州至少需要 {MIN_ENTRY_CHIPS} {label}。"); return
     if game:
+        if game.season:
+            await update.message.reply_text("当前有排位赛房间，请用 /排位 加入或开局。"); return
         if game.phase != "waiting": await update.message.reply_text("当前已有进行中的德州扑克。"); return
         if game.add(uid):
             await update_poker_waiting(game, context.application); await update.message.reply_text("已加入当前等待房间。")
@@ -3464,6 +2751,235 @@ async def cmd_dz(update, context):
         return
     recent_poker_reveals.pop(cid, None)
     game = PokerGame(cid, uid, mode); game.add(uid); active_poker_games[cid] = game
+    msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 加入游戏", callback_data="texas_join")], [InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")]]))
+    if msg:
+        game.game_msg_id = msg.message_id
+        await start_wait_timeout(game, context.application)
+
+# ---------- 德州排位赛命令 ----------
+async def start_season(cid, name="", forced=False):
+    """开启新赛季：给所有已报名者发放起始分。返回 (ok, msg)。"""
+    global season_active, season_id, season_name, season_start_ts, season_end_ts
+    if season_active:
+        return True, "already_active"  # 幂等：已在赛季中，不重复初始化（防自动开赛竞态双击）
+    joined = season_joined.get(cid, set())
+    if not forced and len(joined) < SEASON_MIN_PLAYERS:
+        return False, f"需满 {SEASON_MIN_PLAYERS} 人报名才能开赛（当前 {len(joined)} 人）"
+    season_active = True
+    season_id = now_bj().strftime("%Y%m%d")
+    season_name = name or f"第{season_id}赛季"
+    season_start_ts = int(now_bj().timestamp())
+    season_end_ts = season_start_ts + SEASON_DAYS * 86400
+    season_points[cid] = defaultdict(int)
+    season_games[cid] = defaultdict(int)
+    season_rebuy[cid] = defaultdict(int)
+    for uid in joined:
+        season_points[cid][uid] = SEASON_START_CHIPS
+        season_games[cid][uid] = 0
+        season_rebuy[cid][uid] = 0
+    season_eliminated[cid] = set()
+    save_data()
+    return True, None
+
+
+async def season_settle(app, manual=False):
+    """赛季结算：按当前排位分排名（过滤未达最少局数者），推榜后重置。"""
+    global season_active, season_id, season_name, season_start_ts, season_end_ts
+    if not season_active:
+        return
+    for cid, users in season_points.items():
+        standings = sorted(users.items(), key=lambda x: (-x[1], x[0]))
+        eligible = [(uid, val) for uid, val in standings if uid >= 0 and season_games[cid].get(uid, 0) >= SEASON_MIN_GAMES]
+        lines = [f"🏆 第{season_id}赛季最终榜（{season_name or '排位赛'}）", "━" * 18]
+        if not eligible:
+            lines.append("本赛季无达标玩家。")
+        for i, (uid, val) in enumerate(eligible[:50], 1):
+            g = season_games[cid].get(uid, 0)
+            lines.append(f"{rank_marker(i)} {await get_name(app, uid)}：{val}｜{g}局")
+        lines.extend(["", "⚠️ 结算时刻进行中的牌局不计入本赛季。", "🎁 奖励由管理员另行发放。"])
+        await safe_send_long(app.bot, cid, "\n".join(lines))
+    # 进行中的排位牌局：本手结算不计入排名，提前告知玩家（赛季已结束后其 settle_poker 仅派奖不写回）
+    for g in list(active_poker_games.values()):
+        if getattr(g, "season", False) and getattr(g, "phase", "waiting") != "waiting" and g.chat_id in season_points:
+            try:
+                await safe_send(app.bot, g.chat_id, "⏰ 赛季已结束，本手牌结算不计入排位排名（仍正常派奖）。")
+            except Exception:
+                pass
+    season_active = False
+    season_id = None
+    season_name = ""
+    season_start_ts = 0
+    season_end_ts = 0
+    season_points.clear(); season_games.clear(); season_joined.clear(); season_rebuy.clear(); season_eliminated.clear()
+    season_lobby_msg.clear()  # 大厅看板为 UI 态，结算后清空，下赛季重新发
+    save_data()
+
+
+async def season_standings_lines(app, cid):
+    users = season_points.get(cid, {})
+    standings = sorted(users.items(), key=lambda x: (-x[1], x[0]))
+    remain = max(0, int((season_end_ts - now_bj().timestamp()) / 86400))
+    lines = [f"🏆 第{season_id}赛季排位榜（{season_name or '排位赛'}）",
+             f"⏳ 剩余约 {remain} 天｜上榜需≥{SEASON_MIN_GAMES}局", "━" * 18]
+    if not standings:
+        lines.append("暂无数据")
+    for i, (uid, val) in enumerate(standings[:50], 1):
+        g = season_games[cid].get(uid, 0)
+        tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
+        lines.append(f"{rank_marker(i)} {await get_name(app, uid)}：{val}｜{g}局{tag}")
+    return lines
+
+
+async def season_signup(app, cid, uid):
+    """报名 / 赛中补报名。处理自动开赛。返回 (ok, key)。key∈joining/started/joined_active。"""
+    if uid in season_eliminated.get(cid, set()):
+        return False, "eliminated"
+    if season_active:
+        season_joined.setdefault(cid, set()).add(uid)
+        if uid not in season_points.get(cid, {}):
+            season_points[cid][uid] = SEASON_START_CHIPS
+            season_games[cid][uid] = 0
+            season_rebuy[cid][uid] = 0
+        save_data()
+        return True, "joined_active"
+    season_joined.setdefault(cid, set()).add(uid)
+    save_data()
+    n = len(season_joined[cid])
+    if n >= SEASON_MIN_PLAYERS:
+        ok, msg = await start_season(cid)
+        # 只有真正“首次开赛”的那次才回 started；并发点按钮导致的二次进入回 joined_active
+        return True, "started" if (ok and msg != "already_active") else "joined_active"
+    return True, "joining"
+
+
+def season_lobby_content(app, cid):
+    """返回 (text, reply_markup) 排位大厅看板，按赛季状态切换。"""
+    if not season_active:
+        n = len(season_joined.get(cid, set()))
+        text = (f"🏆 <b>排位赛报名大厅</b>\n\n"
+                f"当前报名：<b>{n}/{SEASON_MIN_PLAYERS}</b> 人\n"
+                f"满 {SEASON_MIN_PLAYERS} 人自动开赛，每人 {SEASON_START_CHIPS} 分，周期 {SEASON_DAYS} 天。\n"
+                f"点下面按钮报名，或用 /排位 也能一键报名。")
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"📝 报名参赛（{n}/{SEASON_MIN_PLAYERS}）", callback_data="season_signup")],
+            [InlineKeyboardButton("❌ 关闭看板", callback_data="season_lobby_close")],
+        ])
+    else:
+        remain = max(0, int((season_end_ts - now_bj().timestamp()) / 86400))
+        text = (f"🏆 <b>第{season_id}赛季「{season_name or '排位赛'}」进行中</b>\n\n"
+                f"⏳ 剩余约 {remain} 天｜上榜需≥{SEASON_MIN_GAMES}局\n"
+                f"用 /排位 开局入座；中途想加入点下面按钮。")
+        markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📝 中途报名加入", callback_data="season_signup")],
+            [InlineKeyboardButton("📊 看排位榜", callback_data="season_rank_btn")],
+            [InlineKeyboardButton("❌ 关闭看板", callback_data="season_lobby_close")],
+        ])
+    return text, markup
+
+
+async def render_season_lobby(app, cid):
+    """编辑已有大厅看板，没有则新发。"""
+    text, markup = season_lobby_content(app, cid)
+    mid = season_lobby_msg.get(cid)
+    if mid:
+        try:
+            await safe_edit(app.bot, cid, mid, text, reply_markup=markup)
+            return
+        except Exception:
+            pass
+    msg = await safe_send(app.bot, cid, text, reply_markup=markup)
+    if msg:
+        season_lobby_msg[cid] = msg.message_id
+
+
+async def cmd_season_join(update, context):
+    if not await need_auth(update): return
+    if not await require_group_chat(update, "德州排位赛", "排位"): return
+    cid, uid = update.effective_chat.id, update.effective_user.id
+    ok, key = await season_signup(context.application, cid, uid)
+    if not ok:
+        await update.message.reply_text("❌ 你已被淘汰，无法报名本赛季。"); return
+    await render_season_lobby(context.application, cid)
+    if key == "started":
+        await update.message.reply_text(f"🏆 报名满 {SEASON_MIN_PLAYERS} 人，第{season_id}赛季「{season_name or '排位赛'}」开始！每人 {SEASON_START_CHIPS} 分，周期 {SEASON_DAYS} 天。用 /排位 开局。")
+    elif key == "joined_active":
+        await update.message.reply_text(f"✅ 已加入进行中的赛季（需满 {SEASON_MIN_GAMES} 局才上榜）。当前分 {season_points[cid][uid]}。用 /排位 开局。")
+    else:
+        n = len(season_joined[cid])
+        await update.message.reply_text(f"✅ 已报名本赛季排位赛（{n}/{SEASON_MIN_PLAYERS}）。满 {SEASON_MIN_PLAYERS} 人自动开赛；也可点群里的大厅看板报名。")
+
+
+async def cmd_season_start(update, context):
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可强制开赛"); return
+    if not await require_group_chat(update, "德州排位赛", "排位"): return
+    cid = update.effective_chat.id
+    if season_active:
+        await update.message.reply_text("⚠️ 本赛季已在进行中。"); return
+    name = " ".join(context.args) if context.args else ""
+    ok, msg = await start_season(cid, name, forced=True)
+    if ok:
+        await update.message.reply_text(f"🏆 第{season_id}赛季「{season_name or '排位赛'}」由管理员强制开启！每人 {SEASON_START_CHIPS} 分，周期 {SEASON_DAYS} 天。用 /排位 开局。")
+    else:
+        await update.message.reply_text(msg)
+
+
+async def cmd_season_end(update, context):
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    cid = update.effective_chat.id
+    if not season_active:
+        await update.message.reply_text("⚠️ 当前无进行中的赛季。"); return
+    await season_settle(context.application, manual=True)
+    await update.message.reply_text("🏁 赛季已手动结算并重置。")
+
+
+async def cmd_season_rank(update, context):
+    if not await need_auth(update): return
+    cid = update.effective_chat.id
+    if not season_active:
+        await update.message.reply_text("⚠️ 当前无进行中的赛季排位赛。"); return
+    lines = await season_standings_lines(context.application, cid)
+    await safe_send_long(context.bot, cid, "\n".join(lines))
+
+
+async def cmd_season_play(update, context):
+    if not await need_auth(update): return
+    if not await require_group_chat(update, "德州排位赛", "排位"): return
+    cid, uid = update.effective_chat.id, update.effective_user.id
+    if not season_active:
+        ok, key = await season_signup(context.application, cid, uid)
+        if not ok:
+            await update.message.reply_text("❌ 你已被淘汰，无法参加本赛季排位。"); return
+        if key == "started":
+            await render_season_lobby(context.application, cid)  # 满 20 自动开赛：翻转看板为进行中，继续往下开房
+        else:
+            await render_season_lobby(context.application, cid)
+            await update.message.reply_text("🏆 已为你报名，大厅看板已发到群里。满 20 人自动开赛；开赛后发 /排位 即可开局入座。")
+            return
+    # 赛季进行中：开 / 入房间（赛中未报名者自动补报名）
+    if uid in season_eliminated.get(cid, set()):
+        await update.message.reply_text("❌ 你已被淘汰，无法参加本赛季排位。"); return
+    if uid not in season_joined.get(cid, set()):
+        season_joined.setdefault(cid, set()).add(uid)
+        if uid not in season_points.get(cid, {}):
+            season_points[cid][uid] = SEASON_START_CHIPS
+            season_games[cid][uid] = 0
+            season_rebuy[cid][uid] = 0
+        save_data()
+    if season_points[cid][uid] <= 0:
+        await update.message.reply_text("❌ 你的排位分已用完，等待应急补分或下局。"); return
+    game = active_poker_games.get(cid)
+    if game:
+        if game.season:
+            if game.phase != "waiting": await update.message.reply_text("当前已有进行中的排位赛。"); return
+            if game.add(uid):
+                await update_poker_waiting(game, context.application); await update.message.reply_text("已加入当前等待房间。")
+            else: await update.message.reply_text("你已在等待房间中。")
+            return
+        else:
+            await update.message.reply_text("当前有日常德州房间，请先 /结束 后再开排位赛。"); return
+    game = PokerGame(cid, uid, current_game_mode(), season=True); game.add(uid); active_poker_games[cid] = game
     msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 加入游戏", callback_data="texas_join")], [InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")]]))
     if msg:
         game.game_msg_id = msg.message_id
@@ -3492,7 +3008,7 @@ async def cmd_sm(update, context):
 async def refund_poker(game, app, notice):
     """终止未结算牌局时，按开局积分退还全部 ante、盲注和后续下注。"""
     game.cancel_timer(); game.cancel_auto(); game.cancel_wait()
-    wallet = texas_chips
+    wallet = season_points if game.season else texas_chips
     for player_id in game.players:
         # 德州下注只在局对象中暂扣；显式恢复开局余额，避免后续改动破坏退款语义。
         wallet[game.chat_id][player_id] = game.initial_chips.get(player_id, wallet[game.chat_id][player_id])
@@ -3757,17 +3273,6 @@ async def on_button(update, context):
             if q: await q.answer("该操作已过期", show_alert=True)
             return
         cid, uid, data = q.message.chat.id, q.from_user.id, q.data or ""
-        # 斗地主手牌经私聊按钮操作：私聊 chat 不在授权群组，需按用户所属对局定位群 cid
-        if data.startswith("ddz_") and cid not in active_ddz_games:
-            gcid = ddz_user_game.get(uid)
-            if gcid is None:
-                # 兜底：用户没有任何进行中的对局（重启/已结束/未加入），把这条 DM 改成"已结束"并去掉按钮
-                try:
-                    await safe_edit(context.bot, cid, q.message.message_id, "⚠️ 此局斗地主已结束，请到群里发起新一局。", reply_markup=None)
-                except Exception:
-                    pass
-                await q.answer("⚠️ 游戏已结束，请到群里重开新局。", show_alert=True); return
-            cid = gcid
         if not is_auth(cid): await q.answer("未授权", show_alert=True); return
         
         # --- 21点 回调 ---
@@ -3927,10 +3432,6 @@ async def on_button(update, context):
                 await safe_edit(context.bot, cid, game.game_msg_id, "🛑 牛牛已手动终止。", reply_markup=None)
             return
 
-        # --- 斗地主 回调 ---
-        if data.startswith("ddz_"):
-            await ddz_handle_button(update, context, q, cid, uid, data)
-            return
 
         # --- 老虎机连抽回调（绑定发起人） ---
         if data.startswith("lhj_spin_"):
@@ -3992,6 +3493,30 @@ async def on_button(update, context):
                 await q.answer("落子成功")
                 await update_gomoku_board(game, context.application, names)
             return
+        if data.startswith("season_"):
+            if data == "season_signup":
+                ok, key = await season_signup(context.application, cid, uid)
+                if not ok:
+                    await q.answer("你已被淘汰，无法报名", show_alert=True); return
+                await render_season_lobby(context.application, cid)
+                if key == "started":
+                    await q.answer("🏆 报名已满，赛季自动开始！用 /排位 开局", show_alert=True)
+                elif key == "joined_active":
+                    await q.answer("✅ 已加入进行中的赛季")
+                else:
+                    await q.answer("✅ 已报名")
+                return
+            if data == "season_lobby_close":
+                mid = season_lobby_msg.pop(cid, None)
+                if mid: await safe_delete(context.bot, cid, mid)
+                await q.answer("已关闭看板"); return
+            if data == "season_rank_btn":
+                if not season_active:
+                    await q.answer("当前无进行中的赛季", show_alert=True); return
+                lines = await season_standings_lines(context.application, cid)
+                await safe_send_long(context.bot, cid, "\n".join(lines))
+                await q.answer("已发送排位榜"); return
+            await q.answer("未知操作", show_alert=True); return
         if data.startswith("texas_"):
             game = active_poker_games.get(cid)
             if data == "texas_reveal":
@@ -4006,12 +3531,26 @@ async def on_button(update, context):
                 await q.answer("本局已终止")
                 return
             if game.phase == "waiting":
-                wallet = texas_chips
-                if data == "texas_join" and wallet[cid][uid] < MIN_ENTRY_CHIPS:
-                    label = "积分"
-                    await q.answer(f"进入德州至少需要 {MIN_ENTRY_CHIPS} {label}", show_alert=True)
-                elif data == "texas_join" and game.add(uid):
-                    await q.answer("已加入"); await update_poker_waiting(game, context.application)
+                if data == "texas_join":
+                    if game.season:
+                        if uid in season_eliminated.get(cid, set()):
+                            await q.answer("已淘汰，无法加入", show_alert=True); return
+                        if uid not in season_joined.get(cid, set()):
+                            season_joined.setdefault(cid, set()).add(uid)
+                            if uid not in season_points.get(cid, {}):
+                                season_points[cid][uid] = SEASON_START_CHIPS
+                                season_games[cid][uid] = 0
+                                season_rebuy[cid][uid] = 0
+                            save_data()
+                        if season_points[cid][uid] <= 0:
+                            await q.answer("排位分不足，无法加入", show_alert=True); return
+                    else:
+                        wallet = texas_chips
+                        if wallet[cid][uid] < MIN_ENTRY_CHIPS:
+                            await q.answer(f"进入德州至少需要 {MIN_ENTRY_CHIPS} 积分", show_alert=True); return
+                    if game.add(uid):
+                        await q.answer("已加入"); await update_poker_waiting(game, context.application)
+                    else: await q.answer("你已在等待房间中。", show_alert=True)
                 elif data == "texas_start" and uid == game.owner_id and game.start():
                     game.cancel_wait()
                     await q.answer("游戏开始"); await update_poker_table(game, context.application); await start_turn_timer(game, context.application)
@@ -4248,6 +3787,9 @@ async def daily_reset_scheduler(app):
         now = now_bj(); target = (now + timedelta(days=1)).replace(hour=0, minute=0, second=1, microsecond=0)
         await asyncio.sleep((target-now).total_seconds())
         today = now_bj().strftime("%Y-%m-%d")
+        # 排位赛到点自动结算（end_ts 为开赛+7天的时间戳）
+        if season_active and now_bj().timestamp() >= season_end_ts:
+            await season_settle(app)
         # 午夜仅清理德州榜单（德州当日榜）；其他游戏榜单不清空，累计为总数
         poker_profit_by_date.clear()
         # 不重置正在进行正式德州或赛马中的玩家，避免跨日覆盖未结算状态。
@@ -4264,9 +3806,6 @@ async def daily_reset_scheduler(app):
         for bjl in active_baccarat_games.values():
             if bjl.phase == "betting":
                 protected.update((bjl.chat_id, uid) for uid in bjl.bets)
-        for ddz in active_ddz_games.values():
-            if ddz.phase in ("bidding", "playing"):
-                protected.update((ddz.chat_id, uid) for uid in ddz.seat_order if uid >= 0)
         for chat_id, users in texas_chips.items():
             for uid in users:
                 if (chat_id, uid) not in protected:
@@ -4288,6 +3827,11 @@ async def leaderboard_scheduler(app):
             lines = [f"🏆 德州当日排行榜（{date}）", "━"*14]
             for i, (uid, amount) in enumerate(sorted(data.items(), key=lambda x:x[1], reverse=True)[:50], 1): lines.append(f"{rank_marker(i)} {await get_name(app, uid)}：{amount:+d}")
             await safe_send_long(app.bot, cid, "\n".join(lines))
+        # 排位赛每日推一次当前榜，给群友紧迫感
+        if season_active:
+            for cid in list(season_points.keys()):
+                lines = await season_standings_lines(app, cid)
+                await safe_send_long(app.bot, cid, "\n".join(lines))
         save_data()
 
 async def hourly_race_scheduler(app):
@@ -4421,8 +3965,10 @@ CMD_ALIASES = {
     "恢复": cmd_restore,
     "骰子": cmd_sb,
     "牛牛": cmd_nn,
-    "斗地主": cmd_ddz, "地主": cmd_ddz, "斗地": cmd_ddz,
-    "斗地主榜": cmd_ddz_rank, "地主榜": cmd_ddz_rank, "ddz榜": cmd_ddz_rank,
+    "排位": cmd_season_play, "排位赛": cmd_season_play,
+    "排位报名": cmd_season_join, "报名排位": cmd_season_join,
+    "排位榜": cmd_season_rank, "赛季榜": cmd_season_rank,
+    "排位开赛": cmd_season_start, "排位结束": cmd_season_end,
     # 旧英文/数字别名（保留兼容，仍可用）
     "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm, "wz": cmd_wz, "sl": cmd_sl,
     "lhj": cmd_lhj, "21": cmd_21, "bjl": cmd_bjl, "gomoku": cmd_wz, "end": cmd_end,
@@ -4430,7 +3976,10 @@ CMD_ALIASES = {
     "cx": cmd_cx, "ph": cmd_ph, "sq": cmd_sq, "qxshouquan": cmd_qxshouquan,
     "addadmin": cmd_addadmin, "deladmin": cmd_deladmin,
     "autosm": cmd_autosm, "backup": cmd_backup, "restore": cmd_restore,
-    "sb": cmd_sb, "nn": cmd_nn, "ddz": cmd_ddz,
+    "sb": cmd_sb, "nn": cmd_nn,
+    "season": cmd_season_play, "seasonplay": cmd_season_play,
+    "seasonjoin": cmd_season_join, "seasonrank": cmd_season_rank,
+    "seasonstart": cmd_season_start, "seasonend": cmd_season_end,
 }
 
 async def _dispatch_alias(cmd, args, update, context):
