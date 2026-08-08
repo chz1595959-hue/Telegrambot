@@ -48,7 +48,7 @@ BLACKJACK_DECKS = 6        # 21点使用6副牌（娱乐场标准）
 DEFAULT_ADMIN = 5431975432
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
 # Bot 管理员：种子集合（始终为管理员，防锁死）+ 可动态增删的持久化集合
-ADMIN_USER_IDS = {ADMIN_USER_ID, 8416301258, 5847451570, 8147535302}  # 种子管理员，重启后自动恢复，无法被 /deladmin 移除
+ADMIN_USER_IDS = {ADMIN_USER_ID}  # 种子管理员，重启后自动恢复，无法被 /deladmin 移除
 BOT_ADMINS = set(ADMIN_USER_IDS)  # 运行时管理员集合 = 种子 ∪ 持久化新增，可经 /addadmin /deladmin 动态管理
 SMALL_BLIND, BIG_BLIND, ANTE = 0, 0, 200
 STALE_TEXT_COMMAND_SECONDS = 120
