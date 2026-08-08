@@ -2972,11 +2972,11 @@ async def cmd_season_help(update, context):
         "• /排位结束 — 提前结算并推最终榜\n\n"
         "<b>自动机制</b>\n"
         "• 每日 23:00 自动推一次排位榜\n"
-        "• 开赛后第 7 天午夜自动结算\n\n"
+        "• 开赛后第 7 天（到点后的首个午夜）自动结算，可能晚最多约 24 小时\n\n"
         "📌 满 20 人开赛；起始 20000 分；输光可应急补分 3×2000，再输光淘汰；满 5 局才上榜。\n"
         "⚠️ 群里若中文命令无反应，多为 BotFather 隐私模式拦截，发 /setprivacy → Disable 即可。"
     )
-    await safe_send_long(context.bot, cid, text)
+    await safe_send_long(context.bot, cid, text, parse_mode="HTML")
 
 
 async def cmd_season_play(update, context):
