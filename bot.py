@@ -2955,6 +2955,30 @@ async def cmd_season_rank(update, context):
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
 
+async def cmd_season_help(update, context):
+    if not await need_auth(update): return
+    cid = update.effective_chat.id
+    text = (
+        "🏆 <b>德州排位赛使用说明</b>\n\n"
+        "<b>报名 / 开局</b>\n"
+        "• /排位 — 一键报名（静默）并可在开赛后开/入牌桌；未报名会自动补报\n"
+        "• /排位报名 — 报名并弹出群里「报名大厅」看板（满 20 自动开赛）\n"
+        "• 大厅看板按钮：📝 报名参赛 / 📝 中途报名加入\n\n"
+        "<b>查询</b>\n"
+        "• /排位榜 — 看当前排名（榜尾显示你的名次）\n"
+        "• 大厅看板按钮：📊 看排位榜\n\n"
+        "<b>管理员专属</b>\n"
+        "• /排位开赛 [赛季名] — 强制开赛（可自定义名，如 /排位开赛 赌神大战秋季赛）\n"
+        "• /排位结束 — 提前结算并推最终榜\n\n"
+        "<b>自动机制</b>\n"
+        "• 每日 23:00 自动推一次排位榜\n"
+        "• 开赛后第 7 天午夜自动结算\n\n"
+        "📌 满 20 人开赛；起始 20000 分；输光可应急补分 3×2000，再输光淘汰；满 5 局才上榜。\n"
+        "⚠️ 群里若中文命令无反应，多为 BotFather 隐私模式拦截，发 /setprivacy → Disable 即可。"
+    )
+    await safe_send_long(context.bot, cid, text)
+
+
 async def cmd_season_play(update, context):
     if not await need_auth(update): return
     if not await require_group_chat(update, "德州排位赛", "排位"): return
@@ -3996,6 +4020,7 @@ async def post_init(app):
             BotCommand("season", "德州排位赛"),
             BotCommand("seasonjoin", "排位报名"),
             BotCommand("seasonrank", "排位榜"),
+            BotCommand("seasonhelp", "排位赛帮助"),
             BotCommand("seasonstart", "排位强制开赛(管理员)"),
             BotCommand("seasonend", "排位提前结算(管理员)"),
         ]
@@ -4039,6 +4064,7 @@ CMD_ALIASES = {
     "排位": cmd_season_play, "排位赛": cmd_season_play,
     "排位报名": cmd_season_join, "报名排位": cmd_season_join,
     "排位榜": cmd_season_rank, "赛季榜": cmd_season_rank,
+    "排位帮助": cmd_season_help, "排位说明": cmd_season_help, "排位赛帮助": cmd_season_help,
     "排位开赛": cmd_season_start, "排位结束": cmd_season_end,
     # 旧英文/数字别名（保留兼容，仍可用）
     "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm, "wz": cmd_wz, "sl": cmd_sl,
