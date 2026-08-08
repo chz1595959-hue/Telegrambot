@@ -11,7 +11,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, MessageHandler, filters
 from treys import Card, Evaluator
@@ -2852,14 +2852,19 @@ async def season_signup(app, cid, uid):
     return True, "joining"
 
 
-def season_lobby_content(app, cid):
+async def season_lobby_content(app, cid):
     """返回 (text, reply_markup) 排位大厅看板，按赛季状态切换。"""
     if not season_active:
-        n = len(season_joined.get(cid, set()))
+        joined = list(season_joined.get(cid, set()))
+        n = len(joined)
+        # 列出已报名昵称（最多 15 个，避免刷屏 + 控制 get_chat API 调用量）
+        names = [await get_name(app, u) for u in joined[:15]]
+        names_text = ("、".join(names) + (f" 等 {n} 人" if n > 15 else "")) if n else "（暂无）"
         text = (f"🏆 <b>排位赛报名大厅</b>\n\n"
                 f"当前报名：<b>{n}/{SEASON_MIN_PLAYERS}</b> 人\n"
                 f"满 {SEASON_MIN_PLAYERS} 人自动开赛，每人 {SEASON_START_CHIPS} 分，周期 {SEASON_DAYS} 天。\n"
-                f"点下面按钮报名，或用 /排位 也能一键报名。")
+                f"已报名：{names_text}\n"
+                f"点下面按钮报名，或用 /排位报名 也能一键报名。")
         markup = InlineKeyboardMarkup([
             [InlineKeyboardButton(f"📝 报名参赛（{n}/{SEASON_MIN_PLAYERS}）", callback_data="season_signup")],
             [InlineKeyboardButton("❌ 关闭看板", callback_data="season_lobby_close")],
@@ -2879,7 +2884,7 @@ def season_lobby_content(app, cid):
 
 async def render_season_lobby(app, cid):
     """编辑已有大厅看板，没有则新发。"""
-    text, markup = season_lobby_content(app, cid)
+    text, markup = await season_lobby_content(app, cid)
     mid = season_lobby_msg.get(cid)
     if mid:
         try:
@@ -2954,8 +2959,9 @@ async def cmd_season_play(update, context):
         if key == "started":
             await render_season_lobby(context.application, cid)  # 满 20 自动开赛：翻转看板为进行中，继续往下开房
         else:
-            await render_season_lobby(context.application, cid)
-            await update.message.reply_text("🏆 已为你报名，大厅看板已发到群里。满 20 人自动开赛；开赛后发 /排位 即可开局入座。")
+            # UX2：/排位 静默报名不弹看板（看板仅在 /排位报名 或按钮点击时出现，减少刷屏）
+            n = len(season_joined[cid])
+            await update.message.reply_text(f"✅ 已报名本赛季排位赛（{n}/{SEASON_MIN_PLAYERS}）。满 {SEASON_MIN_PLAYERS} 人自动开赛；发 /排位报名 可看报名大厅。")
             return
     # 赛季进行中：开 / 入房间（赛中未报名者自动补报名）
     if uid in season_eliminated.get(cid, set()):
@@ -3259,6 +3265,25 @@ async def cmd_deladmin(update, context):
         await update.message.reply_text(f"ℹ️ {uid} 不是管理员"); return
     BOT_ADMINS.discard(uid); save_data()
     await update.message.reply_text(f"✅ 已移除机器人管理员：{uid}")
+
+async def cmd_admin_list(update, context):
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    seeds = set(ADMIN_USER_IDS)
+    dynamic = BOT_ADMINS - seeds
+    lines = ["👑 <b>当前机器人管理员</b>",
+             f"共 <b>{len(BOT_ADMINS)}</b> 人（种子 {len(seeds)} + 动态 {len(dynamic)}）", ""]
+    lines.append("🔒 种子管理员（重启保留，不可被 /deladmin 移除）：")
+    for uid in sorted(seeds):
+        lines.append(f"  • {await get_name(context.application, uid)}（{uid}）")
+    lines.append("")
+    if dynamic:
+        lines.append("➕ 动态添加（可被 /deladmin 移除）：")
+        for uid in sorted(dynamic):
+            lines.append(f"  • {await get_name(context.application, uid)}（{uid}）")
+    else:
+        lines.append("（暂无动态添加的管理员）")
+    await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines))
 
 async def cmd_autosm(update, context):
     if not await need_auth(update): return
@@ -3933,6 +3958,43 @@ async def post_init(app):
         asyncio.create_task(hourly_race_scheduler(app)),
         asyncio.create_task(data_save_worker()) 
     })
+    # 注册 Telegram 原生命令菜单（仅支持拉丁字符命令，中文命令走自定义路由）。
+    # 作用：群里打 / 能看到、能点；命令以 bot_command 实体发送，不受隐私模式影响，必定送达。
+    try:
+        menu = [
+            BotCommand("start", "开始 / 菜单 / 帮助"),
+            BotCommand("dz", "德州扑克"),
+            BotCommand("sm", "赛马"),
+            BotCommand("wz", "五子棋"),
+            BotCommand("sl", "扫雷"),
+            BotCommand("lhj", "老虎机"),
+            BotCommand("21", "21点"),
+            BotCommand("bjl", "百家乐"),
+            BotCommand("sb", "骰子"),
+            BotCommand("nn", "牛牛"),
+            BotCommand("end", "结束当前游戏"),
+            BotCommand("add", "加积分"),
+            BotCommand("adddz", "加德州积分"),
+            BotCommand("reduce", "减积分"),
+            BotCommand("cx", "盈亏查询"),
+            BotCommand("ph", "排行榜"),
+            BotCommand("sq", "授权群组"),
+            BotCommand("qxshouquan", "取消授权"),
+            BotCommand("addadmin", "添加机器人管理员"),
+            BotCommand("deladmin", "移除机器人管理员"),
+            BotCommand("adminlist", "查看管理员列表"),
+            BotCommand("autosm", "切换整点自动赛马"),
+            BotCommand("backup", "备份数据"),
+            BotCommand("restore", "恢复数据"),
+            BotCommand("season", "德州排位赛"),
+            BotCommand("seasonjoin", "排位报名"),
+            BotCommand("seasonrank", "排位榜"),
+            BotCommand("seasonstart", "排位强制开赛(管理员)"),
+            BotCommand("seasonend", "排位提前结算(管理员)"),
+        ]
+        await app.bot.set_my_commands(menu)
+    except Exception:
+        logger.warning("注册命令菜单失败（不影响主功能）")
 
 
 async def post_shutdown(app):
@@ -3960,6 +4022,8 @@ CMD_ALIASES = {
     "取消授权": cmd_qxshouquan,
     "加管理员": cmd_addadmin,
     "减管理员": cmd_deladmin,
+    "管理员列表": cmd_admin_list, "管理员": cmd_admin_list,
+    "adminlist": cmd_admin_list, "admins": cmd_admin_list,
     "自动扫雷": cmd_autosm,
     "备份": cmd_backup,
     "恢复": cmd_restore,
