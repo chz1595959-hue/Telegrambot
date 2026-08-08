@@ -130,6 +130,10 @@ season_joined = defaultdict(set)                          # season_joined[cid] =
 season_rebuy = defaultdict(lambda: defaultdict(int))      # season_rebuy[cid][uid] 已用应急补分次数
 season_eliminated = defaultdict(set)                      # season_eliminated[cid] = {uid} 淘汰集合
 season_lobby_msg = {}                                       # season_lobby_msg[cid] = 排位大厅看板消息 id（UI 态，不持久化）
+# ---------- 赌神称号（全局唯一，跨群共享荣誉） ----------
+user_titles = {}               # user_titles[uid] = "🎰赌神"  当前在任赌神（全局唯一）
+champions_history = []         # [{"season_id","uid","name","score","streak"}] 历届荣誉墙
+TITLE_GAMBLING_GOD = "🎰赌神"
 # 用于老虎机等功能的冷却时间限制。
 user_cooldowns = defaultdict(float)
 # 高性能保存逻辑变量
@@ -211,6 +215,8 @@ def force_save_now():
                 "season_joined": {str(cid): list(users) for cid, users in season_joined.items()},
                 "season_rebuy": {str(cid): dict(users) for cid, users in season_rebuy.items()},
                 "season_eliminated": {str(cid): list(users) for cid, users in season_eliminated.items()},
+                "user_titles": {str(uid): t for uid, t in user_titles.items()},
+                "champions_history": champions_history,
             }
             os.makedirs(os.path.dirname(os.path.abspath(DATA_FILE)), exist_ok=True)
             with open(DATA_TEMP_FILE, "w", encoding="utf-8") as file:
@@ -241,7 +247,7 @@ async def data_save_worker():
 
 
 def load_data():
-    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts
+    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history
     source = DATA_FILE if os.path.exists(DATA_FILE) else DATA_BACKUP_FILE
     if not os.path.exists(source): return
     try:
@@ -278,6 +284,12 @@ def load_data():
             season_joined[int(cid)] = set(int(u) for u in uids)
         for cid, uids in data.get("season_eliminated", {}).items():
             season_eliminated[int(cid)] = set(int(u) for u in uids)
+        # 赌神称号恢复
+        user_titles.clear()
+        for uid, t in data.get("user_titles", {}).items():
+            user_titles[int(uid)] = t
+        champions_history.clear()
+        champions_history.extend(data.get("champions_history", []))
         for cid, value in data.get("sicbo_history", {}).items(): sicbo_history[int(cid)] = list(value)[-12:]
         for cid, value in data.get("sicbo_daily_stats", {}).items():
             sicbo_daily_stats[int(cid)] = {"big": int(value.get("big", 0)), "small": int(value.get("small", 0)), "triple": int(value.get("triple", 0))}
@@ -333,18 +345,24 @@ archive_old_profit_data()
 save_data()  # 标记脏数据，确保归档结果在首次保存时写盘
 
 # ---------- Telegram 工具 ----------
-async def get_name(app, uid):
+def title_prefix(uid):
+    """持赌神称号的玩家在名字前加 🎰赌神 前缀（全局展示；称号为固定串不含 <>&，HTML/纯文本均安全）。"""
+    return f"{TITLE_GAMBLING_GOD} " if uid in user_titles else ""
+
+
+async def get_name(app, uid, with_title=True):
     try:
         chat = await app.bot.get_chat(uid)
         name = " ".join(part for part in (chat.first_name, chat.last_name) if part)
         raw_name = name or (f"@{chat.username}" if chat.username else f"玩家{uid}")
         # 安全转义：防止名字带 < > & 导致 HTML 消息发送失败
-        return html.escape(raw_name)
+        base = html.escape(raw_name)
     except TelegramError:
-        return f"玩家{uid}"
+        base = f"玩家{uid}"
     except Exception:
         logger.warning("获取玩家名称失败: %s", uid, exc_info=True)
-        return f"玩家{uid}"
+        base = f"玩家{uid}"
+    return f"{title_prefix(uid)}{base}" if with_title else base
 
 
 async def safe_send(bot, cid, text, **kwargs):
@@ -2765,6 +2783,8 @@ async def start_season(cid, name="", forced=False):
     joined = season_joined.get(cid, set())
     if not forced and len(joined) < SEASON_MIN_PLAYERS:
         return False, f"需满 {SEASON_MIN_PLAYERS} 人报名才能开赛（当前 {len(joined)} 人）"
+    if forced and not joined:
+        return False, "尚无任何人报名，无法强制开赛"
     season_active = True
     season_id = now_bj().strftime("%Y%m%d")
     season_name = name or f"第{season_id}赛季"
@@ -2792,12 +2812,27 @@ async def season_settle(app, manual=False):
         eligible = [(uid, val) for uid, val in standings if uid >= 0 and season_games[cid].get(uid, 0) >= SEASON_MIN_GAMES]
         lines = [f"🏆 第{season_id}赛季最终榜（{season_name or '排位赛'}）", "━" * 18]
         if not eligible:
-            lines.append("本赛季无达标玩家。")
+            lines.append("本赛季无达标玩家，赌神称号保留在任者。")
         for i, (uid, val) in enumerate(eligible[:50], 1):
             g = season_games[cid].get(uid, 0)
-            lines.append(f"{rank_marker(i)} {await get_name(app, uid)}：{val}｜{g}局")
+            marker = "👑" if (i == 1 and uid in user_titles) else rank_marker(i)
+            lines.append(f"{marker} {await get_name(app, uid)}：{val}｜{g}局")
         lines.extend(["", "⚠️ 结算时刻进行中的牌局不计入本赛季。", "🎁 奖励由管理员另行发放。"])
         await safe_send_long(app.bot, cid, "\n".join(lines))
+        # 自动加冕本赛季赌神（全局唯一，覆盖上任）
+        if eligible:
+            champ_uid = eligible[0][0]
+            champ_name = await get_name(app, champ_uid, with_title=False)
+            streak = 1
+            if champions_history and champions_history[-1]["uid"] == champ_uid:
+                streak = champions_history[-1].get("streak", 1) + 1
+            user_titles.clear(); user_titles[champ_uid] = TITLE_GAMBLING_GOD
+            champions_history.append({"season_id": season_id, "uid": champ_uid, "name": champ_name, "score": eligible[0][1], "streak": streak})
+            crown = f"👑 恭喜 {await get_name(app, champ_uid)} 加冕本赛季 🎰赌神" + (f"（{streak}连冠！）" if streak > 1 else "！")
+            try:
+                await safe_send(app.bot, cid, crown)
+            except Exception:
+                pass
     # 进行中的排位牌局：本手结算不计入排名，提前告知玩家（赛季已结束后其 settle_poker 仅派奖不写回）
     for g in list(active_poker_games.values()):
         if getattr(g, "season", False) and getattr(g, "phase", "waiting") != "waiting" and g.chat_id in season_points:
@@ -2826,7 +2861,8 @@ async def season_standings_lines(app, cid, uid=None):
     for i, (u, val) in enumerate(standings[:50], 1):
         g = season_games[cid].get(u, 0)
         tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
-        lines.append(f"{rank_marker(i)} {await get_name(app, u)}：{val}｜{g}局{tag}")
+        marker = "👑" if (i == 1 and u in user_titles) else rank_marker(i)
+        lines.append(f"{marker} {await get_name(app, u)}：{val}｜{g}局{tag}")
     # 个人排名行：请求者不在前 50 时，单独补一行真实名次，避免大群看不到自己
     if uid is not None and uid in users:
         full_rank = next((i for i, (u, _) in enumerate(standings, 1) if u == uid), None)
@@ -2878,7 +2914,8 @@ async def season_lobby_content(app, cid):
         ])
     else:
         remain = max(0, int((season_end_ts - now_bj().timestamp()) / 86400))
-        text = (f"🏆 <b>第{season_id}赛季「{season_name or '排位赛'}」进行中</b>\n\n"
+        sn = html.escape(season_name or '排位赛')  # 防止管理员自定义赛季名含 < 或 & 触发 BadRequest
+        text = (f"🏆 <b>第{season_id}赛季「{sn}」进行中</b>\n\n"
                 f"⏳ 剩余约 {remain} 天｜上榜需≥{SEASON_MIN_GAMES}局\n"
                 f"用 /排位 开局入座；中途想加入点下面按钮。")
         markup = InlineKeyboardMarkup([
@@ -2955,6 +2992,60 @@ async def cmd_season_rank(update, context):
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
 
+async def cmd_god(update, context):
+    """查看当前赌神与历届荣誉墙。"""
+    if not await need_auth(update): return
+    app = context.application
+    lines = ["👑 <b>🎰赌神 荣誉殿堂</b>", "━" * 16]
+    if not user_titles:
+        lines.append("当前暂无 🎰赌神。拿下排位赛冠军即可加冕！")
+    else:
+        uid = next(iter(user_titles))
+        lines.append(f"🏅 现任赌神：{await get_name(app, uid)}")
+    if champions_history:
+        lines.append("", "📜 <b>历届荣誉墙</b>")
+        for rec in champions_history[-12:][::-1]:
+            streak = rec.get("streak", 1)
+            sfx = f" · {streak}连冠" if streak > 1 else ""
+            lines.append(f"第{rec['season_id']}赛季：{rec.get('name', '?')}（{rec.get('score', 0)}分）{sfx}")
+    else:
+        lines.append("", "📜 历届荣誉墙：暂无记录")
+    await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_god_grant(update, context):
+    """管理员封赌神（全局唯一，覆盖上任）。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    if not context.args:
+        await update.message.reply_text("用法：/封赌神 <用户ID>"); return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 用户 ID 必须是数字。"); return
+    user_titles.clear(); user_titles[uid] = TITLE_GAMBLING_GOD
+    save_data()
+    await update.message.reply_text(f"👑 已将 {uid} 封为 🎰赌神（覆盖上任）。")
+
+
+async def cmd_god_revoke(update, context):
+    """管理员撤赌神。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    if not context.args:
+        await update.message.reply_text("用法：/撤赌神 <用户ID>"); return
+    try:
+        uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ 用户 ID 必须是数字。"); return
+    if uid in user_titles:
+        del user_titles[uid]
+        save_data()
+        await update.message.reply_text(f"🔻 已撤销 {uid} 的 🎰赌神 称号。")
+    else:
+        await update.message.reply_text("ℹ️ 该用户当前没有 🎰赌神 称号。")
+
+
 async def cmd_season_help(update, context):
     if not await need_auth(update): return
     cid = update.effective_chat.id
@@ -2966,6 +3057,7 @@ async def cmd_season_help(update, context):
         "• 大厅看板按钮：📝 报名参赛 / 📝 中途报名加入\n\n"
         "<b>查询</b>\n"
         "• /排位榜 — 看当前排名（榜尾显示你的名次）\n"
+        "• /赌神 — 查看 🎰赌神 称号与历届荣誉墙\n"
         "• 大厅看板按钮：📊 看排位榜\n\n"
         "<b>管理员专属</b>\n"
         "• /排位开赛 [赛季名] — 强制开赛（可自定义名，如 /排位开赛 赌神大战秋季赛）\n"
@@ -3360,6 +3452,8 @@ async def on_button(update, context):
                 if uid not in game.players:
                     await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
                 if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
+                # 额外校验：必须当前确为该玩家回合，防止旧按钮双击跳过下一位玩家
+                if game.players[game.current_player_idx] != uid: await q.answer("不是你的回合", show_alert=True); return
                 game.next_player(); await q.answer("停牌")
                 if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
                 else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
@@ -3370,8 +3464,12 @@ async def on_button(update, context):
                 wallet = game_chips
                 if wallet[cid][uid] < game.bets[uid]: await q.answer("积分不足，无法双倍", show_alert=True); return
                 
-                wallet[cid][uid] -= game.bets[uid]
-                game.double_down(uid)
+                # 原子化：先让 game 校验回合并翻倍（内部翻倍 bets + 更新退款保护），
+                # 仅成功才扣钱；避免超时/重复点击导致静默丢分
+                prev_bet = game.bets[uid]
+                if not game.double_down(uid):
+                    await q.answer("操作失败：已不是你的回合", show_alert=True); return
+                wallet[cid][uid] -= prev_bet
                 await q.answer("双倍下注！摸牌并停牌")
                 await action_notice(cid, context.application, uid, "选择了双倍下注！")
                 
@@ -3703,6 +3801,11 @@ async def on_text(update, context):
             await _dispatch_alias(_words[0], _words[1:], update, context)
             return
         
+        # 深度防御：非命令的游戏交互（下注/落子/加注）仅在授权群内处理，
+        # 与 on_button 对齐；命令分发仍在上面由各自 cmd_* 自行校验权限
+        if not is_auth(cid):
+            return
+        
         # 统一刷新逻辑
         if text in ["棋盘", "刷新", "看棋", "board", "qp"]:
             found = False
@@ -3853,15 +3956,8 @@ async def daily_reset_scheduler(app):
         for poker in active_poker_games.values():
             if poker.phase != "waiting":
                 protected.update((poker.chat_id, uid) for uid in poker.players)
-        for race in active_horse_races.values():
-            if race.phase in {"betting", "racing", "settling"}:
-                protected.update((race.chat_id, uid) for uid in race.bets)
-        for bj in active_blackjack_games.values():
-            if bj.phase != "waiting":
-                protected.update((bj.chat_id, uid) for uid in bj.players)
-        for bjl in active_baccarat_games.values():
-            if bjl.phase == "betting":
-                protected.update((bjl.chat_id, uid) for uid in bjl.bets)
+        # 仅 texas_chips 每日重置；赛马/21点/百家乐用 game_chips（永久不清零），
+        # 故无需把它们的玩家加入保护集（原 race/bj/bjl 分支为无效死代码，已移除）
         for chat_id, users in texas_chips.items():
             for uid in users:
                 if (chat_id, uid) not in protected:
@@ -4023,6 +4119,9 @@ async def post_init(app):
             BotCommand("seasonhelp", "排位赛帮助"),
             BotCommand("seasonstart", "排位强制开赛(管理员)"),
             BotCommand("seasonend", "排位提前结算(管理员)"),
+            BotCommand("god", "赌神称号/荣誉墙"),
+            BotCommand("godgrant", "封赌神(管理员)"),
+            BotCommand("godrevoke", "撤赌神(管理员)"),
         ]
         await app.bot.set_my_commands(menu)
     except Exception:
@@ -4066,6 +4165,8 @@ CMD_ALIASES = {
     "排位榜": cmd_season_rank, "赛季榜": cmd_season_rank,
     "排位帮助": cmd_season_help, "排位说明": cmd_season_help, "排位赛帮助": cmd_season_help,
     "排位开赛": cmd_season_start, "排位结束": cmd_season_end,
+    "赌神": cmd_god, "荣誉墙": cmd_god,
+    "封赌神": cmd_god_grant, "撤赌神": cmd_god_revoke,
     # 旧英文/数字别名（保留兼容，仍可用）
     "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm, "wz": cmd_wz, "sl": cmd_sl,
     "lhj": cmd_lhj, "21": cmd_21, "bjl": cmd_bjl, "gomoku": cmd_wz, "end": cmd_end,
@@ -4077,6 +4178,7 @@ CMD_ALIASES = {
     "season": cmd_season_play, "seasonplay": cmd_season_play,
     "seasonjoin": cmd_season_join, "seasonrank": cmd_season_rank,
     "seasonstart": cmd_season_start, "seasonend": cmd_season_end,
+    "god": cmd_god, "godgrant": cmd_god_grant, "godrevoke": cmd_god_revoke,
 }
 
 async def _dispatch_alias(cmd, args, update, context):
