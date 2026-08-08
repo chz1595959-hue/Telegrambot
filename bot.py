@@ -2815,7 +2815,7 @@ async def season_settle(app, manual=False):
     save_data()
 
 
-async def season_standings_lines(app, cid):
+async def season_standings_lines(app, cid, uid=None):
     users = season_points.get(cid, {})
     standings = sorted(users.items(), key=lambda x: (-x[1], x[0]))
     remain = max(0, int((season_end_ts - now_bj().timestamp()) / 86400))
@@ -2823,10 +2823,17 @@ async def season_standings_lines(app, cid):
              f"⏳ 剩余约 {remain} 天｜上榜需≥{SEASON_MIN_GAMES}局", "━" * 18]
     if not standings:
         lines.append("暂无数据")
-    for i, (uid, val) in enumerate(standings[:50], 1):
-        g = season_games[cid].get(uid, 0)
+    for i, (u, val) in enumerate(standings[:50], 1):
+        g = season_games[cid].get(u, 0)
         tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
-        lines.append(f"{rank_marker(i)} {await get_name(app, uid)}：{val}｜{g}局{tag}")
+        lines.append(f"{rank_marker(i)} {await get_name(app, u)}：{val}｜{g}局{tag}")
+    # 个人排名行：请求者不在前 50 时，单独补一行真实名次，避免大群看不到自己
+    if uid is not None and uid in users:
+        full_rank = next((i for i, (u, _) in enumerate(standings, 1) if u == uid), None)
+        if full_rank is not None and full_rank > 50:
+            g = season_games[cid].get(uid, 0)
+            tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
+            lines.append(f"…（仅显示前 50，你当前第 {full_rank} 名：{users[uid]} 分{tag}）")
     return lines
 
 
@@ -2941,10 +2948,10 @@ async def cmd_season_end(update, context):
 
 async def cmd_season_rank(update, context):
     if not await need_auth(update): return
-    cid = update.effective_chat.id
+    cid, uid = update.effective_chat.id, update.effective_user.id
     if not season_active:
         await update.message.reply_text("⚠️ 当前无进行中的赛季排位赛。"); return
-    lines = await season_standings_lines(context.application, cid)
+    lines = await season_standings_lines(context.application, cid, uid=uid)
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
 
@@ -3538,7 +3545,7 @@ async def on_button(update, context):
             if data == "season_rank_btn":
                 if not season_active:
                     await q.answer("当前无进行中的赛季", show_alert=True); return
-                lines = await season_standings_lines(context.application, cid)
+                lines = await season_standings_lines(context.application, cid, uid=uid)
                 await safe_send_long(context.bot, cid, "\n".join(lines))
                 await q.answer("已发送排位榜"); return
             await q.answer("未知操作", show_alert=True); return
