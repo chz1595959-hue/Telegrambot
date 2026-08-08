@@ -2895,11 +2895,11 @@ async def render_season_lobby(app, cid):
     mid = season_lobby_msg.get(cid)
     if mid:
         try:
-            await safe_edit(app.bot, cid, mid, text, reply_markup=markup)
+            await safe_edit(app.bot, cid, mid, text, reply_markup=markup, parse_mode="HTML")
             return
         except Exception:
             pass
-    msg = await safe_send(app.bot, cid, text, reply_markup=markup)
+    msg = await safe_send(app.bot, cid, text, reply_markup=markup, parse_mode="HTML")
     if msg:
         season_lobby_msg[cid] = msg.message_id
 
@@ -3314,7 +3314,7 @@ async def cmd_admin_list(update, context):
             lines.append(f"  • {await get_name(context.application, uid)}（{uid}）")
     else:
         lines.append("（暂无动态添加的管理员）")
-    await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines))
+    await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
 
 async def cmd_autosm(update, context):
     if not await need_auth(update): return
