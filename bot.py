@@ -134,6 +134,8 @@ season_lobby_msg = {}                                       # season_lobby_msg[c
 user_titles = {}               # user_titles[uid] = "🎰赌神"  当前在任赌神（全局唯一）
 champions_history = []         # [{"season_id","uid","name","score","streak"}] 历届荣誉墙
 TITLE_GAMBLING_GOD = "🎰赌神"
+# ---------- 昵称缓存（持久化）：群里每条消息/回调直接拿 effective_user 真名，避免 get_chat 失败回退成"玩家{uid}" ----------
+user_names = {}                # user_names[uid] = "真名"（原始串，输出时再 html.escape）
 # 用于老虎机等功能的冷却时间限制。
 user_cooldowns = defaultdict(float)
 # 高性能保存逻辑变量
@@ -217,6 +219,7 @@ def force_save_now():
                 "season_eliminated": {str(cid): list(users) for cid, users in season_eliminated.items()},
                 "user_titles": {str(uid): t for uid, t in user_titles.items()},
                 "champions_history": champions_history,
+                "user_names": {str(uid): n for uid, n in user_names.items()},
             }
             os.makedirs(os.path.dirname(os.path.abspath(DATA_FILE)), exist_ok=True)
             with open(DATA_TEMP_FILE, "w", encoding="utf-8") as file:
@@ -247,7 +250,7 @@ async def data_save_worker():
 
 
 def load_data():
-    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history
+    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history, user_names
     source = DATA_FILE if os.path.exists(DATA_FILE) else DATA_BACKUP_FILE
     if not os.path.exists(source): return
     try:
@@ -290,6 +293,10 @@ def load_data():
             user_titles[int(uid)] = t
         champions_history.clear()
         champions_history.extend(data.get("champions_history", []))
+        # 昵称缓存恢复：群里成员真名（避免重启后大量回退成“玩家{uid}”）
+        user_names.clear()
+        for uid, n in data.get("user_names", {}).items():
+            if n: user_names[int(uid)] = n
         for cid, value in data.get("sicbo_history", {}).items(): sicbo_history[int(cid)] = list(value)[-12:]
         for cid, value in data.get("sicbo_daily_stats", {}).items():
             sicbo_daily_stats[int(cid)] = {"big": int(value.get("big", 0)), "small": int(value.get("small", 0)), "triple": int(value.get("triple", 0))}
@@ -350,18 +357,45 @@ def title_prefix(uid):
     return f"{TITLE_GAMBLING_GOD} " if uid in user_titles else ""
 
 
-async def get_name(app, uid, with_title=True):
-    try:
-        chat = await app.bot.get_chat(uid)
-        name = " ".join(part for part in (chat.first_name, chat.last_name) if part)
-        raw_name = name or (f"@{chat.username}" if chat.username else f"玩家{uid}")
-        # 安全转义：防止名字带 < > & 导致 HTML 消息发送失败
-        base = html.escape(raw_name)
-    except TelegramError:
-        base = f"玩家{uid}"
-    except Exception:
-        logger.warning("获取玩家名称失败: %s", uid, exc_info=True)
-        base = f"玩家{uid}"
+def _extract_name(chat):
+    """从 Chat/User 对象提取展示名；提取不到返回 None。"""
+    name = " ".join(part for part in (chat.first_name, chat.last_name) if part)
+    return name or (f"@{chat.username}" if getattr(chat, "username", None) else None)
+
+
+def _remember_name(update):
+    """从任意入站 update 抓取发送者真名进 user_names 缓存（零 API 调用，优先于 get_chat）。"""
+    u = update.effective_user
+    if not u or u.is_bot: return
+    name = u.full_name or (f"@{u.username}" if u.username else None)
+    if name: user_names[u.id] = name
+
+
+async def get_name(app, uid, with_title=True, cid=None):
+    """解析玩家展示名。
+
+    解析优先级：1) 群内 get_chat_member(cid, uid)（群里成员必能解，即使没和 bot 私聊）；
+    2) get_chat(uid)；3) 已缓存的 user_names。全部失败才回退为“玩家{uid}”。
+    解析成功的真名写入 user_names 缓存，减少后续 API 调用与失败率。
+    """
+    raw = user_names.get(uid)
+    if raw is None:
+        if cid is not None:
+            try:
+                member = await app.bot.get_chat_member(cid, uid)
+                raw = _extract_name(member.user)
+            except Exception:
+                raw = None
+        if raw is None:
+            try:
+                raw = _extract_name(await app.bot.get_chat(uid))
+            except Exception:
+                raw = None
+        if raw:
+            user_names[uid] = raw
+    if not raw:
+        raw = f"玩家{uid}"
+    base = html.escape(raw)
     return f"{title_prefix(uid)}{base}" if with_title else base
 
 
@@ -2816,19 +2850,19 @@ async def season_settle(app, manual=False):
         for i, (uid, val) in enumerate(eligible[:50], 1):
             g = season_games[cid].get(uid, 0)
             marker = "👑" if (i == 1 and uid in user_titles) else rank_marker(i)
-            lines.append(f"{marker} {await get_name(app, uid)}：{val}｜{g}局")
+            lines.append(f"{marker} {await get_name(app, uid, cid=cid, with_title=False)}：{val}｜{g}局")
         lines.extend(["", "⚠️ 结算时刻进行中的牌局不计入本赛季。", "🎁 奖励由管理员另行发放。"])
         await safe_send_long(app.bot, cid, "\n".join(lines))
         # 自动加冕本赛季赌神（全局唯一，覆盖上任）
         if eligible:
             champ_uid = eligible[0][0]
-            champ_name = await get_name(app, champ_uid, with_title=False)
+            champ_name = await get_name(app, champ_uid, cid=cid, with_title=False)
             streak = 1
             if champions_history and champions_history[-1]["uid"] == champ_uid:
                 streak = champions_history[-1].get("streak", 1) + 1
             user_titles.clear(); user_titles[champ_uid] = TITLE_GAMBLING_GOD
             champions_history.append({"season_id": season_id, "uid": champ_uid, "name": champ_name, "score": eligible[0][1], "streak": streak})
-            crown = f"👑 恭喜 {await get_name(app, champ_uid)} 加冕本赛季 🎰赌神" + (f"（{streak}连冠！）" if streak > 1 else "！")
+            crown = f"👑 恭喜 {await get_name(app, champ_uid, cid=cid, with_title=False)} 加冕本赛季 🎰赌神" + (f"（{streak}连冠！）" if streak > 1 else "！")
             try:
                 await safe_send(app.bot, cid, crown)
             except Exception:
@@ -2862,7 +2896,7 @@ async def season_standings_lines(app, cid, uid=None):
         g = season_games[cid].get(u, 0)
         tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
         marker = "👑" if (i == 1 and u in user_titles) else rank_marker(i)
-        lines.append(f"{marker} {await get_name(app, u)}：{val}｜{g}局{tag}")
+        lines.append(f"{marker} {await get_name(app, u, cid=cid, with_title=False)}：{val}｜{g}局{tag}")
     # 个人排名行：请求者不在前 50 时，单独补一行真实名次，避免大群看不到自己
     if uid is not None and uid in users:
         full_rank = next((i for i, (u, _) in enumerate(standings, 1) if u == uid), None)
@@ -2996,12 +3030,13 @@ async def cmd_god(update, context):
     """查看当前赌神与历届荣誉墙。"""
     if not await need_auth(update): return
     app = context.application
+    cid = update.effective_chat.id
     lines = ["👑 <b>🎰赌神 荣誉殿堂</b>", "━" * 16]
     if not user_titles:
         lines.append("当前暂无 🎰赌神。拿下排位赛冠军即可加冕！")
     else:
         uid = next(iter(user_titles))
-        lines.append(f"🏅 现任赌神：{await get_name(app, uid)}")
+        lines.append(f"🏅 现任赌神：{await get_name(app, uid, cid=cid, with_title=False)}")
     if champions_history:
         lines.append("", "📜 <b>历届荣誉墙</b>")
         for rec in champions_history[-12:][::-1]:
@@ -3327,13 +3362,13 @@ async def cmd_cx(update, context):
     lines = ["🃏 德州当日盈亏", "━"*14]
     if texas:
         for i, (uid, value) in enumerate(sorted(texas.items(), key=lambda x:x[1], reverse=True)[:50], 1):
-            lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value:+d}")
+            lines.append(f"{rank_marker(i)} {await get_name(context.application, uid, cid=cid)}：{value:+d}")
     else:
         lines.append("暂无记录")
     lines.extend(["", "🎮 通用游戏累计盈亏", "━"*14])
     if combined:
         for i, (uid, value) in enumerate(sorted(combined.items(), key=lambda x:x[1], reverse=True)[:50], 1):
-            lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value:+d}")
+            lines.append(f"{rank_marker(i)} {await get_name(context.application, uid, cid=cid)}：{value:+d}")
     else:
         lines.append("暂无记录")
     await safe_send_long(context.bot, cid, "\n".join(lines))
@@ -3343,10 +3378,10 @@ async def cmd_ph(update, context):
     cid = update.effective_chat.id
     lines = ["💰 德州积分榜", "━"*14]
     for i, (uid, value) in enumerate(sorted(texas_chips[cid].items(), key=lambda x:x[1], reverse=True)[:50], 1):
-        lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value}")
+        lines.append(f"{rank_marker(i)} {await get_name(context.application, uid, cid=cid)}：{value}")
     lines.extend(["", "🎮 通用积分榜", "━"*14])
     for i, (uid, value) in enumerate(sorted(game_chips[cid].items(), key=lambda x:x[1], reverse=True)[:50], 1):
-        lines.append(f"{rank_marker(i)} {await get_name(context.application, uid)}：{value}")
+        lines.append(f"{rank_marker(i)} {await get_name(context.application, uid, cid=cid)}：{value}")
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
 async def cmd_sq(update, context):
@@ -3421,6 +3456,7 @@ async def on_button(update, context):
             if q: await q.answer("该操作已过期", show_alert=True)
             return
         cid, uid, data = q.message.chat.id, q.from_user.id, q.data or ""
+        _remember_name(update)
         if not is_auth(cid): await q.answer("未授权", show_alert=True); return
         
         # --- 21点 回调 ---
@@ -3792,6 +3828,7 @@ async def on_text(update, context):
             if message.date and (datetime.now(timezone.utc) - message.date).total_seconds() > STALE_TEXT_COMMAND_SECONDS:
                 return
             cid, text = update.effective_chat.id, message.text.strip()
+            _remember_name(update)
         except Exception:
             return
 
@@ -4195,6 +4232,7 @@ async def route_command(update, context):
     """把 /中文 或 /英文 命令路由到对应处理函数。"""
     if not update.message or not update.message.text:
         return
+    _remember_name(update)
     parts = update.message.text.strip().split()
     if not parts or not parts[0].startswith("/"):
         return
