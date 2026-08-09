@@ -3101,6 +3101,7 @@ async def cmd_season_help(update, context):
         "• 每日 23:00 自动推一次排位榜\n"
         "• 开赛后第 7 天（到点后的首个午夜）自动结算，可能晚最多约 24 小时\n\n"
         "📌 满 20 人开赛；起始 20000 分；输光可应急补分 3×2000，再输光淘汰；满 5 局才上榜。\n"
+        "💡 以上「排位」命令均可换「赛季」前缀，含义完全相同，如 /赛季榜 /赛季报名 /赛季开赛 /赛季结束。\n"
         "⚠️ 群里若中文命令无反应，多为 BotFather 隐私模式拦截，发 /setprivacy → Disable 即可。"
     )
     await safe_send_long(context.bot, cid, text, parse_mode="HTML")
@@ -4197,11 +4198,11 @@ CMD_ALIASES = {
     "恢复": cmd_restore,
     "骰子": cmd_sb,
     "牛牛": cmd_nn,
-    "排位": cmd_season_play, "排位赛": cmd_season_play,
-    "排位报名": cmd_season_join, "报名排位": cmd_season_join,
-    "排位榜": cmd_season_rank, "赛季榜": cmd_season_rank,
-    "排位帮助": cmd_season_help, "排位说明": cmd_season_help, "排位赛帮助": cmd_season_help,
-    "排位开赛": cmd_season_start, "排位结束": cmd_season_end,
+    "排位": cmd_season_play, "排位赛": cmd_season_play, "赛季": cmd_season_play, "赛季赛": cmd_season_play,
+    "排位报名": cmd_season_join, "报名排位": cmd_season_join, "赛季报名": cmd_season_join,
+    "排位榜": cmd_season_rank, "赛季榜": cmd_season_rank, "赛季排名": cmd_season_rank,
+    "排位帮助": cmd_season_help, "排位说明": cmd_season_help, "排位赛帮助": cmd_season_help, "赛季帮助": cmd_season_help, "赛季说明": cmd_season_help, "赛季赛帮助": cmd_season_help,
+    "排位开赛": cmd_season_start, "排位结束": cmd_season_end, "赛季开赛": cmd_season_start, "赛季结束": cmd_season_end,
     "赌神": cmd_god, "荣誉墙": cmd_god,
     "封赌神": cmd_god_grant, "撤赌神": cmd_god_revoke,
     # 旧英文/数字别名（保留兼容，仍可用）
