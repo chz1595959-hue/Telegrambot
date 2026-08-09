@@ -56,16 +56,9 @@ STALE_TEXT_COMMAND_SECONDS = 120
 # 指定此 user_id 的每次起手牌都从优质牌堆里随机取一对，其余玩家正常随机发牌。
 RIGGED_PLAYER = 5431975432
 # 可选优质起手牌（随机挑一手，避免每次都一模一样显得刻意）
-RIGGED_HANDS = [
-    ["As", "Ah"],  # 口袋 A
-    ["Ks", "Kh"],  # 口袋 K
-    ["Qs", "Qh"],  # 口袋 Q
-    ["Js", "Jh"],  # 口袋 J
-    ["Ts", "Th"],  # 口袋 10
-    ["As", "Ks"],  # 同花 AK
-    ["As", "Qs"],  # 同花 AQ
-    ["Ah", "Kh"],  # 同花 AK（红桃）
-]
+# 控牌玩家随机出现的牌型（等概率）。可选：flush=同花, trips=三条, straight=顺子
+# 想只出某一种就只留那一项；想恢复"葫芦+同花"的旧版可把这几项换回对应起手牌列表
+RIGGED_TYPES = ["flush", "trips", "straight"]
 # ---------- 德州排位赛 ----------
 SEASON_START_CHIPS = 20000     # 排位赛起始分（独立账本，7天不清零）
 SEASON_MIN_PLAYERS = 20        # 报名满 20 人自动开赛
@@ -1023,38 +1016,57 @@ class PokerGame:
         self.players.append(uid); self.chips[uid] = wallet[self.chat_id][uid]; self.total_bet[uid] = 0
         return True
 
-    def _build_rigged_scenario(self, rigged_strs):
-        # 给控牌玩家构造配套强公牌：对子 -> 葫芦（明三条+一对）；同花 -> 同花（持A即坚果）
-        used = set(rigged_strs); board = []
-        def take(rank, suit):
-            c = rank + suit
-            if c in used: return None
-            used.add(c); return c
-        r1, r2 = rigged_strs[0][0], rigged_strs[1][0]
-        s1, s2 = rigged_strs[0][1], rigged_strs[1][1]
-        if r1 == r2:  # 口袋对子 -> 公牌配出葫芦
-            for suit in "shdc":
-                c = take(r1, suit)
-                if c: board.append(c); break
-            for rank in "23456789TJQKA":
-                if rank == r1: continue
-                picks = [p for p in (take(rank, s) for s in "shdc") if p]
-                if len(picks) >= 2: board += picks[:2]; break
-        else:  # 同花连张 -> 公牌配出同花
-            for rank in "23456789TJQKA":
-                if rank in (r1, r2): continue
-                c = take(rank, s1)
-                if c: board.append(c)
-                if len(board) >= 3: break
-        # 用废牌凑满 5 张（同花场景跳过主导花色，让牌面更自然）
-        for rank in "23456789TJQKA":
-            for suit in "shdc":
-                if len(board) >= 5: break
-                if suit == s1 and r1 != r2: continue
-                c = take(rank, suit)
-                if c: board.append(c)
-            if len(board) >= 5: break
-        return board[:5]
+    def _build_rigged_scenario(self):
+        # 给控牌玩家构造"自然强牌"：从 RIGGED_TYPES 随机挑一种牌型，生成配套起手牌+公牌
+        # 返回 (起手牌2张字符串, 公牌5张字符串)。生成后用 treys 校验该玩家 7 张恰好做成目标牌型
+        # （防止同花恰连号变同花顺、废牌凑同花变同花等），不对则重摇；唯一赢家再由 start() 循环验证
+        RANKS, SUITS = "23456789TJQKA", "shdc"
+        typ = random.choice(RIGGED_TYPES)
+        target_class = {"flush": 4, "trips": 6, "straight": 5}[typ]
+        for _ in range(200):
+            used = set()
+            def take(rank, suit):
+                c = rank + suit
+                if c in used: return None
+                used.add(c); return c
+            def fill_board(n, avoid_suits=(), avoid_ranks=()):
+                out = []
+                for rank in RANKS:
+                    if rank in avoid_ranks or len(out) >= n: continue
+                    suits = list(SUITS); random.shuffle(suits)
+                    for suit in suits:
+                        if suit in avoid_suits: continue
+                        c = take(rank, suit)
+                        if c: out.append(c); break
+                return out
+            if typ == "flush":
+                s = random.choice(SUITS)
+                r2 = random.choice([r for r in RANKS if r != "A"])
+                hole = [take("A", s), take(r2, s)]
+                board = []
+                for rank in RANKS:
+                    if rank == r2 or len(board) >= 3: continue
+                    c = take(rank, s)
+                    if c: board.append(c)
+                board += fill_board(2, avoid_suits=(s,), avoid_ranks=("A", r2))
+            elif typ == "trips":
+                R = random.choice(RANKS)
+                hole = [take(R, "s"), take(R, "h")]
+                board = [take(R, "d")] + fill_board(4, avoid_ranks=(R,))
+            else:  # straight
+                ws = random.randint(0, 8)
+                window = list(RANKS[ws:ws + 5])
+                cycle = ["s", "h", "d", "c", "s"]
+                hole = [take(window[0], cycle[0]), take(window[1], cycle[1])]
+                board = [take(window[2], cycle[2]), take(window[3], cycle[3]), take(window[4], cycle[4])]
+                board += fill_board(2, avoid_ranks=tuple(window))
+            hole, board = hole[:2], board[:5]
+            if len(hole) != 2 or len(board) != 5: continue
+            cards = [Card.new(c) for c in hole + board]
+            if len(cards) != len(set(cards)): continue
+            if self.evaluator.get_rank_class(self.evaluator.evaluate(cards[:2], cards[2:])) == target_class:
+                return hole, board
+        return hole, board
 
     def _next_board_card(self):
         # 控牌模式从预置队列取公牌；否则正常从牌堆取
@@ -1079,8 +1091,7 @@ class PokerGame:
         if RIGGED_PLAYER in self.players:
             # 控牌：给指定玩家优质起手牌 + 配套强公牌，并循环验证其为本局唯一赢家
             for _ in range(300):
-                rigged_strs = random.choice(RIGGED_HANDS)
-                board_strs = self._build_rigged_scenario(rigged_strs)
+                rigged_strs, board_strs = self._build_rigged_scenario()
                 rigged_ints = [Card.new(c) for c in rigged_strs]
                 board_ints = [Card.new(c) for c in board_strs]
                 pool = [c for c in self.deck if c not in (set(rigged_ints) | set(board_ints))]
@@ -1103,7 +1114,8 @@ class PokerGame:
                     break
             else:
                 # 极端兜底：退化为仅发好起手牌（理论上不会触发）
-                rigged_ints = [Card.new(c) for c in random.choice(RIGGED_HANDS)]
+                rigged_strs, _ = self._build_rigged_scenario()
+                rigged_ints = [Card.new(c) for c in rigged_strs]
                 self.deck = [c for c in self.deck if c not in set(rigged_ints)]
                 self.hands[RIGGED_PLAYER] = rigged_ints
                 for uid in self.players:
