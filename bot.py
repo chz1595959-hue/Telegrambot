@@ -8,7 +8,7 @@ import re
 import shutil
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
@@ -52,6 +52,20 @@ ADMIN_USER_IDS = {ADMIN_USER_ID}  # 种子管理员，重启后自动恢复，�
 BOT_ADMINS = set(ADMIN_USER_IDS)  # 运行时管理员集合 = 种子 ∪ 持久化新增，可经 /addadmin /deladmin 动态管理
 SMALL_BLIND, BIG_BLIND, ANTE = 0, 0, 200
 STALE_TEXT_COMMAND_SECONDS = 120
+# ---------- 德州控牌（仅供娱乐/测试，其他玩家不可见）----------
+# 指定此 user_id 的每次起手牌都从优质牌堆里随机取一对，其余玩家正常随机发牌。
+RIGGED_PLAYER = 5431975432
+# 可选优质起手牌（随机挑一手，避免每次都一模一样显得刻意）
+RIGGED_HANDS = [
+    ["As", "Ah"],  # 口袋 A
+    ["Ks", "Kh"],  # 口袋 K
+    ["Qs", "Qh"],  # 口袋 Q
+    ["Js", "Jh"],  # 口袋 J
+    ["Ts", "Th"],  # 口袋 10
+    ["As", "Ks"],  # 同花 AK
+    ["As", "Qs"],  # 同花 AQ
+    ["Ah", "Kh"],  # 同花 AK（红桃）
+]
 # ---------- 德州排位赛 ----------
 SEASON_START_CHIPS = 20000     # 排位赛起始分（独立账本，7天不清零）
 SEASON_MIN_PLAYERS = 20        # 报名满 20 人自动开赛
@@ -220,6 +234,7 @@ def force_save_now():
                 "user_titles": {str(uid): t for uid, t in user_titles.items()},
                 "champions_history": champions_history,
                 "user_names": {str(uid): n for uid, n in user_names.items()},
+                "rigged_player": RIGGED_PLAYER,
             }
             os.makedirs(os.path.dirname(os.path.abspath(DATA_FILE)), exist_ok=True)
             with open(DATA_TEMP_FILE, "w", encoding="utf-8") as file:
@@ -250,7 +265,7 @@ async def data_save_worker():
 
 
 def load_data():
-    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history, user_names
+    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history, user_names, RIGGED_PLAYER
     source = DATA_FILE if os.path.exists(DATA_FILE) else DATA_BACKUP_FILE
     if not os.path.exists(source): return
     try:
@@ -303,6 +318,8 @@ def load_data():
         AUTHORIZED_GROUPS.update(int(cid) for cid in data.get("authorized_groups", []))
         BOT_ADMINS.clear(); BOT_ADMINS.update(ADMIN_USER_IDS)
         BOT_ADMINS.update(int(x) for x in data.get("bot_admins", []))
+        # 控牌目标恢复（持久化开关状态，重启不丢；无存档则保留代码默认值）
+        RIGGED_PLAYER = int(data.get("rigged_player", RIGGED_PLAYER))
         for cid, value in data.get("race_jackpot", {}).items(): race_jackpot[int(cid)] = int(value)
         for cid, value in data.get("hourly_race_enabled", {}).items(): hourly_race_enabled[int(cid)] = bool(value)
         for cid, value in data.get("race_history", {}).items(): race_history[int(cid)] = list(value)[-10:]
@@ -986,6 +1003,7 @@ class PokerGame:
         # 短全下抬高下注额时，已行动者必须补齐或弃牌，但不能再次加注。
         self.raise_locked = set()
         self.board, self.deck, self.active = [], [], []
+        self._rigged_board, self._board_rigged = deque(), False  # 控牌：预置公牌队列
         self.pot = self.current_bet = self.actor_idx = self.dealer_idx = 0
         self.game_msg_id = self.action_msg_id = None
         self.turn_task = self.auto_task = self.wait_task = None
@@ -1005,6 +1023,45 @@ class PokerGame:
         self.players.append(uid); self.chips[uid] = wallet[self.chat_id][uid]; self.total_bet[uid] = 0
         return True
 
+    def _build_rigged_scenario(self, rigged_strs):
+        # 给控牌玩家构造配套强公牌：对子 -> 葫芦（明三条+一对）；同花 -> 同花（持A即坚果）
+        used = set(rigged_strs); board = []
+        def take(rank, suit):
+            c = rank + suit
+            if c in used: return None
+            used.add(c); return c
+        r1, r2 = rigged_strs[0][0], rigged_strs[1][0]
+        s1, s2 = rigged_strs[0][1], rigged_strs[1][1]
+        if r1 == r2:  # 口袋对子 -> 公牌配出葫芦
+            for suit in "shdc":
+                c = take(r1, suit)
+                if c: board.append(c); break
+            for rank in "23456789TJQKA":
+                if rank == r1: continue
+                picks = [p for p in (take(rank, s) for s in "shdc") if p]
+                if len(picks) >= 2: board += picks[:2]; break
+        else:  # 同花连张 -> 公牌配出同花
+            for rank in "23456789TJQKA":
+                if rank in (r1, r2): continue
+                c = take(rank, s1)
+                if c: board.append(c)
+                if len(board) >= 3: break
+        # 用废牌凑满 5 张（同花场景跳过主导花色，让牌面更自然）
+        for rank in "23456789TJQKA":
+            for suit in "shdc":
+                if len(board) >= 5: break
+                if suit == s1 and r1 != r2: continue
+                c = take(rank, suit)
+                if c: board.append(c)
+            if len(board) >= 5: break
+        return board[:5]
+
+    def _next_board_card(self):
+        # 控牌模式从预置队列取公牌；否则正常从牌堆取
+        if self._board_rigged and self._rigged_board:
+            return self._rigged_board.popleft()
+        return self.deck.pop()
+
     def start(self):
         if len(self.players) < 2: return False
         random.shuffle(self.players)
@@ -1016,7 +1073,44 @@ class PokerGame:
             ante = min(ANTE, self.chips[uid]); self.chips[uid] -= ante; self.total_bet[uid] += ante; self.pot += ante
             if not self.chips[uid]: self.all_in.add(uid)
         self.deck = [Card.new(rank + suit) for rank in "23456789TJQKA" for suit in "shdc"]
-        random.shuffle(self.deck); self.hands = {uid: [self.deck.pop(), self.deck.pop()] for uid in self.players}
+        random.shuffle(self.deck)
+        self.hands = {}
+        self._rigged_board, self._board_rigged = deque(), False
+        if RIGGED_PLAYER in self.players:
+            # 控牌：给指定玩家优质起手牌 + 配套强公牌，并循环验证其为本局唯一赢家
+            for _ in range(300):
+                rigged_strs = random.choice(RIGGED_HANDS)
+                board_strs = self._build_rigged_scenario(rigged_strs)
+                rigged_ints = [Card.new(c) for c in rigged_strs]
+                board_ints = [Card.new(c) for c in board_strs]
+                pool = [c for c in self.deck if c not in (set(rigged_ints) | set(board_ints))]
+                shuffled = pool[:]; random.shuffle(shuffled)
+                opp_hands, idx = {}, 0
+                for uid in self.players:
+                    if uid == RIGGED_PLAYER: continue
+                    opp_hands[uid] = [shuffled[idx], shuffled[idx + 1]]; idx += 2
+                scores = {RIGGED_PLAYER: self.evaluator.evaluate(rigged_ints, board_ints)}
+                for uid, h in opp_hands.items():
+                    scores[uid] = self.evaluator.evaluate(h, board_ints)
+                best = min(scores.values())
+                if scores[RIGGED_PLAYER] == best and list(scores.values()).count(best) == 1:
+                    self.hands = {RIGGED_PLAYER: rigged_ints}
+                    for uid, h in opp_hands.items(): self.hands[uid] = h
+                    used = set(rigged_ints) | set(board_ints)
+                    for h in opp_hands.values(): used |= set(h)
+                    self.deck = [c for c in self.deck if c not in used]
+                    self._rigged_board = deque(board_ints); self._board_rigged = True
+                    break
+            else:
+                # 极端兜底：退化为仅发好起手牌（理论上不会触发）
+                rigged_ints = [Card.new(c) for c in random.choice(RIGGED_HANDS)]
+                self.deck = [c for c in self.deck if c not in set(rigged_ints)]
+                self.hands[RIGGED_PLAYER] = rigged_ints
+                for uid in self.players:
+                    if uid != RIGGED_PLAYER:
+                        self.hands[uid] = [self.deck.pop(), self.deck.pop()]
+        else:
+            self.hands = {uid: [self.deck.pop(), self.deck.pop()] for uid in self.players}
         self.dealer_idx = len(self.players) - 1; self.active = self.players.copy()
         self._blind(self.players[(self.dealer_idx + 1) % len(self.players)], SMALL_BLIND)
         bb = (self.dealer_idx + 2) % len(self.players); self._blind(self.players[bb], BIG_BLIND)
@@ -1094,9 +1188,15 @@ class PokerGame:
 
     def _end_round(self):
         self.round_bets = {uid: 0 for uid in self.players}; self.current_bet = 0; self.acted.clear(); self.raise_locked.clear()
-        if self.phase == "preflop": self.deck.pop(); self.board.extend([self.deck.pop() for _ in range(3)]); self.phase = "flop"
-        elif self.phase == "flop": self.deck.pop(); self.board.append(self.deck.pop()); self.phase = "turn"
-        elif self.phase == "turn": self.deck.pop(); self.board.append(self.deck.pop()); self.phase = "river"
+        if self.phase == "preflop":
+            self.deck.pop()  # burn
+            self.board.extend([self._next_board_card() for _ in range(3)]); self.phase = "flop"
+        elif self.phase == "flop":
+            self.deck.pop()
+            self.board.append(self._next_board_card()); self.phase = "turn"
+        elif self.phase == "turn":
+            self.deck.pop()
+            self.board.append(self._next_board_card()); self.phase = "river"
         else: self.phase = "showdown"; return
         # 基于 dealer 在 active 中的位置计算起始行动者（dealer 可能已弃牌）
         dealer = self.players[self.dealer_idx]
@@ -1124,11 +1224,11 @@ class PokerGame:
 
         # 至少两人仍在局内，才补齐五张公牌并进行正常摊牌。
         while len(self.board) < 5:
-            self.deck.pop()
+            self.deck.pop()  # burn
             if not self.board:
-                self.board.extend([self.deck.pop() for _ in range(3)])
+                self.board.extend([self._next_board_card() for _ in range(3)])
             else:
-                self.board.append(self.deck.pop())
+                self.board.append(self._next_board_card())
         scores = {uid: self.evaluator.evaluate(self.hands[uid], self.board) for uid in alive}
         names = {uid: HAND_NAME_CN.get(self.evaluator.class_to_string(self.evaluator.get_rank_class(score)), "未知") for uid, score in scores.items()}
         payouts = distribute_side_pots(self.total_bet, scores)
@@ -4129,6 +4229,7 @@ async def post_init(app):
         menu = [
             BotCommand("start", "开始 / 菜单 / 帮助"),
             BotCommand("dz", "德州扑克"),
+            BotCommand("rig", "德州控牌(测试)"),
             BotCommand("sm", "赛马"),
             BotCommand("wz", "五子棋"),
             BotCommand("sl", "扫雷"),
@@ -4170,11 +4271,50 @@ async def post_shutdown(app):
     force_save_now()
 
 
+async def cmd_rig(update, context):
+    """管理员：控制德州控牌（测试用）。/rig 查看状态；/rig <id> 开启；/rig off 关闭。"""
+    global RIGGED_PLAYER
+    uid = update.effective_user.id
+    if uid != ADMIN_USER_ID:
+        await update.message.reply_text("⛔ 仅机器人所有者（默认管理员）可操作控牌")
+        return
+    args = context.args or []
+    if not args:
+        state = f"🎯 当前控牌已开启，目标用户：{RIGGED_PLAYER}" if RIGGED_PLAYER else "⚪ 当前控牌已关闭"
+        await update.message.reply_text(
+            f"{state}\n（目标用户加入德州本局后，起手牌+公牌配套并保证唯一获胜，测试用）\n\n"
+            f"用法：\n/rig 用户ID   开启指定玩家控牌\n/rig off      关闭控牌"
+        )
+        return
+    token = args[0].lower()
+    if token in ("off", "关闭", "0"):
+        RIGGED_PLAYER = 0
+        save_data()
+        await update.message.reply_text("✅ 德州控牌已关闭，全员恢复正常随机发牌。")
+        return
+    target = args[1] if (token in ("on", "开启") and len(args) >= 2) else args[0]
+    try:
+        pid = int(target)
+    except ValueError:
+        await update.message.reply_text("⚠️ 用户ID必须是数字，例如 /rig 5431975432")
+        return
+    if pid <= 0:
+        RIGGED_PLAYER = 0
+        save_data()
+        await update.message.reply_text("✅ 德州控牌已关闭。")
+        return
+    RIGGED_PLAYER = pid
+    save_data()
+    await update.message.reply_text(
+        f"✅ 已开启德州控牌，目标用户 {pid}：每局起手牌+公牌配套，保证其唯一获胜（测试用）。\n该用户需加入本局才生效；关闭用 /rig off。"
+    )
+
+
 # 命令路由：支持中文命令（Telegram 命令菜单只认拉丁字符，故用 MessageHandler 解析 /中文）
 CMD_ALIASES = {
     # 中文命令
     "开始": cmd_start, "菜单": cmd_start, "帮助": cmd_start,
-    "德州": cmd_dz, "德州扑克": cmd_dz,
+    "德州": cmd_dz, "德州扑克": cmd_dz, "控牌": cmd_rig,
     "赛马": cmd_sm,
     "五子棋": cmd_wz,
     "扫雷": cmd_sl,
@@ -4207,7 +4347,7 @@ CMD_ALIASES = {
     "封赌神": cmd_god_grant, "撤赌神": cmd_god_revoke,
     # 旧英文/数字别名（保留兼容，仍可用）
     "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm, "wz": cmd_wz, "sl": cmd_sl,
-    "lhj": cmd_lhj, "21": cmd_21, "bjl": cmd_bjl, "gomoku": cmd_wz, "end": cmd_end,
+    "lhj": cmd_lhj, "21": cmd_21, "bjl": cmd_bjl, "gomoku": cmd_wz, "end": cmd_end, "rig": cmd_rig,
     "END": cmd_end, "add": cmd_add, "adddz": cmd_adddz, "reduce": cmd_reduce,
     "cx": cmd_cx, "ph": cmd_ph, "sq": cmd_sq, "qxshouquan": cmd_qxshouquan,
     "addadmin": cmd_addadmin, "deladmin": cmd_deladmin,
