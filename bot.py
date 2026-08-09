@@ -530,12 +530,12 @@ async def action_notice(cid, app, uid, desc):
 async def emergency_if_needed(cid, uid, app, wallet=None, poker=None):
     used = daily_emergency_used[cid][uid]
     wallet = wallet or game_chips
-    if wallet[cid][uid] != 0 or used >= EMERGENCY_MAX_USES: return False
+    if wallet[cid][uid] < MIN_ENTRY_CHIPS or used >= EMERGENCY_MAX_USES: return False
     wallet[cid][uid] = EMERGENCY_CHIPS
     if poker and uid in poker.chips: poker.chips[uid] += EMERGENCY_CHIPS
     daily_emergency_used[cid][uid] = used + 1; save_data()
     remaining = EMERGENCY_MAX_USES - daily_emergency_used[cid][uid]
-    await safe_send(app.bot, cid, f"🆘 {await get_name(app, uid)} 积分归零，已赠送 {EMERGENCY_CHIPS} 应急积分（今日已补充 {daily_emergency_used[cid][uid]}/{EMERGENCY_MAX_USES} 次，剩余 {remaining} 次）。")
+    await safe_send(app.bot, cid, f"🆘 {await get_name(app, uid)} 积分不足，已赠送 {EMERGENCY_CHIPS} 应急积分（今日已补充 {daily_emergency_used[cid][uid]}/{EMERGENCY_MAX_USES} 次，剩余 {remaining} 次）。")
     return True
 
 
@@ -801,7 +801,7 @@ class BlackjackGame:
         return True
 
     def start(self):
-        if not self.players: return False
+        if self.phase != "waiting" or not self.players: return False
         self.phase = "playing"
         self.deck = [r + s for r in "23456789TJQKA" for s in "shdc"] * BLACKJACK_DECKS
         random.shuffle(self.deck)
@@ -2538,7 +2538,7 @@ class NiuNiuGame:
         return 0, [], list(range(5))
 
     def max_card(self, uid):
-        return max(self.hands[uid]) if uid in self.hands else 0
+        return max(NiuNiuGame.card_point(c) for c in self.hands[uid]) if uid in self.hands else 0
 
     def is_robot(self, uid):
         return uid < 0
@@ -2887,6 +2887,9 @@ async def start_wait_timeout(game, app):
 async def cmd_dz(update, context):
     if not await need_auth(update): return
     if not await require_group_chat(update, "德州扑克", "dz"): return
+    if season_active:
+        await update.message.reply_text("🏆 当前赛季进行中，请使用 /排位 参加排位赛（德州日常局已暂停）。")
+        return
     cid, uid = update.effective_chat.id, update.effective_user.id; game = active_poker_games.get(cid)
     mode = game.mode if game and game.phase == "waiting" else current_game_mode()
     wallet = texas_chips
@@ -3582,7 +3585,10 @@ async def on_button(update, context):
                 if uid not in game.players:
                     await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
                 if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
-                card = game.hit(uid); await q.answer(f"你抽到了 {game.get_card_str([card])}")
+                card = game.hit(uid)
+                if card is None:
+                    await q.answer("不是你的回合或本局已结束", show_alert=True); return
+                await q.answer(f"你抽到了 {game.get_card_str([card])}")
                 if game.phase == "finished" or game.phase == "dealer_turn": await update_blackjack_ui(game, context.application)
                 else: await update_blackjack_ui(game, context.application); await start_bj_turn_timer(game, context.application)
             elif data.startswith("bj_stand_"):
