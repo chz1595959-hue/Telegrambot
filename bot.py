@@ -59,7 +59,7 @@ RIGGED_PLAYER = 0
 # 可选优质起手牌（随机挑一手，避免每次都一模一样显得刻意）
 # 控牌玩家随机出现的牌型（等概率）。可选：flush=同花, trips=三条, straight=顺子
 # 想只出某一种就只留那一项；想恢复"葫芦+同花"的旧版可把这几项换回对应起手牌列表
-RIGGED_TYPES = ["flush", "trips", "straight"]
+RIGGED_TYPES = ["trips", "straight"]
 # ---------- 德州排位赛 ----------
 SEASON_START_CHIPS = 20000     # 排位赛起始分（独立账本，7天不清零）
 SEASON_MIN_PLAYERS = 20        # 报名满 20 人自动开赛
