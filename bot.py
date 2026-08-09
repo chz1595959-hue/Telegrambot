@@ -1157,6 +1157,8 @@ class PokerGame:
         if kind == "fold":
             old = self.active.index(uid); self.folded.add(uid); self.active.remove(uid)
             if self.active: self.actor_idx = (old - 1) % len(self.active)
+            if uid == RIGGED_PLAYER:
+                self._board_rigged = False  # 指定玩家弃牌后，公牌改回纯随机，避免多余控牌露馅
             desc = "弃牌"
         elif kind == "check":
             if self.round_bets[uid] != self.current_bet: return False, "必须跟注或加注"
