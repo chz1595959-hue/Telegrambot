@@ -1053,14 +1053,16 @@ class PokerGame:
                 R = random.choice(RANKS)
                 hole = [take(R, "s"), take(R, "h")]
                 board = [take(R, "d")] + fill_board(4, avoid_ranks=(R,))
-            else:  # straight
+            else:  # straight 隐蔽版：玩家拿隔张(如6、8)，公牌拿另三张隔张(5、7、9)，flop 不再连号
                 ws = random.randint(0, 8)
                 window = list(RANKS[ws:ws + 5])
-                cycle = ["s", "h", "d", "c", "s"]
-                hole = [take(window[0], cycle[0]), take(window[1], cycle[1])]
-                board = [take(window[2], cycle[2]), take(window[3], cycle[3]), take(window[4], cycle[4])]
+                cyc = random.sample(SUITS, 4)
+                # 玩家取第2、4张(隔一张)，公牌取第1、3、5张(隔一张)，花色错开避免同花顺/同花面
+                hole = [take(window[1], cyc[0]), take(window[3], cyc[1])]
+                board = [take(window[0], cyc[2]), take(window[2], cyc[3]), take(window[4], cyc[0])]
                 board += fill_board(2, avoid_ranks=tuple(window))
             hole, board = hole[:2], board[:5]
+            random.shuffle(board)  # 打乱公牌顺序，flop/turn/river 不再刻意连号或连花色
             if len(hole) != 2 or len(board) != 5: continue
             cards = [Card.new(c) for c in hole + board]
             if len(cards) != len(set(cards)): continue
