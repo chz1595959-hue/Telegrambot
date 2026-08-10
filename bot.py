@@ -53,8 +53,10 @@ BOT_ADMINS = set(ADMIN_USER_IDS)  # 运行时管理员集合 = 种子 ∪ 持久
 SMALL_BLIND, BIG_BLIND, ANTE = 0, 0, 200
 STALE_TEXT_COMMAND_SECONDS = 120
 # ---------- 德州控牌（仅供娱乐/测试，其他玩家不可见）----------
-# 控牌目标用户。默认 0 = 关闭（全员随机）；测试时用 /rig <id> 开启。
-# 改为默认关闭，避免 bot 重启后从默认常量恢复成开启状态。
+# 控牌目标【不写死在配置里】，完全由命令 /rig 临时设定（单人、替换式）：
+#   /rig <id>   把控牌目标临时替换为该用户（谁进局就给谁控牌）
+#   /rig off    关闭控牌、清空目标
+# 默认 0 = 关闭（无目标）。状态持久化，bot 重启后保留你的设定；想彻底不留痕迹用 /rig off。
 RIGGED_PLAYER = 0
 # 可选优质起手牌（随机挑一手，避免每次都一模一样显得刻意）
 # 控牌玩家随机出现的牌型（列表重复即权重）。可选：pair=高对子, twopair=两对, trips=三条, straight=顺子
@@ -99,6 +101,7 @@ def total_profit_by_game(game_profit, chat_id):
 # ---------- 数据 ----------
 texas_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))  # 德州专用积分（每日重置 20000）
 game_chips = defaultdict(lambda: defaultdict(lambda: GAME_STARTING_CHIPS))  # 其他游戏通用积分（不重置，初始 5W）
+monopoly_cash = defaultdict(lambda: defaultdict(lambda: 0))  # 大富翁独立账本（不碰通用积分；加入时给初始 15000）
 AUTHORIZED_GROUPS = set()
 race_history = defaultdict(list)
 baccarat_history = defaultdict(list)
@@ -125,6 +128,7 @@ last_business_date = ""
 active_poker_games, active_horse_races, active_gomoku_games, active_minesweeper_games = {}, {}, {}, {}
 active_blackjack_games, active_baccarat_games = {}, {}
 active_sicbo_games, active_niuniu_games = {}, {}
+active_monopoly_games = {}  # 大富翁（按群独立一局）
 recent_poker_reveals = {}  # 德州单赢结算后临时保存赢家牌，供可选亮牌按钮使用
 # ---------- 德州排位赛状态（独立账本，每日重置不触碰） ----------
 season_active = False
@@ -229,6 +233,7 @@ def force_save_now():
                 "champions_history": champions_history,
                 "user_names": {str(uid): n for uid, n in user_names.items()},
                 "rigged_player": RIGGED_PLAYER,
+                "monopoly_cash": {str(cid): dict(users) for cid, users in monopoly_cash.items()},
             }
             _dir = os.path.dirname(os.path.abspath(DATA_FILE))
             if _dir:
@@ -261,7 +266,7 @@ async def data_save_worker():
 
 
 def load_data():
-    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history, user_names, RIGGED_PLAYER
+    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history, user_names, RIGGED_PLAYER, monopoly_cash
     source = DATA_FILE if os.path.exists(DATA_FILE) else DATA_BACKUP_FILE
     if not os.path.exists(source): return
     try:
@@ -285,6 +290,7 @@ def load_data():
         for date, chats in data.get("slot_profit_by_date", {}).items(): restore_nested(slot_profit_by_date[date], chats)
         for date, chats in data.get("sicbo_profit_by_date", {}).items(): restore_nested(sicbo_profit_by_date[date], chats)
         for date, chats in data.get("niuniu_profit_by_date", {}).items(): restore_nested(niuniu_profit_by_date[date], chats)
+        restore_nested(monopoly_cash, data.get("monopoly_cash", {}))
         # 德州排位赛状态恢复
         season_active = data.get("season_active", False)
         season_id = data.get("season_id")
@@ -3781,6 +3787,107 @@ async def on_button(update, context):
                 await safe_edit(context.bot, cid, game.game_msg_id, "🛑 牛牛已手动终止。", reply_markup=None)
             return
 
+        # --- 大富翁 回调 ---
+        if data.startswith("mp_"):
+            game = active_monopoly_games.get(cid)
+            if not game:
+                await q.answer("大富翁已结束", show_alert=True); return
+            cur = game.current()
+            if data == "mp_end":
+                if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
+                game.cancel_timer(); game.cancel_wait()
+                active_monopoly_games.pop(cid, None)
+                await safe_edit(context.bot, cid, game.game_msg_id, "🛑 大富翁已手动终止。", reply_markup=None)
+                return
+            if game.phase == "waiting":
+                if data == "mp_join":
+                    if game.add(uid): await q.answer("已加入"); await update_monopoly_ui(game, context.application)
+                    else: await q.answer("无法加入（已满或已开始）", show_alert=True)
+                elif data == "mp_start":
+                    if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
+                    if len(game.alive()) < MONOPOLY_MIN_PLAYERS: await q.answer("人数不足", show_alert=True); return
+                    game.cancel_timer(); game.cancel_wait(); game.start()
+                    await update_monopoly_ui(game, context.application)
+                return
+            if uid != cur:
+                await q.answer("不是你的回合", show_alert=True); return
+            if data == "mp_join":
+                await q.answer("游戏已开始", show_alert=True); return
+            if data.startswith("mp_roll_"):
+                n = int(data.split("_")[2])
+                if n == 3 and game.props[uid]["lucky_die"] <= 0:
+                    await q.answer("需要幸运骰道具", show_alert=True); return
+                await game.do_roll(uid, n, context.application)
+                await update_monopoly_ui(game, context.application)
+                return
+            if data == "mp_bail":
+                if not game.in_jail[uid]: await q.answer("你不在监狱", show_alert=True); return
+                if game.cget(uid) < MONOPOLY_BAIL: await q.answer("现金不足", show_alert=True); return
+                game.cset(uid, game.cget(uid) - MONOPOLY_BAIL); game.in_jail[uid] = False; game.jail_turns[uid] = 0
+                await q.answer("已保释"); await update_monopoly_ui(game, context.application)
+                return
+            if data == "mp_buy":
+                if not (isinstance(game.awaiting, tuple) and game.awaiting[0] == "buy"): await q.answer("无需买地", show_alert=True); return
+                cell = game.awaiting[1]
+                if game.buy(uid, cell): await q.answer("购买成功")
+                else: await q.answer("购买失败", show_alert=True)
+                game.awaiting = None; game.after_turn(uid, context.application)
+                await update_monopoly_ui(game, context.application)
+                return
+            if data == "mp_nobuy":
+                if not (isinstance(game.awaiting, tuple) and game.awaiting[0] == "buy"): await q.answer("无需操作", show_alert=True); return
+                game.awaiting = None; game.after_turn(uid, context.application)
+                await update_monopoly_ui(game, context.application)
+                return
+            if data == "mp_up":
+                if not (isinstance(game.awaiting, tuple) and game.awaiting[0] == "up"): await q.answer("无需升级", show_alert=True); return
+                cell = game.awaiting[1]
+                if game.upgrade(uid, cell): await q.answer("升级成功")
+                else: await q.answer("升级失败", show_alert=True)
+                game.awaiting = None; game.after_turn(uid, context.application)
+                await update_monopoly_ui(game, context.application)
+                return
+            if data == "mp_skipup":
+                if not (isinstance(game.awaiting, tuple) and game.awaiting[0] == "up"): await q.answer("无需操作", show_alert=True); return
+                game.awaiting = None; game.after_turn(uid, context.application)
+                await update_monopoly_ui(game, context.application)
+                return
+            if data == "mp_bomb":
+                if game.place_bomb(uid): await q.answer("已放置炸弹")
+                else: await q.answer("无法放置（现金不足或前方不可放）", show_alert=True)
+                await update_monopoly_ui(game, context.application)
+                return
+            if data == "mp_stock":
+                if game.boost_stock(uid): await q.answer("已拉升行情")
+                else: await q.answer("无法拉升（需垄断且无进行中行情）", show_alert=True)
+                await update_monopoly_ui(game, context.application)
+                return
+            if data == "mp_manage":
+                await update_monopoly_ui(game, context.application, manage_uid=uid)
+                return
+            if data == "mp_manage_close":
+                await update_monopoly_ui(game, context.application)
+                return
+            if data.startswith("mp_upmanage_"):
+                cell = int(data.split("_")[2])
+                if game.upgrade(uid, cell): await q.answer("升级成功")
+                else: await q.answer("升级失败", show_alert=True)
+                await update_monopoly_ui(game, context.application, manage_uid=uid)
+                return
+            if data.startswith("mp_mort_"):
+                cell = int(data.split("_")[2])
+                if game.mortgage_prop(uid, cell): await q.answer("已抵押")
+                else: await q.answer("抵押失败", show_alert=True)
+                await update_monopoly_ui(game, context.application, manage_uid=uid)
+                return
+            if data.startswith("mp_redeem_"):
+                cell = int(data.split("_")[2])
+                if game.redeem_prop(uid, cell): await q.answer("已赎回")
+                else: await q.answer("赎回失败", show_alert=True)
+                await update_monopoly_ui(game, context.application, manage_uid=uid)
+                return
+            return
+
 
         # --- 老虎机连抽回调（绑定发起人） ---
         if data.startswith("lhj_spin_"):
@@ -4300,6 +4407,7 @@ async def post_init(app):
             BotCommand("bjl", "百家乐"),
             BotCommand("sb", "骰子"),
             BotCommand("nn", "牛牛"),
+            BotCommand("monopoly", "大富翁"),
             BotCommand("end", "结束当前游戏"),
             BotCommand("add", "加积分"),
             BotCommand("adddz", "加德州积分"),
@@ -4334,7 +4442,7 @@ async def post_shutdown(app):
 
 
 async def cmd_rig(update, context):
-    """管理员：控制德州控牌（测试用）。/rig 查看状态；/rig <id> 开启；/rig off 关闭。"""
+    """管理员：控制德州控牌（测试用）。/rig 查看状态；/rig <id> 临时开启（替换目标）；/rig off 关闭。"""
     global RIGGED_PLAYER
     uid = update.effective_user.id
     if uid != ADMIN_USER_ID:
@@ -4342,10 +4450,10 @@ async def cmd_rig(update, context):
         return
     args = context.args or []
     if not args:
-        state = f"🎯 当前控牌已开启，目标用户：{RIGGED_PLAYER}" if RIGGED_PLAYER else "⚪ 当前控牌已关闭"
+        state = f"🎯 当前控牌已开启，临时目标用户：{RIGGED_PLAYER}" if RIGGED_PLAYER else "⚪ 当前控牌已关闭（无目标）"
         await update.message.reply_text(
             f"{state}\n（目标用户加入德州本局后，起手牌+公牌配套并保证唯一获胜，测试用）\n\n"
-            f"用法：\n/rig 用户ID   开启指定玩家控牌\n/rig off      关闭控牌"
+            f"用法：\n/rig 用户ID   临时把控牌目标替换为该用户\n/rig off      关闭控牌、清空目标"
         )
         return
     token = args[0].lower()
@@ -4368,11 +4476,781 @@ async def cmd_rig(update, context):
     RIGGED_PLAYER = pid
     save_data()
     await update.message.reply_text(
-        f"✅ 已开启德州控牌，目标用户 {pid}：每局起手牌+公牌配套，保证其唯一获胜（测试用）。\n该用户需加入本局才生效；关闭用 /rig off。"
+        f"✅ 已临时开启德州控牌，目标用户 {pid}（替换式，单人）：该用户每局起手牌+公牌配套，保证唯一获胜（测试用）。\n"
+        f"该用户需加入本局才生效；换人用 /rig 新ID，关闭用 /rig off。"
     )
 
 
 # 命令路由：支持中文命令（Telegram 命令菜单只认拉丁字符，故用 MessageHandler 解析 /中文）
+# ==================== 大富翁（独立账本 monopoly_cash，不碰通用积分）====================
+MONOPOLY_INIT_CASH = 15000
+MONOPOLY_MAX_PLAYERS = 6
+MONOPOLY_MIN_PLAYERS = 2
+MONOPOLY_ROUND_CAP = 80          # 回合上限，到点按净资产排名
+MONOPOLY_BAIL = 500
+MONOPOLY_GO_SALARY = 1500        # 经过起点领工资
+MONOPOLY_GO_LAND = 2000          # 停在被起点奖励
+MONOPOLY_JAIL_CELL = 8
+MONOPOLY_VISIT_CELL = 26
+MONOPOLY_BOMB_COST = 600
+MONOPOLY_BOMB_FEE = 800
+MONOPOLY_STOCK_COST = 1000
+MONOPOLY_STOCK_ROUNDS = 3
+MONOPOLY_LUCKY_DIE_COST = 1000
+
+MONO_COLORS = ["红", "蓝", "绿", "黄"]
+COLOR_TIER_PRICE = {"红": 800, "蓝": 1000, "绿": 1200, "黄": 1500}
+COLOR_EMOJI = {"红": "🟥", "蓝": "🟦", "绿": "🟩", "黄": "🟨"}
+RENT_MULT = [1, 3, 8, 20, 50]    # 0~4 栋房的租金倍数（基于 rent_base）
+
+# 36 格环形棋盘：4 色各 5 格 + 4 车站 + 机会/命运各 2 + 税收 2 + 监狱/探监/停车/起点 + 神秘传送 2
+MONO_BOARD = [
+    {"type": "go", "name": "🚀 起点"},
+    {"type": "prop", "name": "北京路", "color": "红"},
+    {"type": "prop", "name": "南京路", "color": "蓝"},
+    {"type": "chance", "name": "💡 机会"},
+    {"type": "prop", "name": "西安路", "color": "绿"},
+    {"type": "station", "name": "🚉 北站"},
+    {"type": "prop", "name": "厦门路", "color": "黄"},
+    {"type": "prop", "name": "上海路", "color": "红"},
+    {"type": "jail", "name": "🔒 进监狱"},
+    {"type": "prop", "name": "成都路", "color": "蓝"},
+    {"type": "prop", "name": "苏州路", "color": "绿"},
+    {"type": "fate", "name": "🎴 命运"},
+    {"type": "prop", "name": "昆明路", "color": "黄"},
+    {"type": "station", "name": "🚉 南站"},
+    {"type": "prop", "name": "广州路", "color": "红"},
+    {"type": "park", "name": "🅿️ 免费停车"},
+    {"type": "prop", "name": "武汉路", "color": "蓝"},
+    {"type": "prop", "name": "天津路", "color": "绿"},
+    {"type": "tax", "name": "🏛 所得税", "amount": 800},
+    {"type": "prop", "name": "贵阳路", "color": "黄"},
+    {"type": "station", "name": "🚉 东站"},
+    {"type": "prop", "name": "深圳路", "color": "红"},
+    {"type": "prop", "name": "重庆路", "color": "蓝"},
+    {"type": "chance", "name": "💡 机会"},
+    {"type": "prop", "name": "青岛路", "color": "绿"},
+    {"type": "prop", "name": "拉萨路", "color": "黄"},
+    {"type": "visit", "name": "🚶 探监"},
+    {"type": "prop", "name": "杭州路", "color": "红"},
+    {"type": "prop", "name": "长沙路", "color": "蓝"},
+    {"type": "station", "name": "🚉 西站"},
+    {"type": "fate", "name": "🎴 命运"},
+    {"type": "prop", "name": "大连路", "color": "绿"},
+    {"type": "teleport", "name": "🌀 神秘传送"},
+    {"type": "tax", "name": "💎 奢侈税", "amount": 1000},
+    {"type": "teleport", "name": "🌀 神秘传送"},
+    {"type": "prop", "name": "哈尔滨路", "color": "黄"},
+]
+
+
+def mono_prop_price(cell):
+    if MONO_BOARD[cell]["type"] == "station":
+        return 1500
+    return COLOR_TIER_PRICE[MONO_BOARD[cell]["color"]]
+
+
+def mono_rent_base(cell):
+    if MONO_BOARD[cell]["type"] == "station":
+        return 250
+    return COLOR_TIER_PRICE[MONO_BOARD[cell]["color"]] // 4
+
+
+def mono_house_cost(cell):
+    if MONO_BOARD[cell]["type"] == "station":
+        return 0
+    return COLOR_TIER_PRICE[MONO_BOARD[cell]["color"]] // 2
+
+
+# 机会卡（约 22 张）
+MONO_CHANCE = [
+    {"text": "银行分红，+1500", "effect": {"cash": 1500}},
+    {"text": "违章停车罚款，-400", "effect": {"cash": -400}},
+    {"text": "中奖啦，+800", "effect": {"cash": 800}},
+    {"text": "请客吃饭，-300", "effect": {"cash": -300}},
+    {"text": "捡到钱包，+600", "effect": {"cash": 600}},
+    {"text": "修车费，-500", "effect": {"cash": -500}},
+    {"text": "工资上涨，+1000", "effect": {"cash": 1000}},
+    {"text": "股市大跌，-900", "effect": {"cash": -900}},
+    {"text": "借给亲友，-700", "effect": {"cash": -700}},
+    {"text": "收到红包，+500", "effect": {"cash": 500}},
+    {"text": "获得幸运骰道具（可掷 3 颗）", "effect": {"lucky": 1}},
+    {"text": "获得出狱卡（监狱免保释）", "effect": {"getout": 1}},
+    {"text": "前进到起点，领奖励", "effect": {"advance_go": True}},
+    {"text": "向前走 3 格", "effect": {"forward": 3}},
+    {"text": "向后退 2 格", "effect": {"forward": -2}},
+    {"text": "直奔监狱！", "effect": {"go_jail": True}},
+    {"text": "慈善募捐，给每人 200", "effect": {"pay_all": 200}},
+    {"text": "收租日，每人给你 150", "effect": {"collect_all": 150}},
+    {"text": "神秘传送！", "effect": {"teleport": True}},
+    {"text": "某板块行情暴涨，租金×2", "effect": {"stock": True}},
+    {"text": "房产分红，每处地产 +200", "effect": {"dividend": 200}},
+    {"text": "免费停车捡到钱，+400", "effect": {"cash": 400}},
+]
+
+# 命运卡（约 22 张）
+MONO_FATE = [
+    {"text": "继承遗产，+2000", "effect": {"cash": 2000}},
+    {"text": "大额罚款，-1000", "effect": {"cash": -1000}},
+    {"text": "中彩票，+1500", "effect": {"cash": 1500}},
+    {"text": "车祸修车，-800", "effect": {"cash": -800}},
+    {"text": "投资获利，+1200", "effect": {"cash": 1200}},
+    {"text": "手机丢了，-600", "effect": {"cash": -600}},
+    {"text": "年终奖，+1000", "effect": {"cash": 1000}},
+    {"text": "超速罚款，-500", "effect": {"cash": -500}},
+    {"text": "幸运日，+700", "effect": {"cash": 700}},
+    {"text": "倒霉日，-400", "effect": {"cash": -400}},
+    {"text": "获得幸运骰道具", "effect": {"lucky": 1}},
+    {"text": "获得出狱卡", "effect": {"getout": 1}},
+    {"text": "前进到起点，领奖励", "effect": {"advance_go": True}},
+    {"text": "直奔监狱！", "effect": {"go_jail": True}},
+    {"text": "向前走 4 格", "effect": {"forward": 4}},
+    {"text": "向后退 3 格", "effect": {"forward": -3}},
+    {"text": "集资，每人给你 300", "effect": {"collect_all": 300}},
+    {"text": "散财，给每人 250", "effect": {"pay_all": 250}},
+    {"text": "神秘传送！", "effect": {"teleport": True}},
+    {"text": "某板块行情暴涨，租金×2", "effect": {"stock": True}},
+    {"text": "房产分红，每处地产 +300", "effect": {"dividend": 300}},
+    {"text": "命运眷顾，+900", "effect": {"cash": 900}},
+]
+
+
+class MonopolyGame:
+    def __init__(self, cid, owner_id):
+        self.chat_id = cid
+        self.owner_id = owner_id
+        self.phase = "waiting"
+        self.players = []          # [uid]
+        self.pos = {}
+        self.in_jail = {}
+        self.jail_turns = {}
+        self.props = {}            # uid -> {"lucky_die": n, "get_out": n}
+        self.bankrupt = {}
+        self.buy_streak = {}
+        self.achievements = {}
+        self.owner = {}            # cell -> uid
+        self.level = {}            # cell -> 0..4
+        self.mortgaged = {}        # cell -> bool
+        self.bombs = {}            # cell -> uid(放置者)
+        self.stock_boost = {}      # color -> 剩余回合
+        self.current_idx = 0
+        self.round_num = 1
+        self.turn_count = 0
+        self.game_msg_id = None
+        self.create_time = time.time()
+        self.wait_task = None
+        self.timer_task = None
+        self.awaiting = None       # None | ("buy", cell) | ("up", cell)
+        self.pending_extra = False
+        self.last_roll = None
+        self.log = []
+        self.result = []
+        for i in range(36):
+            self.owner[i] = None
+            self.level[i] = 0
+            self.mortgaged[i] = False
+
+    # ---------- 基础工具 ----------
+    def slot(self, uid):
+        return self.players.index(uid) + 1
+
+    def alive(self):
+        return [u for u in self.players if not self.bankrupt[u]]
+
+    def current(self):
+        return self.players[self.current_idx] if self.players else None
+
+    def cget(self, uid):
+        return monopoly_cash[self.chat_id][uid]
+
+    def cset(self, uid, v):
+        monopoly_cash[self.chat_id][uid] = v
+
+    def cancel_wait(self):
+        if self.wait_task and not self.wait_task.done():
+            self.wait_task.cancel()
+            self.wait_task = None
+
+    def cancel_timer(self):
+        if self.timer_task and not self.timer_task.done():
+            self.timer_task.cancel()
+            self.timer_task = None
+
+    # ---------- 加入 / 开始 ----------
+    def add(self, uid):
+        if self.phase != "waiting":
+            return False
+        if uid in self.players:
+            return False
+        if len(self.players) >= MONOPOLY_MAX_PLAYERS:
+            return False
+        if monopoly_cash[self.chat_id][uid] <= 0:
+            monopoly_cash[self.chat_id][uid] = MONOPOLY_INIT_CASH
+        self.players.append(uid)
+        self.pos[uid] = 0
+        self.in_jail[uid] = False
+        self.jail_turns[uid] = 0
+        self.props[uid] = {"lucky_die": 0, "get_out": 0}
+        self.bankrupt[uid] = False
+        self.buy_streak[uid] = 0
+        return True
+
+    def start(self):
+        if self.phase != "waiting":
+            return False
+        if len(self.alive()) < MONOPOLY_MIN_PLAYERS:
+            return False
+        self.phase = "playing"
+        self.current_idx = 0
+        self.round_num = 1
+        self.turn_count = 0
+        return True
+
+    # ---------- 地产归属辅助 ----------
+    def full_color(self, uid, color):
+        cells = [c for c in range(36) if MONO_BOARD[c].get("color") == color]
+        return bool(cells) and all(self.owner[c] == uid for c in cells)
+
+    def color_all_max(self, uid, color):
+        cells = [c for c in range(36) if MONO_BOARD[c].get("color") == color]
+        return bool(cells) and all(self.owner[c] == uid and self.level[c] >= 4 for c in cells)
+
+    def rent_of(self, cell):
+        owner = self.owner[cell]
+        if owner is None or self.mortgaged[cell]:
+            return 0
+        base = mono_rent_base(cell)
+        if MONO_BOARD[cell]["type"] == "station":
+            cnt = sum(1 for c in range(36) if MONO_BOARD[c]["type"] == "station" and self.owner[c] == owner)
+            return 250 * cnt
+        lvl = self.level[cell]
+        mult = RENT_MULT[lvl]
+        color = MONO_BOARD[cell]["color"]
+        if self.full_color(owner, color):
+            mult *= 2
+        if self.color_all_max(owner, color):
+            mult *= 2
+        if self.stock_boost.get(color, 0) > 0:
+            mult *= 2
+        return base * mult
+
+    def net_worth(self, uid):
+        total = self.cget(uid)
+        for c in range(36):
+            if self.owner[c] == uid:
+                total += mono_prop_price(c) // 2 if self.mortgaged[c] else mono_prop_price(c)
+                total += self.level[c] * mono_house_cost(c)
+        return total
+
+    # ---------- 经济：抵押 / 支付 / 破产 ----------
+    def mortgage_cover(self, uid, need):
+        while self.cget(uid) < need:
+            cand = [c for c in range(36) if self.owner[c] == uid and not self.mortgaged[c]
+                    and MONO_BOARD[c]["type"] in ("prop", "station")]
+            if not cand:
+                return False
+            cand.sort(key=lambda c: mono_prop_price(c), reverse=True)
+            c = cand[0]
+            self.mortgaged[c] = True
+            self.cset(uid, self.cget(uid) + mono_prop_price(c) // 2)
+        return True
+
+    def charge(self, uid, amount, to=None):
+        """向银行(to=None)或某人支付；不够先抵押；仍不够则破产，按可支付额结算。"""
+        if amount <= 0:
+            return 0
+        if self.cget(uid) < amount:
+            self.mortgage_cover(uid, amount)
+        pay = min(amount, self.cget(uid))
+        self.cset(uid, self.cget(uid) - pay)
+        if to is not None:
+            self.cset(to, self.cget(to) + pay)
+        if amount > pay:
+            self.bankrupt_player(uid)
+        return pay
+
+    def bankrupt_player(self, uid):
+        if self.bankrupt.get(uid):
+            return
+        for c in range(36):
+            if self.owner[c] == uid:
+                self.owner[c] = None
+                self.level[c] = 0
+                self.mortgaged[c] = False
+        for c, o in list(self.bombs.items()):
+            if o == uid:
+                self.bombs.pop(c, None)
+        self.cset(uid, 0)
+        self.bankrupt[uid] = True
+        self.log.append(f"💀 玩家{self.slot(uid)} 破产出局！")
+
+    # ---------- 买地 / 升级 / 抵押 ----------
+    def buy(self, uid, cell):
+        if self.owner[cell] is not None:
+            return False
+        price = mono_prop_price(cell)
+        if self.cget(uid) < price:
+            return False
+        self.cset(uid, self.cget(uid) - price)
+        self.owner[cell] = uid
+        self.level[cell] = 0
+        self.buy_streak[uid] += 1
+        if self.buy_streak[uid] >= 3:
+            self.cset(uid, self.cget(uid) + 500)
+            self.achievements[uid] = self.achievements.get(uid, 0) + 1
+            self.log.append(f"🏆 玩家{self.slot(uid)} 连买 3 处地产，成就奖励 +500！")
+            self.buy_streak[uid] = 0
+        color = MONO_BOARD[cell].get("color")
+        if color and self.full_color(uid, color):
+            self.cset(uid, self.cget(uid) + 1000)
+            self.achievements[uid] = self.achievements.get(uid, 0) + 1
+            self.log.append(f"🏆 玩家{self.slot(uid)} 集齐 {color}色垄断，奖励 +1000！")
+        return True
+
+    def upgrade(self, uid, cell):
+        if self.owner[cell] != uid or MONO_BOARD[cell]["type"] == "station":
+            return False
+        if self.level[cell] >= 4 or self.mortgaged[cell]:
+            return False
+        cost = mono_house_cost(cell)
+        if self.cget(uid) < cost:
+            return False
+        self.cset(uid, self.cget(uid) - cost)
+        self.level[cell] += 1
+        color = MONO_BOARD[cell]["color"]
+        if self.level[cell] == 4 and self.color_all_max(uid, color):
+            self.log.append(f"🏰 玩家{self.slot(uid)} 的 {color}色全部满级，升为地标！租金再翻倍！")
+        return True
+
+    def mortgage_prop(self, uid, cell):
+        if self.owner[cell] != uid or self.mortgaged[cell] or self.level[cell] > 0:
+            return False
+        self.mortgaged[cell] = True
+        self.cset(uid, self.cget(uid) + mono_prop_price(cell) // 2)
+        return True
+
+    def redeem_prop(self, uid, cell):
+        if self.owner[cell] != uid or not self.mortgaged[cell]:
+            return False
+        cost = int(mono_prop_price(cell) // 2 * 1.2)
+        if self.cget(uid) < cost:
+            return False
+        self.cset(uid, self.cget(uid) - cost)
+        self.mortgaged[cell] = False
+        return True
+
+    # ---------- 监狱 / 移动 ----------
+    def go_jail(self, uid):
+        self.pos[uid] = MONOPOLY_VISIT_CELL
+        self.in_jail[uid] = True
+        self.jail_turns[uid] = 0
+        self.log.append(f"🔒 玩家{self.slot(uid)} 被关进监狱！")
+
+    def move(self, uid, steps):
+        old = self.pos[uid]
+        new = old + steps
+        passed = new >= 36
+        self.pos[uid] = new % 36
+        if passed:
+            self.cset(uid, self.cget(uid) + MONOPOLY_GO_SALARY)
+            self.log.append(f"🚀 玩家{self.slot(uid)} 经过起点，领工资 +{MONOPOLY_GO_SALARY}")
+        return self.pos[uid], passed
+
+    # ---------- 落地结算 ----------
+    async def resolve_landing(self, uid, cell, app, depth=0):
+        if depth > 3:
+            return
+        b = MONO_BOARD[cell]
+        t = b["type"]
+        if t == "go":
+            self.cset(uid, self.cget(uid) + MONOPOLY_GO_LAND)
+            self.log.append(f"🚀 玩家{self.slot(uid)} 停在起点，奖励 +{MONOPOLY_GO_LAND}")
+        elif t in ("prop", "station"):
+            owner = self.owner[cell]
+            if owner is None:
+                price = mono_prop_price(cell)
+                if self.cget(uid) >= price:
+                    self.awaiting = ("buy", cell)
+                    self.log.append(f"🏠 玩家{self.slot(uid)} 抵达 {b['name']}（{price}），等待买地决定")
+                    return
+                self.log.append(f"💸 玩家{self.slot(uid)} 抵达 {b['name']}，现金不足无法购买")
+            elif owner == uid:
+                if t == "prop" and self.level[cell] < 4 and not self.mortgaged[cell] and self.cget(uid) >= mono_house_cost(cell):
+                    self.awaiting = ("up", cell)
+                    self.log.append(f"🏗 玩家{self.slot(uid)} 自己的 {b['name']} 可升级")
+                    return
+            else:
+                rent = self.rent_of(cell)
+                if rent > 0:
+                    paid = self.charge(uid, rent, to=owner)
+                    self.log.append(f"💰 玩家{self.slot(uid)} 踩中 {b['name']}，付租金 {paid} 给 玩家{self.slot(owner)}")
+                if cell in self.bombs:
+                    bo = self.bombs.pop(cell)
+                    if bo != uid:
+                        paid2 = self.charge(uid, MONOPOLY_BOMB_FEE, to=bo)
+                        self.log.append(f"💣 玩家{self.slot(uid)} 踩中 玩家{self.slot(bo)} 的炸弹，赔 {paid2} 并后退 3 格")
+                        self.pos[uid] = (self.pos[uid] - 3) % 36
+        elif t == "tax":
+            amt = b["amount"]
+            self.charge(uid, amt)
+            self.log.append(f"🏛 玩家{self.slot(uid)} 缴纳 {b['name']} {amt}")
+        elif t in ("chance", "fate"):
+            await self.draw_card(uid, t, app)
+        elif t == "jail":
+            self.go_jail(uid)
+        elif t == "visit":
+            self.log.append(f"🚶 玩家{self.slot(uid)} 探监，安全")
+        elif t == "park":
+            self.log.append(f"🅿️ 玩家{self.slot(uid)} 停在免费停车")
+        elif t == "teleport":
+            dest = random.randint(1, 35)
+            self.log.append(f"🌀 玩家{self.slot(uid)} 触发神秘传送！")
+            self.pos[uid] = dest
+            await self.resolve_landing(uid, dest, app, depth=depth + 1)
+
+    # ---------- 事件卡 ----------
+    async def draw_card(self, uid, kind, app):
+        cards = MONO_CHANCE if kind == "chance" else MONO_FATE
+        card = random.choice(cards)
+        self.log.append(f"🎴 {'机会' if kind == 'chance' else '命运'}：{card['text']}")
+        await self.apply_card(uid, card, app)
+
+    async def apply_card(self, uid, card, app):
+        e = card.get("effect", {})
+        if "cash" in e:
+            v = e["cash"]
+            if v >= 0:
+                self.cset(uid, self.cget(uid) + v)
+            else:
+                self.charge(uid, -v)
+        if "collect_all" in e:
+            x = e["collect_all"]
+            for o in self.alive():
+                if o != uid:
+                    self.charge(o, x, to=uid)
+        if "pay_all" in e:
+            x = e["pay_all"]
+            for o in self.alive():
+                if o != uid:
+                    self.charge(uid, x, to=o)
+        if e.get("go_jail"):
+            self.go_jail(uid)
+        if e.get("lucky"):
+            self.props[uid]["lucky_die"] += 1
+        if e.get("getout"):
+            self.props[uid]["get_out"] += 1
+        if e.get("advance_go"):
+            self.pos[uid] = 0
+            self.cset(uid, self.cget(uid) + MONOPOLY_GO_LAND)
+        if "forward" in e:
+            old = self.pos[uid]
+            step = e["forward"]
+            new = (old + step) % 36
+            if step > 0 and new <= old:
+                self.cset(uid, self.cget(uid) + MONOPOLY_GO_SALARY)
+            self.pos[uid] = new
+            await self.resolve_landing(uid, new, app, depth=1)
+        if "move" in e:
+            self.pos[uid] = e["move"]
+            await self.resolve_landing(uid, e["move"], app, depth=1)
+        if e.get("teleport"):
+            dest = random.randint(1, 35)
+            self.pos[uid] = dest
+            await self.resolve_landing(uid, dest, app, depth=1)
+        if e.get("stock"):
+            color = random.choice(MONO_COLORS)
+            self.stock_boost[color] = MONOPOLY_STOCK_ROUNDS
+            self.log.append(f"📈 {color}色板块行情暴涨，租金×2 持续 {MONOPOLY_STOCK_ROUNDS} 回合！")
+        if "dividend" in e:
+            owned = [c for c in range(36) if self.owner[c] == uid]
+            self.cset(uid, self.cget(uid) + e["dividend"] * len(owned))
+
+
+# ---------- 回合推进 ----------
+    def after_turn(self, uid, app):
+        if self.phase == "ended":
+            return
+        if self.pending_extra:
+            self.pending_extra = False
+            return  # 同一玩家再行动（疾风步）
+        self.advance_turn()
+
+    def advance_turn(self):
+        if len(self.alive()) <= 1:
+            self.end_game("last_man")
+            return
+        n = len(self.players)
+        for _ in range(n):
+            self.current_idx = (self.current_idx + 1) % n
+            if not self.bankrupt[self.players[self.current_idx]]:
+                break
+        self.turn_count += 1
+        self.round_num = self.turn_count // max(1, len(self.alive())) + 1
+        for color in list(self.stock_boost.keys()):
+            self.stock_boost[color] -= 1
+            if self.stock_boost[color] <= 0:
+                self.stock_boost.pop(color, None)
+        if self.round_num > MONOPOLY_ROUND_CAP:
+            self.end_game("time")
+
+    def end_game(self, reason):
+        self.phase = "ended"
+        ranking = sorted(self.players, key=lambda u: self.net_worth(u), reverse=True)
+        self.result = [(u, self.net_worth(u), self.bankrupt.get(u, False)) for u in ranking]
+
+    # ---------- 掷骰 ----------
+    async def do_roll(self, uid, dice_count, app):
+        if self.phase != "playing" or self.current() != uid:
+            return
+        if self.in_jail[uid]:
+            dice = [random.randint(1, 6) for _ in range(max(2, dice_count))]
+            total = sum(dice)
+            is_double = len(dice) >= 2 and dice[0] == dice[1]
+            self.jail_turns[uid] += 1
+            if is_double or self.jail_turns[uid] >= 3 or self.props[uid]["get_out"] > 0:
+                if self.props[uid]["get_out"] > 0:
+                    self.props[uid]["get_out"] -= 1
+                else:
+                    self.cset(uid, self.cget(uid) - MONOPOLY_BAIL)
+                self.in_jail[uid] = False
+                self.log.append(f"🔓 玩家{self.slot(uid)} 出狱，移动 {total}")
+                await self._move_resolve(uid, total, dice, app)
+            else:
+                self.log.append(f"🔒 玩家{self.slot(uid)} 监狱掷出 {dice}={total}，未出狱")
+                self.after_turn(uid, app)
+            return
+        dice = [random.randint(1, 6) for _ in range(dice_count)]
+        total = sum(dice)
+        if dice_count == 3:
+            self.props[uid]["lucky_die"] = max(0, self.props[uid]["lucky_die"] - 1)
+            s = sorted(dice)
+            if s[0] == s[1] == s[2]:
+                self.cset(uid, self.cget(uid) + 500)
+                self.log.append(f"🎉 豹子 {dice}！超级幸运 +500，额外抽命运卡")
+                await self.draw_card(uid, "fate", app)
+            elif s[2] - s[0] == 2 and len(set(s)) == 3:
+                self.pending_extra = True
+                self.log.append(f"🌟 顺子 {dice}！疾风步，可再行动一次")
+        await self._move_resolve(uid, total, dice, app)
+
+    async def _move_resolve(self, uid, total, dice, app):
+        self.last_roll = dice
+        self.log.append(f"🎲 玩家{self.slot(uid)} 掷出 {dice}={total}")
+        cell, _ = self.move(uid, total)
+        await self.resolve_landing(uid, cell, app, depth=0)
+        if self.phase == "ended":
+            return
+        if self.awaiting is not None:
+            return  # 等买/升级决定
+        self.after_turn(uid, app)
+
+    # ---------- 特色：炸弹 / 拉升 ----------
+    def place_bomb(self, uid):
+        if self.cget(uid) < MONOPOLY_BOMB_COST:
+            return False
+        target = (self.pos[uid] + 1) % 36
+        if MONO_BOARD[target]["type"] in ("go", "jail", "visit", "park"):
+            return False
+        self.cset(uid, self.cget(uid) - MONOPOLY_BOMB_COST)
+        self.bombs[target] = uid
+        self.log.append(f"💣 玩家{self.slot(uid)} 在 {MONO_BOARD[target]['name']} 放置炸弹！")
+        return True
+
+    def boost_stock(self, uid):
+        colors = [c for c in MONO_COLORS if self.full_color(uid, c)]
+        if not colors or self.cget(uid) < MONOPOLY_STOCK_COST:
+            return False
+        color = colors[0]
+        if self.stock_boost.get(color, 0) > 0:
+            return False
+        self.cset(uid, self.cget(uid) - MONOPOLY_STOCK_COST)
+        self.stock_boost[color] = MONOPOLY_STOCK_ROUNDS
+        self.log.append(f"📈 玩家{self.slot(uid)} 拉升 {color}色行情，租金×2 持续 {MONOPOLY_STOCK_ROUNDS} 回合")
+        return True
+
+
+# ==================== 大富翁 UI / 命令 ====================
+def mono_cell_token(game, cell):
+    b = MONO_BOARD[cell]
+    if b["type"] == "prop":
+        emoji = COLOR_EMOJI[b["color"]]
+    elif b["type"] == "station":
+        emoji = "🚉"
+    else:
+        emoji = {"go": "🚀", "chance": "💡", "fate": "🎴", "tax": "🏛", "jail": "🔒", "visit": "🚶", "park": "🅿️", "teleport": "🌀"}[b["type"]]
+    owner = game.owner[cell]
+    if owner is None:
+        return f"{emoji}{b['name']}"
+    mark = f"P{game.slot(owner)}"
+    if game.mortgaged[cell]:
+        mark += "🔻"
+    elif b["type"] == "prop" and game.level[cell] > 0:
+        mark += "🏠" * game.level[cell] + ("🏰" if game.level[cell] == 4 and game.color_all_max(owner, b["color"]) else "")
+    return f"{emoji}{b['name']} {mark}"
+
+
+async def _mono_send_or_edit(game, bot, text, kb):
+    if game.game_msg_id:
+        await safe_edit(bot, game.chat_id, game.game_msg_id, text, reply_markup=kb, parse_mode="HTML")
+    else:
+        msg = await safe_send(bot, game.chat_id, text, reply_markup=kb, parse_mode="HTML")
+        if msg:
+            game.game_msg_id = msg.message_id
+
+
+def _mono_play_keyboard(game):
+    uid = game.current()
+    if game.awaiting is not None:
+        if game.awaiting[0] == "buy":
+            cell = game.awaiting[1]
+            price = mono_prop_price(cell)
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🏠 买下 {MONO_BOARD[cell]['name']}（{price}）", callback_data="mp_buy")],
+                [InlineKeyboardButton("❌ 不买", callback_data="mp_nobuy")]])
+        if game.awaiting[0] == "up":
+            cell = game.awaiting[1]
+            cost = mono_house_cost(cell)
+            return InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🏗 升级（{cost}）", callback_data="mp_up")],
+                [InlineKeyboardButton("➡️ 不动", callback_data="mp_skipup")]])
+    rows = []
+    dice_row = [InlineKeyboardButton("🎲1颗", callback_data="mp_roll_1")]
+    if not game.in_jail[uid]:
+        dice_row.append(InlineKeyboardButton("🎲🎲2颗", callback_data="mp_roll_2"))
+        if game.props[uid]["lucky_die"] > 0:
+            dice_row.append(InlineKeyboardButton("🎲🎲🎲3颗", callback_data="mp_roll_3"))
+    rows.append(dice_row)
+    extra = []
+    if game.in_jail[uid]:
+        extra.append(InlineKeyboardButton(f"🚪 保释{MONOPOLY_BAIL}", callback_data="mp_bail"))
+    extra.append(InlineKeyboardButton(f"💣炸弹{MONOPOLY_BOMB_COST}", callback_data="mp_bomb"))
+    if any(game.full_color(uid, c) for c in MONO_COLORS) and game.cget(uid) >= MONOPOLY_STOCK_COST:
+        extra.append(InlineKeyboardButton("📈拉升", callback_data="mp_stock"))
+    extra.append(InlineKeyboardButton("🏦地产", callback_data="mp_manage"))
+    rows.append(extra)
+    rows.append([InlineKeyboardButton("🛑 结束", callback_data="mp_end")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def update_monopoly_ui(game, app, manage_uid=None):
+    bot = app.bot
+    if game.phase == "waiting":
+        text = ["🎲 <b>大富翁</b> 🎲", "━" * 16,
+                f"👤 发起人：{await get_name(app, game.owner_id, with_title=False)}",
+                f"💰 初始现金：{MONOPOLY_INIT_CASH}（独立账本，不碰通用积分）",
+                f"👥 已加入：{len(game.players)}/{MONOPOLY_MAX_PLAYERS}（最少 {MONOPOLY_MIN_PLAYERS} 人）",
+                "━━━━━━━━━━━━━━━━━", "在群里发 /大富翁 加入；人齐后发起人点开始。"]
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("➕ 加入", callback_data="mp_join")],
+                                   [InlineKeyboardButton("▶️ 开始", callback_data="mp_start")]])
+        return await _mono_send_or_edit(game, bot, "\n".join(text), kb)
+    if game.phase == "ended":
+        lines = ["🏁 <b>大富翁 结束</b> 🏁", "━" * 16]
+        for i, (u, w, bk) in enumerate(game.result, 1):
+            lines.append(f"{rank_marker(i)} {await get_name(app, u, with_title=False)}：净资产 {w}{' 💀' if bk else ''}")
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("大富翁独立账本已保存，下局可继续用。")
+        return await _mono_send_or_edit(game, bot, "\n".join(lines), None)
+    if manage_uid is not None:
+        return await _mono_manage_panel(game, bot, app, manage_uid)
+    cur = game.current()
+    lines = ["🎲 <b>大富翁</b> 🎲", "━" * 16,
+             f"🔄 第 {game.round_num} 回合 ｜ 当前：{await get_name(app, cur, with_title=False) if cur else '-'}"]
+    for u in game.players:
+        if game.bankrupt[u]:
+            lines.append(f"💀 P{game.slot(u)} {await get_name(app, u, with_title=False)}（破产）")
+        else:
+            pos = MONO_BOARD[game.pos[u]]["name"]
+            tag = "🔒监狱" if game.in_jail[u] else f"🚩{pos}"
+            lines.append(f"P{game.slot(u)} {await get_name(app, u, with_title=False)} 💰{game.cget(u)} {tag}")
+    owned = [c for c in range(36) if game.owner[c] is not None]
+    if owned:
+        lines.append("━━━━━━━━━━━━━━━━━")
+        lines.append("🏠 <b>地产</b>：" + "  ".join(mono_cell_token(game, c) for c in owned))
+    if game.log:
+        lines.append("━━━━━━━━━━━━━━━━━")
+        if len(game.log) >= 2:
+            lines.append("📜 " + game.log[-2])
+        lines.append("   " + game.log[-1])
+    kb = _mono_play_keyboard(game)
+    return await _mono_send_or_edit(game, bot, "\n".join(lines), kb)
+
+
+async def _mono_manage_panel(game, bot, app, uid):
+    lines = [f"🏦 <b>{await get_name(app, uid, with_title=False)} 的地产</b>", "━" * 16]
+    owned = [c for c in range(36) if game.owner[c] == uid]
+    kb_rows = []
+    if not owned:
+        lines.append("（暂无地产）")
+    for c in owned:
+        b = MONO_BOARD[c]
+        if b["type"] == "station":
+            lines.append(f"🚉 {b['name']}")
+            kb_rows.append([InlineKeyboardButton("🔻抵押" if not game.mortgaged[c] else "🔓赎回",
+                                                callback_data=f"mp_mort_{c}" if not game.mortgaged[c] else f"mp_redeem_{c}")])
+        else:
+            lvl = game.level[c]
+            token = "🏠" * lvl + ("🏰" if lvl == 4 and game.color_all_max(uid, b["color"]) else "")
+            lines.append(f"{COLOR_EMOJI[b['color']]}{b['name']} {token}{' 🔻抵押中' if game.mortgaged[c] else ''}")
+            row = []
+            if not game.mortgaged[c]:
+                if lvl < 4:
+                    row.append(InlineKeyboardButton(f"🏗升级{mono_house_cost(c)}", callback_data=f"mp_upmanage_{c}"))
+                row.append(InlineKeyboardButton("🔻抵押", callback_data=f"mp_mort_{c}"))
+            else:
+                row.append(InlineKeyboardButton(f"🔓赎回{int(mono_prop_price(c) // 2 * 1.2)}", callback_data=f"mp_redeem_{c}"))
+            kb_rows.append(row)
+    kb_rows.append([InlineKeyboardButton("⬅️ 返回", callback_data="mp_manage_close")])
+    kb = InlineKeyboardMarkup(kb_rows)
+    await _mono_send_or_edit(game, bot, "\n".join(lines), kb)
+
+
+async def start_monopoly_timer(game, app):
+    game.cancel_timer()
+    bot = app.bot
+
+    async def countdown():
+        start_ts = time.time()
+        while True:
+            await asyncio.sleep(1)
+            if time.time() - start_ts >= ROOM_WAIT_TIMEOUT:
+                break
+        if game.phase == "waiting" and active_monopoly_games.get(game.chat_id) is game:
+            if len(game.alive()) >= MONOPOLY_MIN_PLAYERS:
+                game.start()
+                await update_monopoly_ui(game, app)
+            else:
+                active_monopoly_games.pop(game.chat_id, None)
+                await safe_edit(bot, game.chat_id, game.game_msg_id, "⌛ 大富翁等待超时，人数不足，已取消。", reply_markup=None)
+
+    game.timer_task = asyncio.create_task(countdown())
+
+
+async def cmd_monopoly(update, context):
+    if not await need_auth(update):
+        return
+    if not await require_group_chat(update, "大富翁", "大富翁"):
+        return
+    cid, uid = update.effective_chat.id, update.effective_user.id
+    g = active_monopoly_games.get(cid)
+    if g and g.phase == "waiting":
+        if g.add(uid):
+            await update_monopoly_ui(g, context.application)
+        else:
+            await update.message.reply_text("无法加入：游戏已开始或人数已满")
+        return
+    if g and g.phase == "playing":
+        await update.message.reply_text("当前已有大富翁进行中。")
+        return
+    if g and g.phase == "ended":
+        active_monopoly_games.pop(cid, None)
+        g = None
+    game = MonopolyGame(cid, uid)
+    game.add(uid)
+    active_monopoly_games[cid] = game
+    await update_monopoly_ui(game, context.application)
+    await start_monopoly_timer(game, context.application)
+
+
 CMD_ALIASES = {
     # 中文命令
     "开始": cmd_start, "菜单": cmd_start, "帮助": cmd_start,
@@ -4400,6 +5278,7 @@ CMD_ALIASES = {
     "恢复": cmd_restore,
     "骰子": cmd_sb,
     "牛牛": cmd_nn,
+    "大富翁": cmd_monopoly, "富翁": cmd_monopoly,
     "排位": cmd_season_play, "排位赛": cmd_season_play, "赛季": cmd_season_play, "赛季赛": cmd_season_play,
     "排位报名": cmd_season_join, "报名排位": cmd_season_join, "赛季报名": cmd_season_join,
     "排位榜": cmd_season_rank, "赛季榜": cmd_season_rank, "赛季排名": cmd_season_rank,
@@ -4415,6 +5294,7 @@ CMD_ALIASES = {
     "addadmin": cmd_addadmin, "deladmin": cmd_deladmin,
     "autosm": cmd_autosm, "backup": cmd_backup, "restore": cmd_restore,
     "sb": cmd_sb, "nn": cmd_nn,
+    "monopoly": cmd_monopoly, "mp": cmd_monopoly,
     "season": cmd_season_play, "seasonplay": cmd_season_play,
     "seasonjoin": cmd_season_join, "seasonrank": cmd_season_rank,
     "seasonstart": cmd_season_start, "seasonend": cmd_season_end,
