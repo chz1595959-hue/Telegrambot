@@ -2832,58 +2832,63 @@ async def run_slot_spins(context, cid, uid, count, answer=None):
     if wallet[cid][uid] < total_cost:
         if answer: await answer(f"❌ 积分不足，{count} 连抽需要 {total_cost} 积分", show_alert=True)
         return False, ""
-    
     # 扣钱并设置冷却
     user_cooldowns[uid] = now
     wallet[cid][uid] -= total_cost
-    
-    # 全局并发限制：防止多人同时狂抽导致 Telegram 限流，卡死所有游戏
-    async with SLOT_SPIN_SEM:
-        date = business_date()
-        name = await get_name(context.application, uid)
-        results = [get_slot_result() for _ in range(count)]
-        total_payout = sum(SLOT_BET * m for _, m in results)
-        wallet[cid][uid] += total_payout
-        
-        # 记录统计
-        if mode == "official":
-            for _, m in results:
-                net = SLOT_BET * m - SLOT_BET
-                slot_profit_by_date[date][cid][uid] += net
-        
-        # 结果消息
-        if count == 1:
-            res_str = " | ".join(results[0][0])
-            m = results[0][1]
-            if m > 0:
-                result_text = f"🎰 <b>老虎机结果：[ {res_str} ]</b>\n\n🎉 恭喜 {name} 中了 {m} 倍！获得 {total_payout} 积分。"
+    try:
+        # 全局并发限制：防止多人同时狂抽导致 Telegram 限流，卡死所有游戏
+        async with SLOT_SPIN_SEM:
+            date = business_date()
+            name = await get_name(context.application, uid)
+            results = [get_slot_result() for _ in range(count)]
+            total_payout = sum(SLOT_BET * m for _, m in results)
+            wallet[cid][uid] += total_payout
+
+            # 记录统计
+            if mode == "official":
+                for _, m in results:
+                    net = SLOT_BET * m - SLOT_BET
+                    slot_profit_by_date[date][cid][uid] += net
+
+            # 结果消息
+            if count == 1:
+                res_str = " | ".join(results[0][0])
+                m = results[0][1]
+                if m > 0:
+                    result_text = f"🎰 <b>老虎机结果：[ {res_str} ]</b>\n\n🎉 恭喜 {name} 中了 {m} 倍！获得 {total_payout} 积分。"
+                else:
+                    result_text = f"🎰 <b>老虎机结果：[ {res_str} ]</b>\n\n💸 很遗憾，{name} 未中奖，失去了 {SLOT_BET} 积分。"
+            elif count <= 20:
+                lines = []
+                for i, (res, m) in enumerate(results, 1):
+                    rs = " | ".join(res)
+                    lines.append(f"{i}. [ {rs} ] " + (f"🎉 ×{m}" if m > 0 else "💸"))
+                result_text = f"🎰 <b>老虎机 {count} 连抽</b>｜👤 {name}\n━━━━━━━━━━━━━━━━━\n" + "\n".join(lines) + f"\n━━━━━━━━━━━━━━━━━\n💰 总投入 {total_cost}｜总赢回 {total_payout}｜净 {total_payout - total_cost:+d}"
             else:
-                result_text = f"🎰 <b>老虎机结果：[ {res_str} ]</b>\n\n💸 很遗憾，{name} 未中奖，失去了 {SLOT_BET} 积分。"
-        elif count <= 20:
-            lines = []
-            for i, (res, m) in enumerate(results, 1):
-                rs = " | ".join(res)
-                lines.append(f"{i}. [ {rs} ] " + (f"🎉 ×{m}" if m > 0 else "💸"))
-            result_text = f"🎰 <b>老虎机 {count} 连抽</b>｜👤 {name}\n━━━━━━━━━━━━━━━━━\n" + "\n".join(lines) + f"\n━━━━━━━━━━━━━━━━━\n💰 总投入 {total_cost}｜总赢回 {total_payout}｜净 {total_payout - total_cost:+d}"
-        else:
-            # 50/100 连抽：按倍率统计，避免超长消息
-            tally = {}
-            for _, m in results:
-                tally[m] = tally.get(m, 0) + 1
-            parts = [f"未中奖 {tally.get(0, 0)} 次"] if tally.get(0) else []
-            for m in sorted((k for k in tally if k > 0), reverse=True):
-                parts.append(f"🎉 中 {m} 倍 × {tally[m]} 次")
-            result_text = f"🎰 <b>老虎机 {count} 连抽</b>｜👤 {name}\n━━━━━━━━━━━━━━━━━\n" + "\n".join(parts) + f"\n━━━━━━━━━━━━━━━━━\n💰 总投入 {total_cost}｜总赢回 {total_payout}｜净 {total_payout - total_cost:+d}"
-        
-        # 榜单
-        if mode == "official":
-            s_rank = sorted(total_profit_by_game(slot_profit_by_date, cid).items(), key=lambda item: item[1], reverse=True)[:50]
-            result_text += "\n\n🏆 <b>老虎机累计盈利榜（总数）</b>\n"
-            result_text += "\n".join([f"{rank_marker(i)} {await get_name(context.application, u)}：{a:+d}" for i, (u, a) in enumerate(s_rank, 1)])
-        
-        save_data()
-        if mode == "official": await emergency_if_needed(cid, uid, context.application)
-    return True, result_text
+                # 50/100 连抽：按倍率统计，避免超长消息
+                tally = {}
+                for _, m in results:
+                    tally[m] = tally.get(m, 0) + 1
+                parts = [f"未中奖 {tally.get(0, 0)} 次"] if tally.get(0) else []
+                for m in sorted((k for k in tally if k > 0), reverse=True):
+                    parts.append(f"🎉 中 {m} 倍 × {tally[m]} 次")
+                result_text = f"🎰 <b>老虎机 {count} 连抽</b>｜👤 {name}\n━━━━━━━━━━━━━━━━━\n" + "\n".join(parts) + f"\n━━━━━━━━━━━━━━━━━\n💰 总投入 {total_cost}｜总赢回 {total_payout}｜净 {total_payout - total_cost:+d}"
+
+            # 榜单
+            if mode == "official":
+                s_rank = sorted(total_profit_by_game(slot_profit_by_date, cid).items(), key=lambda item: item[1], reverse=True)[:50]
+                result_text += "\n\n🏆 <b>老虎机累计盈利榜（总数）</b>\n"
+                result_text += "\n".join([f"{rank_marker(i)} {await get_name(context.application, u)}：{a:+d}" for i, (u, a) in enumerate(s_rank, 1)])
+
+            save_data()
+            if mode == "official": await emergency_if_needed(cid, uid, context.application)
+        return True, result_text
+    except Exception:
+        # 结算任意环节异常：回滚扣款，杜绝“扣了钱没结果”的静默失败
+        wallet[cid][uid] += total_cost
+        logger.exception("老虎机结算异常，已回滚扣款 cid=%s uid=%s", cid, uid)
+        if answer: await answer("⚠️ 老虎机结算异常，积分已退回", show_alert=True)
+        return False, ""
 
 
 
@@ -2906,9 +2911,6 @@ async def start_wait_timeout(game, app):
 async def cmd_dz(update, context):
     if not await need_auth(update): return
     if not await require_group_chat(update, "德州扑克", "dz"): return
-    if season_active:
-        await update.message.reply_text("🏆 当前赛季进行中，请使用 /排位 参加排位赛（德州日常局已暂停）。")
-        return
     cid, uid = update.effective_chat.id, update.effective_user.id; game = active_poker_games.get(cid)
     mode = game.mode if game and game.phase == "waiting" else current_game_mode()
     wallet = texas_chips
@@ -3762,10 +3764,10 @@ async def on_button(update, context):
                 await q.answer("无效操作", show_alert=True); return
             ok, result_text = await run_slot_spins(context, cid, uid, count, answer=q.answer)
             if ok and q.message:
-                # 抽奖成功后原地编辑为开奖结果（1 次 API，比删除+发送省一半请求）；编辑失败则直接发送
+                # 抽奖成功后原地编辑为开奖结果（省一次 API）；编辑失败则改用分段长消息发送，避免超长/编辑限制导致结果不出
                 edited = await safe_edit(context.bot, cid, q.message.message_id, result_text, reply_markup=None, parse_mode="HTML")
                 if edited is None:
-                    await safe_send(context.bot, cid, result_text, parse_mode="HTML")
+                    await safe_send_long(context.bot, cid, result_text, parse_mode="HTML")
             return
 
         if data == "gomoku_join":
