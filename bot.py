@@ -116,7 +116,7 @@ sicbo_history = defaultdict(list)  # 骰子路书：大🔴 小🔵 单🟡 双�
 sicbo_daily_stats = defaultdict(lambda: {"big": 0, "small": 0, "triple": 0})
 race_jackpot = defaultdict(int)
 hourly_race_enabled = defaultdict(lambda: False)
-daily_emergency_used = defaultdict(lambda: defaultdict(bool))
+daily_emergency_used = defaultdict(lambda: defaultdict(int))
 # 已实扣的游戏下注，用于全系游戏在重启时自动退款。
 # 按游戏类型分条存储，避免多游戏并发时记录互相覆盖：
 # pending_game_bets[群ID][用户ID]["21"/"baccarat"/"horse"] = {"amount": 100, "mode": "official"}
@@ -158,7 +158,7 @@ def now_bj(): return datetime.now(BEIJING_TZ)
 def race_id(ts): return datetime.fromtimestamp(ts, timezone.utc).astimezone(BEIJING_TZ).strftime("%Y%m%d-%H%M")
 def business_date(now=None):
     now = now or now_bj()
-    return (now + timedelta(days=1) if (now.hour, now.minute) >= (23, 50) else now).strftime("%Y-%m-%d")
+    return now.strftime("%Y-%m-%d")
 
 
 def current_game_mode():
@@ -230,7 +230,9 @@ def force_save_now():
                 "user_names": {str(uid): n for uid, n in user_names.items()},
                 "rigged_player": RIGGED_PLAYER,
             }
-            os.makedirs(os.path.dirname(os.path.abspath(DATA_FILE)), exist_ok=True)
+            _dir = os.path.dirname(os.path.abspath(DATA_FILE))
+            if _dir:
+                os.makedirs(_dir, exist_ok=True)
             with open(DATA_TEMP_FILE, "w", encoding="utf-8") as file:
                 json.dump(data, file, ensure_ascii=False, indent=2)
                 file.flush(); os.fsync(file.fileno())
@@ -387,7 +389,9 @@ async def get_name(app, uid, with_title=True, cid=None):
 
     解析优先级：1) 群内 get_chat_member(cid, uid)（群里成员必能解，即使没和 bot 私聊）；
     2) get_chat(uid)；3) 已缓存的 user_names。全部失败才回退为“玩家{uid}”。
-    解析成功的真名写入 user_names 缓存，减少后续 API 调用与失败率。
+    解析成功的真名与兜底名都会写入 user_names 缓存：兜底名也缓存可避免每次渲染榜单
+    都对已离群用户重复打 2 次必败的 Telegram API（浪费且易触发限流）。用户下次发消息
+    / 点按钮时，_remember_name 会用真名覆盖兜底名，正确性不受影响。
     """
     raw = user_names.get(uid)
     if raw is None:
@@ -406,6 +410,8 @@ async def get_name(app, uid, with_title=True, cid=None):
             user_names[uid] = raw
     if not raw:
         raw = f"玩家{uid}"
+    # 兜底名同样写缓存：离群用户只需解析失败一次，之后直接从缓存取，不再重打 API
+    user_names[uid] = raw
     base = html.escape(raw)
     return f"{title_prefix(uid)}{base}" if with_title else base
 
@@ -1312,7 +1318,22 @@ def poker_buttons(game, uid):
     to_call = max(0, game.current_bet - game.round_bets[uid])
     rows.append([InlineKeyboardButton("❌ 弃牌", callback_data="texas_fold"), InlineKeyboardButton("✅ 过牌" if not to_call else f"✅ 跟注 {to_call}", callback_data="texas_check" if not to_call else "texas_call")])
     if uid not in game.raise_locked and game.chips[uid] >= to_call + FIXED_MIN_RAISE:
-        rows.append([InlineKeyboardButton(f"🔼 加注 {FIXED_MIN_RAISE}", callback_data=f"texas_raise_{FIXED_MIN_RAISE}")])
+        max_extra = game.chips[uid] - to_call  # 本轮能额外加的最大值（再加=全下）
+        # 双动态加注档：半池(½) + 满池；数值随底池每手实时变化
+        extras = []
+        for label, raw in (("半池", max(FIXED_MIN_RAISE, game.pot // 2)), ("满池", max(FIXED_MIN_RAISE, game.pot))):
+            # 超过能加上限 → 等同于全下，不再显示该档（已有全下键）；低于最小加注也跳过
+            if FIXED_MIN_RAISE <= raw <= max_extra:
+                extras.append((label, raw))
+        # 小底池时两档可能相同，去重
+        seen, uniq = set(), []
+        for label, raw in extras:
+            if raw not in seen:
+                seen.add(raw); uniq.append((label, raw))
+        # 两档都超上限时退化为最小加注键，保证加注功能不丢失（进本分支已保证 max_extra ≥ 100）
+        if not uniq:
+            uniq.append(("最小", FIXED_MIN_RAISE))
+        rows.append([InlineKeyboardButton(f"🔼 +{raw} {label}", callback_data=f"texas_raise_{raw}") for label, raw in uniq[:2]])
     if game.chips[uid] > 0: rows.append([InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data="texas_allin")])
     return InlineKeyboardMarkup(rows)
 
@@ -1986,6 +2007,10 @@ async def update_blackjack_ui(game, app):
                 payout = 0
                 
                 if p_score > 21: result_str = "💥 爆牌 (负)"; payout = 0
+                elif game.is_blackjack(game.dealer_hand):
+                    # 庄家天牌（2张21）：闲家同为天牌才平，否则全输（标准规则，庄家天牌赢非天牌闲家）
+                    if game.is_blackjack(game.hands[uid]): result_str = "🤝 平局 (双方天牌)"; payout = bet
+                    else: result_str = "💸 战败 (庄家天牌)"; payout = 0
                 elif d_score > 21: 
                     if game.is_blackjack(game.hands[uid]): result_str = "🃏 Blackjack (胜)"; payout = int(bet * 2.5)
                     else: result_str = "🏛 庄爆 (胜)"; payout = bet * 2
@@ -2658,27 +2683,28 @@ async def settle_niuniu(game, app):
     try:
         for uid, p_niu, p_win, amount in results:
             if p_win:
-                # 闲家赢：从庄家获得 amount；庄家余额不足则按余额封顶
+                # 闲家赢：从庄家获得 amount
                 if dealer_uid >= 0:
+                    # 真人庄家：余额不足按余额封顶，杜绝真人负积分
                     pay = min(amount, wallet[game.chat_id][dealer_uid])
                     wallet[game.chat_id][dealer_uid] -= pay
                     actual_dealer_delta -= pay
                     gained = pay
                 else:
+                    # 机器人庄家（负 uid 记账，允许负余额作庄家账本）：闲家照常收全额，
+                    # 积分在「真人玩家 ↔ 机器人账本」间转移，系统零和，不凭空生积分
                     gained = amount
+                    wallet[game.chat_id][dealer_uid] -= amount
+                    actual_dealer_delta -= amount
                 if uid >= 0:
                     wallet[game.chat_id][uid] += gained
                 actual_net = gained
             else:
-                # 闲家输：向庄家支付 amount
-                if uid >= 0:
-                    wallet[game.chat_id][uid] -= amount
-                    paid = amount
-                else:
-                    paid = 0
-                if dealer_uid >= 0:
-                    wallet[game.chat_id][dealer_uid] += paid
-                    actual_dealer_delta += paid
+                # 闲家输：向庄家支付 amount（封顶到自身余额，杜绝真人负积分）
+                paid = min(amount, wallet[game.chat_id][uid]) if uid >= 0 else 0
+                wallet[game.chat_id][uid] -= paid
+                wallet[game.chat_id][dealer_uid] += paid
+                actual_dealer_delta += paid
                 actual_net = -paid
             if game.mode == "official":
                 if uid >= 0: niuniu_profit_by_date[date][game.chat_id][uid] += actual_net
@@ -2881,7 +2907,6 @@ async def run_slot_spins(context, cid, uid, count, answer=None):
                 result_text += "\n".join([f"{rank_marker(i)} {await get_name(context.application, u)}：{a:+d}" for i, (u, a) in enumerate(s_rank, 1)])
 
             save_data()
-            if mode == "official": await emergency_if_needed(cid, uid, context.application)
         return True, result_text
     except Exception:
         # 结算任意环节异常：回滚扣款，杜绝“扣了钱没结果”的静默失败
@@ -2889,6 +2914,12 @@ async def run_slot_spins(context, cid, uid, count, answer=None):
         logger.exception("老虎机结算异常，已回滚扣款 cid=%s uid=%s", cid, uid)
         if answer: await answer("⚠️ 老虎机结算异常，积分已退回", show_alert=True)
         return False, ""
+    # 应急补分放在回滚保护之外：即使它抛异常，也不会触发“退本金”，避免玩家白拿奖金+本金
+    if mode == "official":
+        try:
+            await emergency_if_needed(cid, uid, context.application)
+        except Exception:
+            logger.exception("老虎机结算后应急补分异常（不影响已发放奖金）")
 
 
 
@@ -3944,6 +3975,10 @@ async def on_button(update, context):
                 return
     except Exception:
         logger.exception("按钮处理异常")
+        try:
+            await q.answer("⚠️ 操作出错，请稍后重试或联系管理员", show_alert=True)
+        except Exception:
+            pass
 
 
 async def on_text(update, context):
