@@ -524,8 +524,8 @@ async def action_notice(cid, app, uid, desc):
 async def emergency_if_needed(cid, uid, app, wallet=None, poker=None):
     used = daily_emergency_used[cid][uid]
     wallet = wallet or game_chips
-    if wallet[cid][uid] < MIN_ENTRY_CHIPS or used >= EMERGENCY_MAX_USES: return False
-    wallet[cid][uid] = EMERGENCY_CHIPS
+    if wallet[cid][uid] >= MIN_ENTRY_CHIPS or used >= EMERGENCY_MAX_USES: return False
+    wallet[cid][uid] += EMERGENCY_CHIPS
     if poker and uid in poker.chips: poker.chips[uid] += EMERGENCY_CHIPS
     daily_emergency_used[cid][uid] = used + 1; save_data()
     remaining = EMERGENCY_MAX_USES - daily_emergency_used[cid][uid]
