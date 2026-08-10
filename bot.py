@@ -3560,7 +3560,18 @@ async def cmd_qxshouquan(update, context):
     if not is_bot_admin(update.effective_user.id): return
     try: cid = int(context.args[0])
     except (IndexError, ValueError): await update.message.reply_text("用法：/qxshouquan 群ID"); return
-    AUTHORIZED_GROUPS.discard(cid); save_data(); await update.message.reply_text(f"✅ 已取消授权 {cid}")
+    # 超级群ID恒为负数(-100...)，兼容用户漏输负号的情况: 正负都尝试删除
+    cands = {cid, -cid} if cid > 0 else {cid}
+    removed = [g for g in cands if g in AUTHORIZED_GROUPS]
+    if not removed:
+        await update.message.reply_text(
+            f"⚠️ 授权名单中找不到 {cid}。\n超级群ID为负数，形如 -100... 请带负号重试。\n"
+            f"当前授权：{'、'.join(str(g) for g in sorted(AUTHORIZED_GROUPS)) or '（空）'}")
+        return
+    for g in removed:
+        AUTHORIZED_GROUPS.discard(g)
+    save_data()
+    await update.message.reply_text(f"✅ 已取消授权：{'、'.join(str(g) for g in removed)}")
 
 async def cmd_sqlist(update, context):
     if not is_bot_admin(update.effective_user.id):
