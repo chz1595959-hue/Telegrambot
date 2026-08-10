@@ -3562,6 +3562,21 @@ async def cmd_qxshouquan(update, context):
     except (IndexError, ValueError): await update.message.reply_text("用法：/qxshouquan 群ID"); return
     AUTHORIZED_GROUPS.discard(cid); save_data(); await update.message.reply_text(f"✅ 已取消授权 {cid}")
 
+async def cmd_sqlist(update, context):
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    cid = update.effective_chat.id if update.effective_chat else None
+    ag = sorted(AUTHORIZED_GROUPS)
+    if not ag:
+        await update.message.reply_text("📋 授权群组列表：（空）\n当前没有任何群被授权。\n可在目标群里发送 /授权 来授权。")
+        return
+    lines = [f"📋 授权群组列表（共 {len(ag)} 个）", "━"*20]
+    for i, g in enumerate(ag, 1):
+        mark = "  ✅ 当前群" if g == cid else ""
+        lines.append(f"{i}. {g}{mark}")
+    lines.extend(["", "目标群发送 /授权 新增；/qxshouquan 群ID 移除。"])
+    await safe_send_long(context.bot, cid, "\n".join(lines))
+
 async def cmd_addadmin(update, context):
     if not is_bot_admin(update.effective_user.id):
         await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
@@ -4416,6 +4431,7 @@ async def post_init(app):
             BotCommand("ph", "排行榜"),
             BotCommand("sq", "授权群组"),
             BotCommand("qxshouquan", "取消授权"),
+            BotCommand("sqlist", "查看授权群组"),
             BotCommand("addadmin", "添加机器人管理员"),
             BotCommand("deladmin", "移除机器人管理员"),
             BotCommand("adminlist", "查看管理员列表"),
@@ -5267,7 +5283,7 @@ CMD_ALIASES = {
     "减积分": cmd_reduce, "减分": cmd_reduce,
     "盈亏": cmd_cx, "查询": cmd_cx,
     "排行": cmd_ph, "排行榜": cmd_ph, "积分榜": cmd_ph, "积分": cmd_ph,
-    "授权": cmd_sq,
+    "授权": cmd_sq, "授权列表": cmd_sqlist,
     "取消授权": cmd_qxshouquan,
     "加管理员": cmd_addadmin,
     "减管理员": cmd_deladmin,
@@ -5290,7 +5306,7 @@ CMD_ALIASES = {
     "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm, "wz": cmd_wz, "sl": cmd_sl,
     "lhj": cmd_lhj, "21": cmd_21, "bjl": cmd_bjl, "gomoku": cmd_wz, "end": cmd_end, "rig": cmd_rig,
     "END": cmd_end, "add": cmd_add, "adddz": cmd_adddz, "reduce": cmd_reduce,
-    "cx": cmd_cx, "ph": cmd_ph, "sq": cmd_sq, "qxshouquan": cmd_qxshouquan,
+    "cx": cmd_cx, "ph": cmd_ph, "sq": cmd_sq, "qxshouquan": cmd_qxshouquan, "sqlist": cmd_sqlist,
     "addadmin": cmd_addadmin, "deladmin": cmd_deladmin,
     "autosm": cmd_autosm, "backup": cmd_backup, "restore": cmd_restore,
     "sb": cmd_sb, "nn": cmd_nn,
