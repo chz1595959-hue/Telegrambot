@@ -57,9 +57,9 @@ STALE_TEXT_COMMAND_SECONDS = 120
 # 改为默认关闭，避免 bot 重启后从默认常量恢复成开启状态。
 RIGGED_PLAYER = 0
 # 可选优质起手牌（随机挑一手，避免每次都一模一样显得刻意）
-# 控牌玩家随机出现的牌型（等概率）。可选：flush=同花, trips=三条, straight=顺子
-# 想只出某一种就只留那一项；想恢复"葫芦+同花"的旧版可把这几项换回对应起手牌列表
-RIGGED_TYPES = ["trips", "straight"]
+# 控牌玩家随机出现的牌型（列表重复即权重）。可选：pair=高对子, twopair=两对, trips=三条, straight=顺子
+# 高对子/两对最自然几乎无人察觉；顺子最扎眼故权重最低。想完全不出顺子就把 "straight" 删掉
+RIGGED_TYPES = ["pair", "pair", "pair", "twopair", "twopair", "trips", "straight"]
 # ---------- 德州排位赛 ----------
 SEASON_START_CHIPS = 20000     # 排位赛起始分（独立账本，7天不清零）
 SEASON_MIN_PLAYERS = 20        # 报名满 20 人自动开赛
@@ -1018,13 +1018,14 @@ class PokerGame:
         return True
 
     def _build_rigged_scenario(self):
-        # 给控牌玩家构造"自然强牌"：从 RIGGED_TYPES 随机挑一种牌型，生成配套起手牌+公牌
+        # 给控牌玩家构造"自然强牌"：从 RIGGED_TYPES（加权）随机挑一种牌型，生成配套起手牌+公牌
         # 返回 (起手牌2张字符串, 公牌5张字符串)。生成后用 treys 校验该玩家 7 张恰好做成目标牌型
-        # （防止同花恰连号变同花顺、废牌凑同花变同花等），不对则重摇；唯一赢家再由 start() 循环验证
+        # （防止废牌凑同花/恰连号变同花顺等），不对则重摇；唯一赢家再由 start() 循环验证
         RANKS, SUITS = "23456789TJQKA", "shdc"
+        HIGH = "AKQJT987"  # 高对子用较高点数，最自然且常赢
         typ = random.choice(RIGGED_TYPES)
-        target_class = {"flush": 4, "trips": 6, "straight": 5}[typ]
-        for _ in range(200):
+        target_class = {"flush": 4, "straight": 5, "trips": 6, "twopair": 7, "pair": 8}.get(typ, 6)
+        for _ in range(300):
             used = set()
             def take(rank, suit):
                 c = rank + suit
@@ -1032,7 +1033,8 @@ class PokerGame:
                 used.add(c); return c
             def fill_board(n, avoid_suits=(), avoid_ranks=()):
                 out = []
-                for rank in RANKS:
+                ranks = list(RANKS); random.shuffle(ranks)  # 点数随机取，避免公牌恒为连号把对子/两对变顺子
+                for rank in ranks:
                     if rank in avoid_ranks or len(out) >= n: continue
                     suits = list(SUITS); random.shuffle(suits)
                     for suit in suits:
@@ -1050,6 +1052,17 @@ class PokerGame:
                     c = take(rank, s)
                     if c: board.append(c)
                 board += fill_board(2, avoid_suits=(s,), avoid_ranks=("A", r2))
+            elif typ == "pair":
+                # 高对子（如 AA/KK）：最自然的赢法，几乎无人怀疑；公牌给分散点数避免轻易成 set
+                R = random.choice(HIGH)
+                hole = [take(R, "s"), take(R, "h")]
+                board = fill_board(5, avoid_ranks=(R,))
+            elif typ == "twopair":
+                # 两对：玩家手里真拿一对(R1)，公牌补第二对(R2)+3张无关散牌；校验恰好两对，避免连成顺子
+                R1 = random.choice(RANKS)
+                R2 = random.choice([r for r in RANKS if r != R1])
+                hole = [take(R1, "s"), take(R1, "h")]
+                board = [take(R2, "d"), take(R2, "c")] + fill_board(3, avoid_ranks=(R1, R2))
             elif typ == "trips":
                 R = random.choice(RANKS)
                 hole = [take(R, "s"), take(R, "h")]
@@ -4315,7 +4328,7 @@ async def cmd_rig(update, context):
         save_data()
         await update.message.reply_text("✅ 德州控牌已关闭，全员恢复正常随机发牌。")
         return
-    target = args[1] if (token in ("on", "开启") and len(args) >= 2) else args[0]
+    target = args[0]
     try:
         pid = int(target)
     except ValueError:
