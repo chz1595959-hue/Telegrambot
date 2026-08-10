@@ -59,7 +59,7 @@ RIGGED_PLAYER = 0
 # 可选优质起手牌（随机挑一手，避免每次都一模一样显得刻意）
 # 控牌玩家随机出现的牌型（列表重复即权重）。可选：pair=高对子, twopair=两对, trips=三条, straight=顺子
 # 高对子/两对最自然几乎无人察觉；顺子最扎眼故权重最低。想完全不出顺子就把 "straight" 删掉
-RIGGED_TYPES = ["pair", "pair", "pair", "twopair", "twopair", "trips", "straight"]
+RIGGED_TYPES = ["pair", "pair", "pair", "trips"]  # 只剩高对子/三条：公牌永远全散牌（无重复点数、无顺子面），彻底消灭 42234 这种假牌面
 # ---------- 德州排位赛 ----------
 SEASON_START_CHIPS = 20000     # 排位赛起始分（独立账本，7天不清零）
 SEASON_MIN_PLAYERS = 20        # 报名满 20 人自动开赛
@@ -1018,13 +1018,24 @@ class PokerGame:
         return True
 
     def _build_rigged_scenario(self):
-        # 给控牌玩家构造"自然强牌"：从 RIGGED_TYPES（加权）随机挑一种牌型，生成配套起手牌+公牌
-        # 返回 (起手牌2张字符串, 公牌5张字符串)。生成后用 treys 校验该玩家 7 张恰好做成目标牌型
-        # （防止废牌凑同花/恰连号变同花顺等），不对则重摇；唯一赢家再由 start() 循环验证
+        # 给控牌玩家构造"自然强牌"：从 RIGGED_TYPES（加权）随机挑牌型，生成起手牌+公牌
+        # 核心约束：公牌点数全部不同（无重复、无对子面）且不含4连（无顺子面），
+        # 因此公牌看上去完全像随机局，绝不会出现 42234 这种重复点数面；唯一赢家由 start() 循环验证
         RANKS, SUITS = "23456789TJQKA", "shdc"
         HIGH = "AKQJT987"  # 高对子用较高点数，最自然且常赢
+
+        def board_has_run(board_strs):
+            # 公牌点数排序后是否含 >=4 连续（顺子面），pair/trips 应避免
+            nums = sorted(RANKS.index(c[0]) for c in board_strs)
+            run = 1
+            for i in range(1, len(nums)):
+                run = run + 1 if nums[i] == nums[i - 1] + 1 else 1
+                if run >= 4:
+                    return True
+            return False
+
         typ = random.choice(RIGGED_TYPES)
-        target_class = {"flush": 4, "straight": 5, "trips": 6, "twopair": 7, "pair": 8}.get(typ, 6)
+        target_class = {"trips": 6, "pair": 8}.get(typ, 8)
         for _ in range(300):
             used = set()
             def take(rank, suit):
@@ -1033,7 +1044,7 @@ class PokerGame:
                 used.add(c); return c
             def fill_board(n, avoid_suits=(), avoid_ranks=()):
                 out = []
-                ranks = list(RANKS); random.shuffle(ranks)  # 点数随机取，避免公牌恒为连号把对子/两对变顺子
+                ranks = list(RANKS); random.shuffle(ranks)  # 点数随机取，避免公牌恒为连号
                 for rank in ranks:
                     if rank in avoid_ranks or len(out) >= n: continue
                     suits = list(SUITS); random.shuffle(suits)
@@ -1042,39 +1053,17 @@ class PokerGame:
                         c = take(rank, suit)
                         if c: out.append(c); break
                 return out
-            if typ == "flush":
-                s = random.choice(SUITS)
-                r2 = random.choice([r for r in RANKS if r != "A"])
-                hole = [take("A", s), take(r2, s)]
-                board = []
-                for rank in RANKS:
-                    if rank == r2 or len(board) >= 3: continue
-                    c = take(rank, s)
-                    if c: board.append(c)
-                board += fill_board(2, avoid_suits=(s,), avoid_ranks=("A", r2))
-            elif typ == "pair":
-                # 高对子（如 AA/KK）：最自然的赢法，几乎无人怀疑；公牌给分散点数避免轻易成 set
+            if typ == "pair":
+                # 高对子（如 AA/KK）：最自然的赢法；公牌全散牌无对子面、无顺子面
                 R = random.choice(HIGH)
                 hole = [take(R, "s"), take(R, "h")]
                 board = fill_board(5, avoid_ranks=(R,))
-            elif typ == "twopair":
-                # 两对：玩家手里真拿一对(R1)，公牌补第二对(R2)+3张无关散牌；校验恰好两对，避免连成顺子
-                R1 = random.choice(RANKS)
-                R2 = random.choice([r for r in RANKS if r != R1])
-                hole = [take(R1, "s"), take(R1, "h")]
-                board = [take(R2, "d"), take(R2, "c")] + fill_board(3, avoid_ranks=(R1, R2))
-            elif typ == "trips":
+                if board_has_run(board): continue
+            else:  # trips：玩家一对 + 公牌一张同点凑三条；公牌其余全散、无顺子面
                 R = random.choice(RANKS)
                 hole = [take(R, "s"), take(R, "h")]
                 board = [take(R, "d")] + fill_board(4, avoid_ranks=(R,))
-            else:  # straight 隐蔽版：玩家拿隔张(如6、8)，公牌拿另三张隔张(5、7、9)，flop 不再连号
-                ws = random.randint(0, 8)
-                window = list(RANKS[ws:ws + 5])
-                cyc = random.sample(SUITS, 4)
-                # 玩家取第2、4张(隔一张)，公牌取第1、3、5张(隔一张)，花色错开避免同花顺/同花面
-                hole = [take(window[1], cyc[0]), take(window[3], cyc[1])]
-                board = [take(window[0], cyc[2]), take(window[2], cyc[3]), take(window[4], cyc[0])]
-                board += fill_board(2, avoid_ranks=tuple(window))
+                if board_has_run(board): continue
             hole, board = hole[:2], board[:5]
             random.shuffle(board)  # 打乱公牌顺序，flop/turn/river 不再刻意连号或连花色
             if len(hole) != 2 or len(board) != 5: continue
