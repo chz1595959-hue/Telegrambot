@@ -3565,15 +3565,25 @@ async def cmd_qxshouquan(update, context):
 async def cmd_sqlist(update, context):
     if not is_bot_admin(update.effective_user.id):
         await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
-    cid = update.effective_chat.id if update.effective_chat else None
+    chat = update.effective_chat
+    cid = chat.id if chat else None
+    cur_title = getattr(chat, "title", None)  # 群聊里直接有标题，省一次 API
     ag = sorted(AUTHORIZED_GROUPS)
     if not ag:
         await update.message.reply_text("📋 授权群组列表：（空）\n当前没有任何群被授权。\n可在目标群里发送 /授权 来授权。")
         return
     lines = [f"📋 授权群组列表（共 {len(ag)} 个）", "━"*20]
     for i, g in enumerate(ag, 1):
+        title = cur_title if (g == cid and cur_title) else None
+        if title is None:
+            try:
+                ch = await context.bot.get_chat(g)
+                title = getattr(ch, "title", None)
+            except Exception:
+                title = None  # bot 不在该群等异常 → 仅显示 ID
         mark = "  ✅ 当前群" if g == cid else ""
-        lines.append(f"{i}. {g}{mark}")
+        name = f" {title}" if title else ""
+        lines.append(f"{i}. {g}{name}{mark}")
     lines.extend(["", "目标群发送 /授权 新增；/qxshouquan 群ID 移除。"])
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
