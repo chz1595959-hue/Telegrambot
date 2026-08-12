@@ -1757,7 +1757,10 @@ class HorseRace:
 
 
 # ---------- 权限与命令 ----------
-def is_auth(cid): return cid in AUTHORIZED_GROUPS
+# 历史授权群硬编码兜底：即便 Railway 卷未持久化导致 bot_data.json 清空，
+# 这 6 个群也始终可用，避免"未授权"误报（实时授权仍走 AUTHORIZED_GROUPS）。
+KNOWN_GROUPS = {-1004398421224, -1004384542911, -1003708362987, -1001236513715, -5348625455, -5280344276}
+def is_auth(cid): return cid in AUTHORIZED_GROUPS or cid in KNOWN_GROUPS
 def is_bot_admin(uid): return uid in BOT_ADMINS
 async def need_auth(update):
     if not update.effective_chat or not is_auth(update.effective_chat.id):
