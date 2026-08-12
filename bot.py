@@ -1545,6 +1545,12 @@ async def settle_poker(game, app):
             await safe_send(app.bot, game.chat_id, "⚠️ 德州已完成结算，但详细结算消息发送失败。")
     except Exception:
         logger.exception("德州结算异常")
+        try:
+            await safe_send(app.bot, game.chat_id,
+                "⚠️ 本局德州结算时发生异常，分数可能未更新。请把本提示截图反馈；"
+                "管理员可在 Railway 运行日志中搜索 “德州结算异常” 查看具体错误堆栈以定位问题。")
+        except Exception:
+            pass
     finally:
         if active_poker_games.get(game.chat_id) is game: active_poker_games.pop(game.chat_id, None)
         if game.mode == "official" and not game.season:
