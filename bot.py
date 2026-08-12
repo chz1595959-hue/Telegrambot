@@ -3527,6 +3527,62 @@ async def cmd_adddz(update, context):
     await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)} 添加 {amount} 德州积分，当前 {texas_chips[cid][uid]}。")
 
 
+async def cmd_setscore(update, context):
+    """管理员：设置某玩家赛季排位分（私聊可用，需指定群ID）。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    args = context.args
+    if is_group_chat(update):
+        if len(args) < 2:
+            await update.message.reply_text("用法（群内）：/setscore 用户ID 数量"); return
+        cid = update.effective_chat.id
+        try:
+            uid = int(args[0]); amount = int(args[1])
+        except ValueError:
+            await update.message.reply_text("用户ID和数量都必须是数字"); return
+    else:
+        if len(args) < 3:
+            await update.message.reply_text("用法（私聊）：/setscore 群ID 用户ID 数量"); return
+        try:
+            cid = int(args[0]); uid = int(args[1]); amount = int(args[2])
+        except ValueError:
+            await update.message.reply_text("群ID、用户ID和数量都必须是数字"); return
+    if not season_active:
+        await update.message.reply_text("⚠️ 当前无进行中的赛季，设置后也不会上榜。"); return
+    season_points[cid][uid] = amount
+    season_joined[cid].add(uid)
+    save_data()
+    await update.message.reply_text(f"✅ 已设置 {await get_name(context.application, uid)}（群 {cid}）赛季分为 {amount}。")
+
+
+async def cmd_addscore(update, context):
+    """管理员：增加某玩家赛季排位分（私聊可用，需指定群ID）。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    args = context.args
+    if is_group_chat(update):
+        if len(args) < 2:
+            await update.message.reply_text("用法（群内）：/addscore 用户ID 数量"); return
+        cid = update.effective_chat.id
+        try:
+            uid = int(args[0]); amount = int(args[1])
+        except ValueError:
+            await update.message.reply_text("用户ID和数量都必须是数字"); return
+    else:
+        if len(args) < 3:
+            await update.message.reply_text("用法（私聊）：/addscore 群ID 用户ID 数量"); return
+        try:
+            cid = int(args[0]); uid = int(args[1]); amount = int(args[2])
+        except ValueError:
+            await update.message.reply_text("群ID、用户ID和数量都必须是数字"); return
+    if not season_active:
+        await update.message.reply_text("⚠️ 当前无进行中的赛季，加分后也不会上榜。"); return
+    season_points[cid][uid] += amount
+    season_joined[cid].add(uid)
+    save_data()
+    await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)}（群 {cid}）增加 {amount} 赛季分，当前 {season_points[cid][uid]}。")
+
+
 async def cmd_reduce(update, context):
     if not is_bot_admin(update.effective_user.id):
         await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
@@ -3614,7 +3670,7 @@ async def cmd_sqlist(update, context):
     chat = update.effective_chat
     cid = chat.id if chat else None
     cur_title = getattr(chat, "title", None)  # 群聊里直接有标题，省一次 API
-    ag = sorted(AUTHORIZED_GROUPS)
+    ag = sorted(AUTHORIZED_GROUPS | KNOWN_GROUPS)
     if not ag:
         await update.message.reply_text("📋 授权群组列表：（空）\n当前没有任何群被授权。\n可在目标群里发送 /授权 来授权。")
         return
@@ -3628,6 +3684,8 @@ async def cmd_sqlist(update, context):
             except Exception:
                 title = None  # bot 不在该群等异常 → 仅显示 ID
         mark = "  ✅ 当前群" if g == cid else ""
+        if g in KNOWN_GROUPS and g not in AUTHORIZED_GROUPS:
+            mark += "  🔒内置"
         name = f" {title}" if title else ""
         lines.append(f"{i}. {g}{name}{mark}")
     lines.extend(["", "目标群发送 /授权 新增；/qxshouquan 群ID 移除。"])
@@ -4474,6 +4532,8 @@ async def post_init(app):
             BotCommand("end", "结束当前游戏"),
             BotCommand("add", "加积分"),
             BotCommand("adddz", "加德州积分"),
+            BotCommand("setscore", "设赛季分"),
+            BotCommand("addscore", "加赛季分"),
             BotCommand("reduce", "减积分"),
             BotCommand("cx", "盈亏查询"),
             BotCommand("ph", "排行榜"),
@@ -5283,6 +5343,8 @@ CMD_ALIASES = {
     "结束": cmd_end,
     "加积分": cmd_add, "加分": cmd_add,
     "加德州": cmd_adddz,
+    "设赛季分": cmd_setscore, "setscore": cmd_setscore,
+    "加赛季分": cmd_addscore, "addscore": cmd_addscore,
     "减积分": cmd_reduce, "减分": cmd_reduce,
     "盈亏": cmd_cx, "查询": cmd_cx,
     "排行": cmd_ph, "排行榜": cmd_ph, "积分榜": cmd_ph, "积分": cmd_ph,
@@ -5310,6 +5372,7 @@ CMD_ALIASES = {
     "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm, "wz": cmd_wz, "sl": cmd_sl,
     "lhj": cmd_lhj, "21": cmd_21, "bjl": cmd_bjl, "gomoku": cmd_wz, "end": cmd_end, "rig": cmd_rig,
     "END": cmd_end, "add": cmd_add, "adddz": cmd_adddz, "reduce": cmd_reduce,
+    "setscore": cmd_setscore, "addscore": cmd_addscore,
     "cx": cmd_cx, "ph": cmd_ph, "sq": cmd_sq, "qxshouquan": cmd_qxshouquan, "sqlist": cmd_sqlist,
     "addadmin": cmd_addadmin, "deladmin": cmd_deladmin,
     "autosm": cmd_autosm, "backup": cmd_backup, "restore": cmd_restore,
