@@ -447,7 +447,12 @@ save_data()  # 标记脏数据，确保归档结果在首次保存时写盘
 # 赛季恢复（防御 prune bug 清空 / 卷损坏）：从未播种 且 当前无任何赛季数据 → 从内置备份 DEFAULT_SEASON 恢复一次。
 # season_seeded 落地后不再重复恢复，避免覆盖管理员新开的赛季；若用户已从 .bak 恢复真数据（season_points 非空），则不覆盖。
 _season_has_data = any(len(v) > 0 for v in season_points.values())
-if not season_seeded and not _season_has_data:
+# 自愈恢复：覆盖两种赛季数据丢失场景
+#  (a) 从未播种(not season_seeded) 且 数据空 —— 全新部署 / 卷文件丢失（默认 season_active=False, season_id=None 也能救）
+#  (b) 当前是内置赛季(第20260809) 且 进行中 且 数据空 —— 曾被 seed 过(season_seeded=True)但数据又被清空(卷损坏/误清/手动结束)，
+#      旧判定因 season_seeded 永久为 True 而漏救，导致“数据又没了”。此分支补齐自愈。
+if (not season_seeded and not _season_has_data) or \
+   (season_active and season_id == DEFAULT_SEASON['season_id'] and not _season_has_data):
     seed_default_season()
     force_save_now()
 migrate_fake_season_ids()  # 迁移卷上旧假uid赛季条目为真实uid（幂等）
@@ -3634,6 +3639,61 @@ async def cmd_addscore(update, context):
     await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)}（群 {cid}）增加 {amount} 赛季分，当前 {season_points[cid][uid]}。")
 
 
+async def cmd_reseed(update, context):
+    """管理员：强制从内置备份 DEFAULT_SEASON 恢复第20260809赛季数据（覆盖当前赛季字段）。带 confirm 防误清真实数据。私聊/群内均可。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    args = context.args
+    confirm = len(args) >= 1 and args[0] in ("confirm", "确认", "yes")
+    total = sum(len(v) for v in season_points.values())
+    if total > 0 and not confirm:
+        await update.message.reply_text(
+            f"⚠️ 当前赛季已有数据（共 {total} 条赛季分记录）。\n"
+            f"此命令会用内置备份（第20260809赛季，含41个占位ID『玩家{{数字}}』）覆盖当前赛季数据。\n"
+            f"确认覆盖请发送：/reseed confirm")
+        return
+    seed_default_season()
+    migrate_fake_season_ids()
+    prune_season_cids()
+    force_save_now()
+    n = sum(len(v) for v in season_points.values())
+    await update.message.reply_text(
+        f"✅ 已从内置备份恢复第20260809赛季（{n} 条赛季分记录）。\n"
+        f"注：其中41人为占位ID（玩家{{数字}}），需补真实 Telegram ID 才能显示真名。")
+
+
+async def cmd_revive(update, context):
+    """管理员：恢复被淘汰的玩家（移出淘汰集合、重置应急补分次数、恢复赛季分），私聊可用。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    args = context.args
+    if is_group_chat(update):
+        if len(args) < 1:
+            await update.message.reply_text("用法（群内）：/revive 用户ID [分数]"); return
+        cid = update.effective_chat.id
+        try:
+            uid = int(args[0])
+            amount = int(args[1]) if len(args) >= 2 else SEASON_START_CHIPS
+        except ValueError:
+            await update.message.reply_text("用户ID和分数都必须是数字"); return
+    else:
+        if len(args) < 2:
+            await update.message.reply_text("用法（私聊）：/revive 群ID 用户ID [分数]"); return
+        try:
+            cid = int(args[0]); uid = int(args[1])
+            amount = int(args[2]) if len(args) >= 3 else SEASON_START_CHIPS
+        except ValueError:
+            await update.message.reply_text("群ID、用户ID和分数都必须是数字"); return
+    if not season_active:
+        await update.message.reply_text("⚠️ 当前无进行中的赛季。"); return
+    season_eliminated[cid].discard(uid)
+    season_rebuy[cid][uid] = 0
+    season_points[cid][uid] = amount
+    season_joined[cid].add(uid)
+    save_data()
+    await update.message.reply_text(f"✅ 已恢复 {await get_name(context.application, uid)}（群 {cid}）：移出淘汰名单、补分次数重置、赛季分设为 {amount}。现在可正常报名参赛。")
+
+
 async def cmd_reduce(update, context):
     if not is_bot_admin(update.effective_user.id):
         await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
@@ -4486,6 +4546,7 @@ async def post_init(app):
             BotCommand("bjl", "百家乐"),
             BotCommand("sb", "骰子"),
             BotCommand("nn", "牛牛"),
+            BotCommand("revive", "复活淘汰玩家"),
             BotCommand("end", "结束当前游戏"),
             BotCommand("add", "加积分"),
             BotCommand("adddz", "加德州积分"),
@@ -4509,6 +4570,7 @@ async def post_init(app):
             BotCommand("seasonhelp", "排位赛帮助"),
             BotCommand("seasonstart", "排位强制开赛(管理员)"),
             BotCommand("seasonend", "排位提前结算(管理员)"),
+            BotCommand("reseed", "恢复赛季数据(管理员)"),
             BotCommand("god", "赌神称号/荣誉墙"),
             BotCommand("godgrant", "封赌神(管理员)"),
             BotCommand("godrevoke", "撤赌神(管理员)"),
@@ -4593,11 +4655,13 @@ CMD_ALIASES = {
     "恢复": cmd_restore,
     "骰子": cmd_sb,
     "牛牛": cmd_nn,
+    "复活": cmd_revive, "恢复淘汰": cmd_revive,
     "排位": cmd_season_play, "排位赛": cmd_season_play, "赛季": cmd_season_play, "赛季赛": cmd_season_play,
     "排位报名": cmd_season_join, "报名排位": cmd_season_join, "赛季报名": cmd_season_join,
     "排位榜": cmd_season_rank, "赛季榜": cmd_season_rank, "赛季排名": cmd_season_rank,
     "排位帮助": cmd_season_help, "排位说明": cmd_season_help, "排位赛帮助": cmd_season_help, "赛季帮助": cmd_season_help, "赛季说明": cmd_season_help, "赛季赛帮助": cmd_season_help,
     "排位开赛": cmd_season_start, "排位结束": cmd_season_end, "赛季开赛": cmd_season_start, "赛季结束": cmd_season_end,
+    "赛季恢复": cmd_reseed, "恢复赛季": cmd_reseed,
     "赌神": cmd_god, "荣誉墙": cmd_god,
     "封赌神": cmd_god_grant, "撤赌神": cmd_god_revoke,
     # 旧英文/数字别名（保留兼容，仍可用）
@@ -4609,9 +4673,11 @@ CMD_ALIASES = {
     "addadmin": cmd_addadmin, "deladmin": cmd_deladmin,
     "autosm": cmd_autosm, "backup": cmd_backup, "restore": cmd_restore,
     "sb": cmd_sb, "nn": cmd_nn,
+    "revive": cmd_revive,
     "season": cmd_season_play, "seasonplay": cmd_season_play,
     "seasonjoin": cmd_season_join, "seasonrank": cmd_season_rank,
     "seasonstart": cmd_season_start, "seasonend": cmd_season_end,
+    "reseed": cmd_reseed,
     "god": cmd_god, "godgrant": cmd_god_grant, "godrevoke": cmd_god_revoke,
 }
 
