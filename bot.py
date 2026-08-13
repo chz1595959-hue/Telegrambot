@@ -4402,10 +4402,12 @@ async def on_text(update, context):
         except Exception:
             return
 
-        # 不带 / 的命令直达：仅当整条消息正好是命令别名时才触发，避免闲聊误杀
-        # （如"结束了吗""积分不够"不会被当作命令；只有单独说"结束"等才触发）
-        if text in CMD_ALIASES:
-            await _dispatch_alias(text, [], update, context)
+        # 不带 / 的命令直达：若首词是已知命令别名，按命令处理（兼容"命令 参数"无斜杠写法）
+        # 还原旧版逻辑：首词匹配，支持 rig 5431975432 / addscore uid num 等带参无斜杠命令
+        # （注意：首词是中文命令名也生效，如"加德州 uid num"；防闲聊误触发交由各 cmd_* 内部对参数容错）
+        _words = text.split()
+        if _words and _words[0] in CMD_ALIASES:
+            await _dispatch_alias(_words[0], _words[1:], update, context)
             return
         
         # 深度防御：非命令的游戏交互（下注/落子/加注）仅在授权群内处理，
