@@ -4748,7 +4748,7 @@ async def post_shutdown(app):
 
 async def cmd_rig(update, context):
     """管理员：控制德州控牌（测试用）。/rig 查看状态；/rig <id> 临时开启（替换目标）；/rig off 关闭。"""
-    global RIGGED_PLAYER
+    global RIGGED_PLAYER, RIGGED_DUO
     uid = update.effective_user.id
     if uid != ADMIN_USER_ID:
         await update.message.reply_text("⛔ 仅机器人所有者（默认管理员）可操作控牌")
@@ -4764,6 +4764,7 @@ async def cmd_rig(update, context):
     token = args[0].lower()
     if token in ("off", "关闭", "0"):
         RIGGED_PLAYER = 0
+        RIGGED_DUO = (0, 0)  # 一并关闭双控，避免"关了 rig 却还在控牌"的困惑
         save_data()
         await update.message.reply_text("✅ 德州控牌已关闭，全员恢复正常随机发牌。")
         return
@@ -4779,10 +4780,11 @@ async def cmd_rig(update, context):
         await update.message.reply_text("✅ 德州控牌已关闭。")
         return
     RIGGED_PLAYER = pid
+    RIGGED_DUO = (0, 0)  # 与双控牌互斥：开单控自动关双控，避免双控分支抢走控制权导致单控"失效"
     save_data()
     await update.message.reply_text(
         f"✅ 已临时开启德州控牌，目标用户 {pid}（替换式，单人）：该用户每局起手牌+公牌配套，保证唯一获胜（测试用）。\n"
-        f"该用户需加入本局才生效；换人用 /rig 新ID，关闭用 /rig off。"
+        f"该用户需加入本局才生效；换人用 /rig 新ID，关闭用 /rig off。已自动关闭双控牌 /rig2。"
     )
 
 async def cmd_rig2(update, context):
