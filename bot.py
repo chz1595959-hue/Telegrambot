@@ -3600,10 +3600,9 @@ async def on_text(update, context):
         except Exception:
             return
 
-        # 不带 / 的命令直达：若首词是已知命令别名，按命令处理
-        # 但“结束/积分/查询/帮助/开始”等日常词仅在带 / 前缀时才触发，避免群里正常聊天误触发
+        # 不带 / 的命令直达：若首词是已知命令别名，按命令处理（全部命令均可不带 / 触发）
         _words = text.split()
-        if _words and _words[0] in CMD_ALIASES and _words[0] not in {"结束", "积分", "查询", "帮助", "开始"}:
+        if _words and _words[0] in CMD_ALIASES:
             await _dispatch_alias(_words[0], _words[1:], update, context)
             return
         
