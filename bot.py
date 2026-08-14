@@ -2544,6 +2544,12 @@ async def run_slot_spins(context, cid, uid, count, answer=None):
         # 榜单（含 await get_name，必须在动钱包之前完成）
         if mode == "official":
             s_rank = sorted(total_profit_by_game(slot_profit_by_date, cid).items(), key=lambda item: item[1], reverse=True)[:50]
+            # 把本局已确定的净赢并入展示，避免榜单滞后一局（钱包更新在下方，此处仅用于显示）
+            session_net = total_payout - total_cost
+            if session_net != 0:
+                shown = dict(s_rank)
+                shown[uid] = shown.get(uid, 0) + session_net
+                s_rank = sorted(shown.items(), key=lambda item: item[1], reverse=True)[:50]
             result_text += "\n\n🏆 <b>老虎机累计盈利榜（总数）</b>\n"
             result_text += "\n".join([f"{rank_marker(i)} {await get_name(context.application, u)}：{a:+d}" for i, (u, a) in enumerate(s_rank, 1)])
 
@@ -3214,6 +3220,15 @@ async def cmd_ph(update, context):
     lines.extend(["", "🎮 通用积分榜", "━"*14])
     for i, (uid, value) in enumerate(sorted(game_chips[cid].items(), key=lambda x:x[1], reverse=True)[:50], 1):
         lines.append(f"{rank_marker(i)} {await get_name(context.application, uid, cid=cid)}：{value}")
+    # 累计盈利榜（含老虎机），方便随时核对战绩，不再只能从抽奖结果里看滞后的榜单
+    combined = {}
+    for g in (blackjack_profit_by_date, race_profit_by_date, baccarat_profit_by_date, slot_profit_by_date, sicbo_profit_by_date, niuniu_profit_by_date):
+        for u, v in total_profit_by_game(g, cid).items():
+            combined[u] = combined.get(u, 0) + v
+    if combined:
+        lines.extend(["", "🏆 累计盈利榜（总数）", "━"*14])
+        for i, (u, v) in enumerate(sorted(combined.items(), key=lambda x:x[1], reverse=True)[:50], 1):
+            lines.append(f"{rank_marker(i)} {await get_name(context.application, u, cid=cid)}：{v:+d}")
     await safe_send_long(context.bot, cid, "\n".join(lines))
 
 async def cmd_sq(update, context):
