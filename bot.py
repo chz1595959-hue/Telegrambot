@@ -9,6 +9,7 @@ import shutil
 import threading
 import time
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 
 from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto, Update
@@ -116,7 +117,7 @@ last_business_date = ""
 active_poker_games, active_horse_races = {}, {}
 active_blackjack_games, active_baccarat_games = {}, {}
 active_sicbo_games, active_niuniu_games = {}, {}
-recent_poker_reveals = {}  # 德州单赢结算后临时保存赢家牌，供可选亮牌按钮使用
+recent_poker_reveals = defaultdict(list)  # 德州单赢结算后临时保存赢家牌（每群一个队列，供可选亮牌按钮使用，新单赢不再覆盖旧的）
 # ---------- 德州排位赛状态（独立账本，每日重置不触碰） ----------
 season_active = False
 season_id = None
@@ -143,6 +144,20 @@ data_dirty = False
 save_event = None # 延迟初始化
 data_save_lock = threading.Lock()
 background_tasks = set()
+# 用户级钱包锁：防止同一用户同时进入多个扣款/派彩路径导致并发负分
+wallet_locks = defaultdict(asyncio.Lock)
+
+@asynccontextmanager
+async def user_wallet_locks(uids):
+    """按 uid 全局有序获取多个用户钱包锁，避免死锁。用于多人结算（牛牛/德州等）。"""
+    uids = sorted(set(uids))
+    for uid in uids:
+        await wallet_locks[uid].acquire()
+    try:
+        yield
+    finally:
+        for uid in reversed(uids):
+            wallet_locks[uid].release()
 
 
 def now_bj(): return datetime.now(BEIJING_TZ)
@@ -824,10 +839,14 @@ class PokerGame:
 
     def action(self, uid, kind, extra=0):
         if uid != self.current(): return False, "还没轮到你"
+        skip_next = False
         if kind == "fold":
             old = self.active.index(uid); self.folded.add(uid); self.active.remove(uid)
-            if self.active: self.actor_idx = old % len(self.active)
+            if self.active:
+                self.actor_idx = old % len(self.active)
+                self._next(self.actor_idx)   # 直接定位下一个行动者，避免末尾 _next(actor_idx+1) 跳过下家
             desc = "弃牌"
+            skip_next = True
         elif kind == "check":
             if self.round_bets[uid] != self.current_bet: return False, "必须跟注或加注"
             self.acted.add(uid); desc = "过牌"
@@ -868,7 +887,7 @@ class PokerGame:
         alive = [p for p in self.active if p not in self.folded]
         if len(alive) <= 1 or all(p in self.all_in for p in alive): self.phase = "showdown"
         elif self._round_done(): self._end_round()
-        else: self._next(self.actor_idx + 1)
+        elif not skip_next: self._next(self.actor_idx + 1)
         return True, desc
 
     def _end_round(self):
@@ -886,7 +905,7 @@ class PokerGame:
             start = 0
         if self._next(start) is None: self.phase = "showdown"
 
-    def showdown(self):
+    async def showdown(self):
         alive = [uid for uid in self.players if uid not in self.folded]
         self.showdown_order = alive.copy()
 
@@ -898,8 +917,10 @@ class PokerGame:
             wallet = season_points if self.season else texas_chips
             for uid in self.players:
                 # 增量结算：保留牌局进行中管理员用 /adddz 加的分，避免被开局快照覆盖
-                wallet[self.chat_id][uid] += self.chips[uid] - self.initial_chips.get(uid, wallet[self.chat_id][uid])
-            save_data(); force_save_now()
+                # 赛季已结束的进行中牌局不写回 season_points，避免污染已清空的赛季账本（仍正常派奖，筹码不持久化）
+                if not (self.season and not season_active):
+                    wallet[self.chat_id][uid] += self.chips[uid] - self.initial_chips.get(uid, wallet[self.chat_id][uid])
+            save_data(); await asyncio.to_thread(force_save_now)
             return [(winner, "最后赢家", self.pot, [("全部底池", self.pot)], {})]
 
         # 至少两人仍在局内，才补齐五张公牌并进行正常摊牌。
@@ -916,8 +937,10 @@ class PokerGame:
         wallet = season_points if self.season else texas_chips
         for uid in self.players:
             # 增量结算：保留牌局进行中管理员用 /adddz 加的分，避免被开局快照覆盖
-            wallet[self.chat_id][uid] += self.chips[uid] - self.initial_chips.get(uid, wallet[self.chat_id][uid])
-        save_data(); force_save_now(); return [(uid, names[uid], item["amount"], item["details"], names) for uid, item in payouts.items()]
+            # 赛季已结束的进行中牌局不写回 season_points，避免污染已清空的赛季账本（仍正常派奖，筹码不持久化）
+            if not (self.season and not season_active):
+                wallet[self.chat_id][uid] += self.chips[uid] - self.initial_chips.get(uid, wallet[self.chat_id][uid])
+        save_data(); await asyncio.to_thread(force_save_now); return [(uid, names[uid], item["amount"], item["details"], names) for uid, item in payouts.items()]
 
     def cancel_timer(self):
         task, self.turn_task = self.turn_task, None
@@ -1021,7 +1044,9 @@ async def settle_poker(game, app):
     if game.settled: return
     game.settled = True; game.cancel_timer(); game.cancel_auto(); game.cancel_wait()
     try:
-        result = game.showdown()
+        # 获取本局所有真实玩家的钱包锁，再执行 showdown 里的钱包写回，避免与同一用户的其他扣款路径并发
+        async with user_wallet_locks([uid for uid in game.players if uid >= 0]):
+            result = await game.showdown()
         if not result: raise RuntimeError("德州摊牌未生成结算结果")
         date, hand_types = business_date(), result[0][4]
         name_ids = set(game.players) | set(game.showdown_order)
@@ -1078,15 +1103,19 @@ async def settle_poker(game, app):
         if len(game.showdown_order) <= 1:
             winner = game.showdown_order[0] if game.showdown_order else None
             if winner is not None and game.hands.get(winner):
-                recent_poker_reveals[game.chat_id] = {
-                    "winner": winner,
-                    "hand": list(game.hands[winner]),
-                    "board": list(game.board),
-                }
                 btn = await safe_send(app.bot, game.chat_id,
                     "💡 本局单挑收池，赢家可选择亮出底牌：",
                     reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🃏 亮牌", callback_data="texas_reveal")]]))
-                recent_poker_reveals[game.chat_id]["reveal_msg_id"] = btn.message_id if btn else None
+                # 入队而非覆盖：同一群可同时存在多局未亮牌的单赢
+                recent_poker_reveals[game.chat_id].append({
+                    "winner": winner,
+                    "hand": list(game.hands[winner]),
+                    "board": list(game.board),
+                    "reveal_msg_id": btn.message_id if btn else None,
+                })
+                # 仅保留最近 5 条，避免极端情况下无限增长
+                if len(recent_poker_reveals[game.chat_id]) > 5:
+                    recent_poker_reveals[game.chat_id] = recent_poker_reveals[game.chat_id][-5:]
         if delivered is None:
             await safe_send(app.bot, game.chat_id, "⚠️ 德州已完成结算，但详细结算消息发送失败。")
     except Exception:
@@ -1095,14 +1124,21 @@ async def settle_poker(game, app):
         if active_poker_games.get(game.chat_id) is game: active_poker_games.pop(game.chat_id, None)
         if game.mode == "official" and not game.season:
             for uid in game.players: await emergency_if_needed(game.chat_id, uid, app, texas_chips, game)
-        save_data()
+        save_data(); await asyncio.to_thread(force_save_now)
 
 
 
 async def handle_texas_reveal(cid, uid, q, context):
     """德州单赢后，点击「亮牌」按钮，把赢家两张底牌发到群（可选，不强制）。"""
-    info = recent_poker_reveals.get(cid)
-    if not info:
+    infos = recent_poker_reveals.get(cid, [])
+    if not infos:
+        await q.answer("本局亮牌数据已失效", show_alert=True); return
+    # 按点击的亮牌按钮消息 id 精确匹配对应的一局，避免新单赢覆盖旧单赢后无法亮牌
+    clicked_id = q.message.message_id if q.message else None
+    info = next((it for it in infos if it.get("reveal_msg_id") == clicked_id), None)
+    if info is None and len(infos) == 1:
+        info = infos[0]  # 兜底：仅剩一条且按钮消息 id 无法匹配时直接取该条
+    if info is None:
         await q.answer("本局亮牌数据已失效", show_alert=True); return
     if uid != info["winner"]:
         await q.answer("只有赢家本人能亮牌", show_alert=True); return
@@ -1115,7 +1151,10 @@ async def handle_texas_reveal(cid, uid, q, context):
     rid = info.get("reveal_msg_id")
     if rid:
         await safe_edit(context.bot, cid, rid, "🃏 已亮牌", reply_markup=None)
-    recent_poker_reveals.pop(cid, None)
+    # 仅移除本条亮牌记录，其余未亮牌的单赢保留
+    recent_poker_reveals[cid] = [it for it in infos if it is not info]
+    if not recent_poker_reveals[cid]:
+        recent_poker_reveals.pop(cid, None)
     await q.answer("已亮牌")
 
 
@@ -1161,13 +1200,15 @@ class HorseRace:
                 raw[b] = raw[a]
         return [max(1.05, v) for v in raw]
 
-    def bet(self, uid, horse, amount):
+    async def bet(self, uid, horse, amount):
         if self.phase != "betting" or self.cancelled: return False, "当前不是下注阶段"
         wallet = game_chips
-        if not 0 <= horse < HORSE_COUNT or amount <= 0 or amount > wallet[self.chat_id][uid]: return False, "马号、金额或积分无效"
-        # 先按「下注前」赔率锁定（即玩家在界面上看到的赔率），确保看到=拿到
-        o = self.odds()[horse]
-        wallet[self.chat_id][uid] -= amount; self.pool += amount; self.total_bets[horse] += amount
+        if not 0 <= horse < HORSE_COUNT or amount <= 0: return False, "马号或金额无效"
+        async with wallet_locks[uid]:
+            if amount > wallet[self.chat_id][uid]: return False, "积分不足"
+            # 先按「下注前」赔率锁定（即玩家在界面上看到的赔率），确保看到=拿到
+            o = self.odds()[horse]
+            wallet[self.chat_id][uid] -= amount; self.pool += amount; self.total_bets[horse] += amount
         self.bets[uid][horse] = self.bets[uid].get(horse, 0) + amount
         prev_amt = self.bets[uid][horse] - amount
         prev_odd = self.bet_odds[uid].get(horse)
@@ -1353,7 +1394,7 @@ class HorseRace:
                 else:
                     lines.extend(["", "🎮 娱乐局：本局不计入正式盈亏榜。"])
                 
-                self.phase = "finished"; save_data()
+                self.phase = "finished"; save_data(); await asyncio.to_thread(force_save_now)
                 # 清除退款记录
                 for uid in self.bets: pending_game_bets[self.chat_id].get(uid, {}).pop("horse", None)
                 delivered = await safe_send_long(app.bot, self.chat_id, "\n".join(lines), parse_mode="HTML")
@@ -1386,7 +1427,7 @@ class HorseRace:
             for uid, bets in self.bets.items(): 
                 wallet[self.chat_id][uid] += sum(bets.values())
                 pending_game_bets[self.chat_id].get(uid, {}).pop("horse", None)
-            if self.mode == "official": race_jackpot[self.chat_id] += self.jackpot
+            # 奖池不再在开局时弹出，故取消/退款时无需回写（race_jackpot[cid] 始终保留原始奖池）
             save_data()
             if active_horse_races.get(self.chat_id) is self: active_horse_races.pop(self.chat_id, None)
             await safe_edit(app.bot, self.chat_id, self.game_msg_id, notice, reply_markup=None)
@@ -1593,6 +1634,7 @@ async def update_blackjack_ui(game, app):
                 pending_game_bets[game.chat_id].get(uid, {}).pop("21", None)
             payments_applied = True
             payouts_done = True
+            save_data(); await asyncio.to_thread(force_save_now)
 
             # 记录庄家历史 (仅记录本局主要趋势)
             if game.mode == "official":
@@ -1740,6 +1782,7 @@ async def settle_baccarat(game, app):
             pending_game_bets[game.chat_id].get(uid, {}).pop("baccarat", None)
 
         payouts_applied = True
+        save_data(); await asyncio.to_thread(force_save_now)
 
         text += "\n\n".join(lines) if lines else "本局无人盈亏。"
 
@@ -1995,6 +2038,7 @@ async def settle_sicbo(game, app):
             if net != 0: lines.append(f"👤 {name_map[uid]}\n盈亏：{net:+d}")
             pending_game_bets[game.chat_id].get(uid, {}).pop("sicbo", None)
         payouts_applied = True
+        save_data(); await asyncio.to_thread(force_save_now)
         text += "\n\n".join(lines) if lines else "本局无人下注，已取消。"
         if game.mode == "official":
             rank = sorted(total_profit_by_game(sicbo_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
@@ -2251,48 +2295,54 @@ async def settle_niuniu(game, app):
             robot_budget = NIU_ROBOT_BANK
 
     try:
-        for uid, p_niu, p_win, amount in results:
-            if p_win:
-                # 闲家赢：从庄家获得 amount；庄家余额不足则按余额封顶
-                if dealer_uid >= 0:
-                    pay = min(amount, wallet[game.chat_id][dealer_uid])
-                    wallet[game.chat_id][dealer_uid] -= pay
-                    actual_dealer_delta -= pay
-                    gained = pay
+        # 多人结算：一次性获取所有涉及用户的钱包锁，按 uid 排序避免死锁
+        involved_uids = [uid for uid in game.players if uid >= 0]
+        if dealer_uid >= 0 and dealer_uid not in involved_uids:
+            involved_uids.append(dealer_uid)
+        async with user_wallet_locks(involved_uids):
+            for uid, p_niu, p_win, amount in results:
+                if p_win:
+                    # 闲家赢：从庄家获得 amount；庄家余额不足则按余额封顶
+                    if dealer_uid >= 0:
+                        pay = min(amount, wallet[game.chat_id][dealer_uid])
+                        wallet[game.chat_id][dealer_uid] -= pay
+                        actual_dealer_delta -= pay
+                        gained = pay
+                    else:
+                        # 机器人庄家：从系统奖池扣，封顶当前余额
+                        pay = min(amount, robot_budget)
+                        robot_budget -= pay
+                        gained = pay
+                    if uid >= 0:
+                        wallet[game.chat_id][uid] += gained
+                    actual_net = gained
                 else:
-                    # 机器人庄家：从系统奖池扣，封顶当前余额
-                    pay = min(amount, robot_budget)
-                    robot_budget -= pay
-                    gained = pay
-                if uid >= 0:
-                    wallet[game.chat_id][uid] += gained
-                actual_net = gained
-            else:
-                # 闲家输：向庄家支付 amount
-                if uid >= 0:
-                    wallet[game.chat_id][uid] -= amount
-                    paid = amount
-                else:
-                    paid = 0
-                if dealer_uid >= 0:
-                    wallet[game.chat_id][dealer_uid] += paid
-                    actual_dealer_delta += paid
-                else:
-                    # 机器人庄家收下闲家输的分，注入奖池
-                    robot_budget += paid
+                    # 闲家输：向庄家支付 amount
+                    if uid >= 0:
+                        wallet[game.chat_id][uid] -= amount
+                        paid = amount
+                    else:
+                        paid = 0
+                    if dealer_uid >= 0:
+                        wallet[game.chat_id][dealer_uid] += paid
+                        actual_dealer_delta += paid
+                    else:
+                        # 机器人庄家收下闲家输的分，注入奖池
+                        robot_budget += paid
                 actual_net = -paid
-            if game.mode == "official":
-                if uid >= 0: niuniu_profit_by_date[date][game.chat_id][uid] += actual_net
-                if dealer_uid >= 0: niuniu_profit_by_date[date][game.chat_id][dealer_uid] -= actual_net
+                if game.mode == "official":
+                    if uid >= 0: niuniu_profit_by_date[date][game.chat_id][uid] += actual_net
+                    if dealer_uid >= 0: niuniu_profit_by_date[date][game.chat_id][dealer_uid] -= actual_net
 
-            p_hand = game.hands[uid]
-            p_combo = game.niu_info[uid][1]
-            p_cards = format_niu_cards(p_hand, p_combo)
-            result_icon = "✅" if p_win else "❌"
-            lines.append(f"  {result_icon} {name_map[uid]} | {p_cards} | <b>{NIU_NAMES[p_niu]}</b> | {actual_net:+d}")
-            lines.append("")
+                p_hand = game.hands[uid]
+                p_combo = game.niu_info[uid][1]
+                p_cards = format_niu_cards(p_hand, p_combo)
+                result_icon = "✅" if p_win else "❌"
+                lines.append(f"  {result_icon} {name_map[uid]} | {p_cards} | <b>{NIU_NAMES[p_niu]}</b> | {actual_net:+d}")
+                lines.append("")
 
-        payouts_applied = True
+            payouts_applied = True
+        save_data(); await asyncio.to_thread(force_save_now)
         dealer_net = actual_dealer_delta
         if dealer_uid < 0:
             # 奖池单局结算后封顶，避免无限累积
@@ -2478,13 +2528,19 @@ async def run_slot_spins(context, cid, uid, count, answer=None):
             result_text += "\n".join([f"{rank_marker(i)} {await get_name(context.application, u)}：{a:+d}" for i, (u, a) in enumerate(s_rank, 1)])
 
         # ===== 所有 await 成功后才动钱包，异常则白拿/白扣都不会发生 =====
-        wallet[cid][uid] -= total_cost
-        if mode == "official":
-            for _, m in results:
-                net = SLOT_BET * m - SLOT_BET
-                slot_profit_by_date[date][cid][uid] += net
-        wallet[cid][uid] += total_payout
-        save_data()
+        # 用户级锁：同一用户并发连抽/其他扣款路径串行化，防止检查余额后、扣款前被其他路径扣减导致负分
+        async with wallet_locks[uid]:
+            if wallet[cid][uid] < total_cost:
+                user_cooldowns[uid] = 0  # 余额不足时回滚冷却，允许立即重试
+                if answer: await answer(f"❌ 积分不足，{count} 连抽需要 {total_cost} 积分", show_alert=True)
+                return False, ""
+            wallet[cid][uid] -= total_cost
+            if mode == "official":
+                for _, m in results:
+                    net = SLOT_BET * m - SLOT_BET
+                    slot_profit_by_date[date][cid][uid] += net
+            wallet[cid][uid] += total_payout
+            save_data()
         if mode == "official": await emergency_if_needed(cid, uid, context.application)
     return True, result_text
 
@@ -2523,7 +2579,7 @@ async def cmd_dz(update, context):
             await update_poker_waiting(game, context.application); await update.message.reply_text("已加入当前等待房间。")
         else: await update.message.reply_text("你已在等待房间中。")
         return
-    recent_poker_reveals.pop(cid, None)
+    # 注意：不再在此清空亮牌队列，保留上一局（已结束）单赢未亮牌的数据，供玩家随时补亮牌
     game = PokerGame(cid, uid, mode); game.add(uid); active_poker_games[cid] = game
     msg = await safe_send(context.bot, cid, await poker_waiting_text(game, context.application), reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 加入游戏", callback_data="texas_join")], [InlineKeyboardButton("❌ 终止房间", callback_data="texas_end")]]))
     if msg:
@@ -2564,7 +2620,9 @@ async def season_settle(app, manual=False):
     global season_active, season_id, season_name, season_start_ts, season_end_ts
     if not season_active:
         return
-    for cid, users in season_points.items():
+    # 快照：防止结算过程中并发的 showdown 修改 season_points 导致 RuntimeError
+    season_snapshot = dict(season_points)
+    for cid, users in season_snapshot.items():
         standings = sorted(users.items(), key=lambda x: (-season_total_profit(cid, x[0]), x[0]))
         eligible = [(uid, val) for uid, val in standings if uid >= 0 and season_games[cid].get(uid, 0) >= SEASON_MIN_GAMES]
         lines = [f"🏆 第{season_id}赛季最终榜（{season_name or '排位赛'}）", "━" * 18]
@@ -2766,14 +2824,16 @@ async def cmd_god(update, context):
         uid = next(iter(user_titles))
         lines.append(f"🏅 现任赌神：{await get_name(app, uid, cid=cid, with_title=False)}")
     if champions_history:
-        lines.append("", "📜 <b>历届荣誉墙</b>")
+        lines.append("")
+        lines.append("📜 <b>历届荣誉墙</b>")
         for rec in champions_history[-12:][::-1]:
             streak = rec.get("streak", 1)
             sfx = f" · {streak}连冠" if streak > 1 else ""
             name = html.escape(str(rec.get("name", "?")))
             lines.append(f"第{rec['season_id']}赛季：{name}（{rec.get('score', 0)}分）{sfx}")
     else:
-        lines.append("", "📜 历届荣誉墙：暂无记录")
+        lines.append("")
+        lines.append("📜 历届荣誉墙：暂无记录")
     text = "\n".join(lines)
     try:
         await safe_send_long(context.bot, update.effective_chat.id, text, parse_mode="HTML")
@@ -2916,7 +2976,7 @@ async def cmd_sm(update, context):
             await update.message.reply_text("当前已有赛车进行中。")
         return
     mode = current_game_mode()
-    jackpot = race_jackpot.pop(cid, 0) if mode == "official" else 0
+    jackpot = race_jackpot.get(cid, 0) if mode == "official" else 0
     race = HorseRace(cid, update.effective_user.id, jackpot, mode); active_horse_races[cid] = race
     msg = await safe_send(context.bot, cid, await race.view(context.application), reply_markup=race.buttons())
     if msg: race.game_msg_id = msg.message_id
@@ -3218,11 +3278,13 @@ async def on_button(update, context):
             if data.startswith("bj_join_"):
                 bet = int(data.split("_")[2])
                 wallet = game_chips
-                if wallet[cid][uid] < bet: await q.answer("积分不足", show_alert=True); return
-                if game.add_player(uid, bet):
-                    wallet[cid][uid] -= bet
-                    await q.answer("已加入"); await update_blackjack_ui(game, context.application)
-                else: await q.answer("你已在局中或无法加入", show_alert=True)
+                async with wallet_locks[uid]:
+                    if wallet[cid][uid] < bet: await q.answer("积分不足", show_alert=True); return
+                    if game.add_player(uid, bet):
+                        wallet[cid][uid] -= bet
+                    else:
+                        await q.answer("你已在局中或无法加入", show_alert=True); return
+                await q.answer("已加入"); await update_blackjack_ui(game, context.application)
             elif data == "bj_start":
                 if uid != game.owner_id: await q.answer("仅发起人可开始", show_alert=True); return
                 if game.start(): 
@@ -3250,14 +3312,16 @@ async def on_button(update, context):
                     await q.answer("❌ 你未参与本局游戏。", show_alert=True); return
                 if str(uid) != data.split("_")[2]: await q.answer("不是你的回合", show_alert=True); return
                 wallet = game_chips
-                if wallet[cid][uid] < game.bets[uid]: await q.answer("积分不足，无法双倍", show_alert=True); return
-                
-                # 原子化：先让 game 校验回合并翻倍（内部翻倍 bets + 更新退款保护），
-                # 仅成功才扣钱；避免超时/重复点击导致静默丢分
-                prev_bet = game.bets[uid]
-                if not game.double_down(uid):
-                    await q.answer("操作失败：已不是你的回合", show_alert=True); return
-                wallet[cid][uid] -= prev_bet
+
+                # 用户级锁包裹检查余额→扣款，防止并发超扣
+                async with wallet_locks[uid]:
+                    if wallet[cid][uid] < game.bets[uid]: await q.answer("积分不足，无法双倍", show_alert=True); return
+                    # 原子化：先让 game 校验回合并翻倍（内部翻倍 bets + 更新退款保护），
+                    # 仅成功才扣钱；避免超时/重复点击导致静默丢分
+                    prev_bet = game.bets[uid]
+                    if not game.double_down(uid):
+                        await q.answer("操作失败：已不是你的回合", show_alert=True); return
+                    wallet[cid][uid] -= prev_bet
                 await q.answer("双倍下注！摸牌并停牌")
                 await action_notice(cid, context.application, uid, "选择了双倍下注！")
                 
@@ -3283,8 +3347,9 @@ async def on_button(update, context):
                 side = data.split("_")[2]
                 bet_amount = BACCARAT_FIXED_BET # 引用全局配置
                 wallet = game_chips
-                if wallet[cid][uid] < bet_amount: await q.answer("积分不足", show_alert=True); return
-                wallet[cid][uid] -= bet_amount
+                async with wallet_locks[uid]:
+                    if wallet[cid][uid] < bet_amount: await q.answer("积分不足", show_alert=True); return
+                    wallet[cid][uid] -= bet_amount
                 game.place_bet(uid, side, bet_amount)
                 side_names = {"player":"闲", "banker":"庄", "tie":"和"}
                 await q.answer(f"✅ 押注 {side_names.get(side, side)} 成功 (累计: {game.bets[uid][side]})", show_alert=False)
@@ -3321,20 +3386,26 @@ async def on_button(update, context):
                 await update_sicbo_ui(game, context.application)
             elif data.startswith("sb_bet_spec_"):
                 n = int(data.split("_")[3]); amt = game.get_amount(uid)
-                if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
-                game_chips[cid][uid] -= amt; game.place_bet(uid, f"spec_{n}", amt)
+                async with wallet_locks[uid]:
+                    if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
+                    game_chips[cid][uid] -= amt
+                game.place_bet(uid, f"spec_{n}", amt)
                 await q.answer(f"✅ 押围骰 {n}{n}{n} ({amt}积分)")
                 await update_sicbo_ui(game, context.application)
             elif data.startswith("sb_bet_sum_"):
                 s = int(data.split("_")[3]); amt = game.get_amount(uid)
-                if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
-                game_chips[cid][uid] -= amt; game.place_bet(uid, f"sum_{s}", amt)
+                async with wallet_locks[uid]:
+                    if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
+                    game_chips[cid][uid] -= amt
+                game.place_bet(uid, f"sum_{s}", amt)
                 await q.answer(f"✅ 押总点数 {s} ({amt}积分)")
                 await update_sicbo_ui(game, context.application)
             elif data.startswith("sb_bet_"):
                 bet_type = data.split("_")[2]; amt = game.get_amount(uid)
-                if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
-                game_chips[cid][uid] -= amt; game.place_bet(uid, bet_type, amt)
+                async with wallet_locks[uid]:
+                    if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
+                    game_chips[cid][uid] -= amt
+                game.place_bet(uid, bet_type, amt)
                 await q.answer(f"✅ 押 {SICBO_BET_NAMES.get(bet_type, bet_type)} ({amt}积分)")
                 await update_sicbo_ui(game, context.application)
             elif data == "sb_start":
@@ -3470,7 +3541,7 @@ async def on_button(update, context):
             try: _, horse, amount = data.split("_"); horse, amount = int(horse), int(amount)
             except ValueError: await q.answer("无效下注数据", show_alert=True); return
             if not race: await q.answer("赛车已结束", show_alert=True); return
-            ok, desc = race.bet(uid, horse, amount)
+            ok, desc = await race.bet(uid, horse, amount)
             if not ok: await q.answer(desc, show_alert=True); return
             race.name_cache[uid] = await get_name(context.application, uid); await q.answer(desc); await action_notice(cid, context.application, uid, f"下注 {amount} 于 {HORSE_EMOJI[horse]}")
             await safe_edit(context.bot, cid, race.game_msg_id, await race.view(context.application), reply_markup=race.buttons())
@@ -3548,12 +3619,13 @@ async def on_text(update, context):
             side_map = {"庄": "banker", "闲": "player", "和": "tie"}
             side_cn = bjl_match.group(1); side = side_map[side_cn]
             amount = int(bjl_match.group(2))
-            wallet = game_chips
-            if wallet[cid][user.id] < amount:
-                await message.reply_text(f"❌ 积分不足，你只有 {wallet[cid][user.id]}。"); return
             if amount > 50000:
                 await message.reply_text("❌ 百家乐单次下注上限为 50000 积分。"); return
-            wallet[cid][user.id] -= amount
+            wallet = game_chips
+            async with wallet_locks[user.id]:
+                if wallet[cid][user.id] < amount:
+                    await message.reply_text(f"❌ 积分不足，你只有 {wallet[cid][user.id]}。"); return
+                wallet[cid][user.id] -= amount
             baccarat.place_bet(user.id, side, amount)
             await action_notice(cid, context.application, user.id, f"在百家乐押注了 {side_cn} {amount}")
             await update_baccarat_ui(baccarat, context.application)
@@ -3569,20 +3641,22 @@ async def on_text(update, context):
             if amount < BJ_MIN_BET:
                 await message.reply_text(f"❌ 21点最低下注 {BJ_MIN_BET} 积分。"); return
             wallet = game_chips
-            if wallet[cid][user.id] < amount:
-                await message.reply_text(f"❌ 积分不足，你只有 {wallet[cid][user.id]}。"); return
-            if blackjack.add_player(user.id, amount):
-                wallet[cid][user.id] -= amount
-                await action_notice(cid, context.application, user.id, f"加入了 21点，下注 {amount}")
-                await update_blackjack_ui(blackjack, context.application)
-            else: await message.reply_text("❌ 你已在局中或无法加入。")
+            async with wallet_locks[user.id]:
+                if wallet[cid][user.id] < amount:
+                    await message.reply_text(f"❌ 积分不足，你只有 {wallet[cid][user.id]}。"); return
+                if blackjack.add_player(user.id, amount):
+                    wallet[cid][user.id] -= amount
+                else:
+                    await message.reply_text("❌ 你已在局中或无法加入。"); return
+            await action_notice(cid, context.application, user.id, f"加入了 21点，下注 {amount}")
+            await update_blackjack_ui(blackjack, context.application)
             return
 
         # 赛车与德州传统匹配
         match = re.fullmatch(r"下注\s+(\d+)\s+(\d+)", text); race = active_horse_races.get(cid)
         if match and race:
             horse, amount = int(match.group(1))-1, int(match.group(2))
-            ok, desc = race.bet(user.id, horse, amount)
+            ok, desc = await race.bet(user.id, horse, amount)
             if not ok: await message.reply_text(f"❌ {desc}"); return
             race.name_cache[user.id] = await get_name(context.application, user.id)
             await action_notice(cid, context.application, user.id, f"下注 {amount} 于 {HORSE_EMOJI[horse]}")
@@ -3694,7 +3768,7 @@ async def hourly_race_scheduler(app):
             for cid, enabled in list(hourly_race_enabled.items()):
                 if not enabled or cid in active_horse_races: continue
                 mode = current_game_mode()
-                jackpot = race_jackpot.pop(cid, 0) if mode == "official" else 0
+                jackpot = race_jackpot.get(cid, 0) if mode == "official" else 0
                 race = HorseRace(cid, ADMIN_USER_ID, jackpot, mode); active_horse_races[cid] = race
                 msg = await safe_send(app.bot, cid, await race.view(app), reply_markup=race.buttons())
                 if msg: race.game_msg_id = msg.message_id
@@ -3909,10 +3983,10 @@ def main():
     # 在主循环启动前初始化 Event
     save_event = asyncio.Event()
     
-    builder = Application.builder().token(token).concurrent_updates(True).post_init(post_init).post_shutdown(post_shutdown)
-    if hasattr(builder, "max_concurrent_updates"):
-        builder = builder.max_concurrent_updates(8)  # 新版 PTB：并发上限 8
-    app = builder.build()  # 旧版 PTB：concurrent_updates(True) 默认上限 4
+    # 资金系统：关闭并发更新，串行处理所有 update handler，消除「检查余额→扣款」之间的竞态
+    # （后台任务如赛车动画、定时调度仍为并发；仅 handler 之间不再交错，杜绝并发负分）。
+    builder = Application.builder().token(token).concurrent_updates(False).post_init(post_init).post_shutdown(post_shutdown)
+    app = builder.build()
 
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r'^/'), route_command))
     app.add_handler(CallbackQueryHandler(on_button)); app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND & ~filters.Regex(r'^/'), on_text))
