@@ -45,7 +45,7 @@ FIXED_MIN_RAISE = 100      # 德州最低加注额
 BLACKJACK_DECKS = 6        # 21点使用6副牌（娱乐场标准）
 
 # 其他配置
-DEFAULT_ADMIN = 5431975432
+DEFAULT_ADMIN = 8929733838  # Bot 主人（唯一管理员种子，重启保留、/deladmin 不可移除）
 ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", DEFAULT_ADMIN))
 # Bot 管理员：种子集合（始终为管理员，防锁死）+ 可动态增删的持久化集合
 ADMIN_USER_IDS = {ADMIN_USER_ID}  # 种子管理员，重启后自动恢复，无法被 /deladmin 移除
@@ -102,6 +102,7 @@ def total_profit_by_game(game_profit, chat_id):
 texas_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))  # 德州专用积分（每日重置 20000）
 game_chips = defaultdict(lambda: defaultdict(lambda: GAME_STARTING_CHIPS))  # 其他游戏通用积分（不重置，初始 5W）
 AUTHORIZED_GROUPS = set()
+KNOWN_GROUPS = set()  # 内置群组白名单（现为空白，所有授权走 /授权 动态添加）
 race_history = defaultdict(list)
 baccarat_history = defaultdict(list)
 blackjack_history = defaultdict(list) # 新增 21点历史
@@ -3086,7 +3087,7 @@ async def cmd_start(update, context):
         "🏆 <b>赌神</b>\n"
         "/god 赌神称号/荣誉墙（/godgrant 封 /godrevoke 撤，仅管理员）\n\n"
         "⏹ 进行中的游戏用 /end 结束。\n"
-        "所有命令也支持中文（如「德州」「赛马」「加积分」），且不带斜杠也能用（如 dz / 加积分 5431975432 100）。"
+        "所有命令也支持中文（如「德州」「赛马」「加积分」），且不带斜杠也能用（如 dz / 加积分 8929733838 100）。"
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
