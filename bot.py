@@ -29,7 +29,6 @@ EMERGENCY_MAX_USES = 3
 
 # 游戏时间配置 (秒)
 TURN_TIMEOUT = 60          # 德州/21点单回合思考时间
-AUTO_START_TIMEOUT = 30    # 21点/百家乐自动开牌/解散时间
 ROOM_WAIT_TIMEOUT = 60     # 各游戏等待房统一倒计时（60秒）
 RACE_AUTO_START = 120      # 赛车自动开赛时间
 RACE_ANIMATION_INTERVAL = 1.5
@@ -68,7 +67,6 @@ HORSE_COUNT = 4
 HORSE_NAMES = ["轿车", "出租", "越野", "皮卡"]
 HORSE_EMOJI = ["🚗", "🚕", "🚙", "🛻"]
 FIXED_BET_AMOUNTS = [100, 200, 500, 1000]
-RACE_UPDATE_INTERVAL = 5
 RACE_TRACK_LENGTH = 14
 DATA_BACKUP_FILE, DATA_TEMP_FILE = f"{DATA_FILE}.bak", f"{DATA_FILE}.tmp"
 BEIJING_TZ = timezone(timedelta(hours=8))
@@ -129,8 +127,9 @@ season_points = defaultdict(lambda: defaultdict(int))    # season_points[cid][ui
 season_games = defaultdict(lambda: defaultdict(int))     # season_games[cid][uid] 参赛局数
 season_joined = defaultdict(set)                          # season_joined[cid] = {uid} 报名集合
 season_rebuy = defaultdict(lambda: defaultdict(int))      # season_rebuy[cid][uid] 已用应急补分次数
-season_eliminated = defaultdict(set)                      # season_eliminated[cid] = {uid} 淘汰集合
+season_eliminated = defaultdict(set)                      # 仅保留以兼容旧存档；淘汰机制已取消，不再使用
 season_lobby_msg = {}                                       # season_lobby_msg[cid] = 排位大厅看板消息 id（UI 态，不持久化）
+season_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # season_profit_by_date[date][cid][uid] = 当日盈亏（赛季每日重置成 2W 前记录；赛季总排行=7日累计之和）
 # ---------- 赌神称号（全局唯一，跨群共享荣誉） ----------
 user_titles = {}               # user_titles[uid] = "🎰赌神"  当前在任赌神（全局唯一）
 champions_history = []         # [{"season_id","uid","name","score","streak"}] 历届荣誉墙
@@ -220,6 +219,7 @@ def force_save_now():
                 "season_joined": {str(cid): list(users) for cid, users in season_joined.items()},
                 "season_rebuy": {str(cid): dict(users) for cid, users in season_rebuy.items()},
                 "season_eliminated": {str(cid): list(users) for cid, users in season_eliminated.items()},
+                "season_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in season_profit_by_date.items()},
                 "user_titles": {str(uid): t for uid, t in user_titles.items()},
                 "champions_history": champions_history,
                 "user_names": {str(uid): n for uid, n in user_names.items()},
@@ -290,6 +290,7 @@ def load_data():
             season_joined[int(cid)] = set(int(u) for u in uids)
         for cid, uids in data.get("season_eliminated", {}).items():
             season_eliminated[int(cid)] = set(int(u) for u in uids)
+        for date, chats in data.get("season_profit_by_date", {}).items(): restore_nested(season_profit_by_date[date], chats)
         # 赌神称号恢复
         user_titles.clear()
         for uid, t in data.get("user_titles", {}).items():
@@ -341,7 +342,8 @@ def archive_old_profit_data(keep_days=90):
     cutoff = (now_bj() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
     for profit_dict in (race_profit_by_date, blackjack_profit_by_date,
                         baccarat_profit_by_date, slot_profit_by_date,
-                        sicbo_profit_by_date, niuniu_profit_by_date):
+                        sicbo_profit_by_date, niuniu_profit_by_date,
+                        season_profit_by_date):
         old_dates = [d for d in list(profit_dict.keys()) if d != "_archive" and d < cutoff]
         if not old_dates:
             continue
@@ -771,8 +773,8 @@ class PokerGame:
     def add(self, uid):
         if self.phase != "waiting" or uid in self.players: return False
         if self.season:
-            # 排位赛：必须已报名、未淘汰、且排位分 > 0
-            if uid not in season_joined.get(self.chat_id, set()) or uid in season_eliminated.get(self.chat_id, set()):
+            # 排位赛：必须已报名、且排位分 > 0
+            if uid not in season_joined.get(self.chat_id, set()):
                 return False
             wallet = season_points
             if wallet[self.chat_id][uid] <= 0: return False
@@ -824,7 +826,7 @@ class PokerGame:
         if uid != self.current(): return False, "还没轮到你"
         if kind == "fold":
             old = self.active.index(uid); self.folded.add(uid); self.active.remove(uid)
-            if self.active: self.actor_idx = (old - 1) % len(self.active)
+            if self.active: self.actor_idx = old % len(self.active)
             desc = "弃牌"
         elif kind == "check":
             if self.round_bets[uid] != self.current_bet: return False, "必须跟注或加注"
@@ -897,7 +899,7 @@ class PokerGame:
             for uid in self.players:
                 # 增量结算：保留牌局进行中管理员用 /adddz 加的分，避免被开局快照覆盖
                 wallet[self.chat_id][uid] += self.chips[uid] - self.initial_chips.get(uid, wallet[self.chat_id][uid])
-            save_data()
+            save_data(); force_save_now()
             return [(winner, "最后赢家", self.pot, [("全部底池", self.pot)], {})]
 
         # 至少两人仍在局内，才补齐五张公牌并进行正常摊牌。
@@ -915,7 +917,7 @@ class PokerGame:
         for uid in self.players:
             # 增量结算：保留牌局进行中管理员用 /adddz 加的分，避免被开局快照覆盖
             wallet[self.chat_id][uid] += self.chips[uid] - self.initial_chips.get(uid, wallet[self.chat_id][uid])
-        save_data(); return [(uid, names[uid], item["amount"], item["details"], names) for uid, item in payouts.items()]
+        save_data(); force_save_now(); return [(uid, names[uid], item["amount"], item["details"], names) for uid, item in payouts.items()]
 
     def cancel_timer(self):
         task, self.turn_task = self.turn_task, None
@@ -1052,7 +1054,7 @@ async def settle_poker(game, app):
                 poker_profit_by_date[date][game.chat_id][uid] += net
             lines.extend([f"{names[uid]}：投入 {game.total_bet[uid]}｜盈亏 {net:+d}", ""])
 
-        # 排位赛：累计局数 + 破产应急补分 / 淘汰处理（赛季已结束的进行中牌局只正常派奖、不计入、不误判破产）
+        # 排位赛：累计局数 + 破产应急补分（已取消淘汰；赛季已结束的进行中牌局只正常派奖、不计入、不误判破产）
         if game.season and season_active:
             for p in game.players:
                 if p < 0: continue
@@ -1064,9 +1066,7 @@ async def settle_poker(game, app):
                         season_rebuy[game.chat_id][p] += 1
                         season_points[game.chat_id][p] = SEASON_REBUY_AMOUNT
                         lines.append(f"⚠️ {names[p]} 破产，启用应急筹码 +{SEASON_REBUY_AMOUNT}（剩 {SEASON_REBUY_COUNT - season_rebuy[game.chat_id][p]} 次）")
-                    else:
-                        season_eliminated[game.chat_id].add(p)
-                        lines.append(f"💀 {names[p]} 应急筹码用尽，已淘汰出本赛季")
+                    # 已取消淘汰机制：破产玩家当日剩余时间无法下注，次日 0 点重置为 {SEASON_START_CHIPS} 后可继续参赛
 
         if game.mode == "official" and not game.season:
             rank = sorted(poker_profit_by_date[date][game.chat_id].items(), key=lambda item: item[1], reverse=True)[:50]
@@ -1597,7 +1597,7 @@ async def update_blackjack_ui(game, app):
             # 记录庄家历史 (仅记录本局主要趋势)
             if game.mode == "official":
                 # 计算本局玩家总体输赢，用于生成庄家路书图标
-                total_net = sum(p - game.bets[u] for p, u in payout_plan)
+                total_net = sum(net for (uid, payout, net) in payout_plan)
                 history_icon = "🏛" if total_net < 0 else ("🤝" if total_net == 0 else "👤")
                 blackjack_history[game.chat_id] = (blackjack_history[game.chat_id] + [history_icon])[-10:]
 
@@ -2554,6 +2554,7 @@ async def start_season(cid, name="", forced=False):
         season_games[cid][uid] = 0
         season_rebuy[cid][uid] = 0
     season_eliminated[cid] = set()
+    season_profit_by_date.pop(cid, None)
     save_data()
     return True, None
 
@@ -2564,7 +2565,7 @@ async def season_settle(app, manual=False):
     if not season_active:
         return
     for cid, users in season_points.items():
-        standings = sorted(users.items(), key=lambda x: (-x[1], x[0]))
+        standings = sorted(users.items(), key=lambda x: (-season_total_profit(cid, x[0]), x[0]))
         eligible = [(uid, val) for uid, val in standings if uid >= 0 and season_games[cid].get(uid, 0) >= SEASON_MIN_GAMES]
         lines = [f"🏆 第{season_id}赛季最终榜（{season_name or '排位赛'}）", "━" * 18]
         if not eligible:
@@ -2572,7 +2573,7 @@ async def season_settle(app, manual=False):
         for i, (uid, val) in enumerate(eligible[:50], 1):
             g = season_games[cid].get(uid, 0)
             marker = "👑" if (i == 1 and uid in user_titles) else rank_marker(i)
-            lines.append(f"{marker} {await get_name(app, uid, cid=cid, with_title=False)}：{val}｜{g}局")
+            lines.append(f"{marker} {await get_name(app, uid, cid=cid, with_title=False)}：总{season_total_profit(cid, uid):+d}｜{g}局")
         lines.extend(["", "⚠️ 结算时刻进行中的牌局不计入本赛季。", "🎁 奖励由管理员另行发放。"])
         await safe_send_long(app.bot, cid, "\n".join(lines))
         # 自动加冕本赛季赌神（全局唯一，覆盖上任）
@@ -2601,14 +2602,23 @@ async def season_settle(app, manual=False):
     season_name = ""
     season_start_ts = 0
     season_end_ts = 0
-    season_points.clear(); season_games.clear(); season_joined.clear(); season_rebuy.clear(); season_eliminated.clear()
+    season_points.clear(); season_games.clear(); season_joined.clear(); season_rebuy.clear(); season_eliminated.clear(); season_profit_by_date.clear()
     season_lobby_msg.clear()  # 大厅看板为 UI 态，结算后清空，下赛季重新发
     save_data()
 
 
+def season_total_profit(cid, uid):
+    """赛季总盈亏 = 各日已结算盈亏之和 + 当前未结算当日盈亏（当前分 - 起始分）。"""
+    total = 0
+    for d in season_profit_by_date:
+        total += season_profit_by_date[d].get(cid, {}).get(uid, 0)
+    total += season_points.get(cid, {}).get(uid, 0) - SEASON_START_CHIPS
+    return total
+
+
 async def season_standings_lines(app, cid, uid=None):
     users = season_points.get(cid, {})
-    standings = sorted(users.items(), key=lambda x: (-x[1], x[0]))
+    standings = sorted(users.items(), key=lambda x: (-season_total_profit(cid, x[0]), x[0]))
     remain = max(0, int((season_end_ts - now_bj().timestamp()) / 86400))
     lines = [f"🏆 第{season_id}赛季排位榜（{season_name or '排位赛'}）",
              f"⏳ 剩余约 {remain} 天｜上榜需≥{SEASON_MIN_GAMES}局", "━" * 18]
@@ -2618,21 +2628,19 @@ async def season_standings_lines(app, cid, uid=None):
         g = season_games[cid].get(u, 0)
         tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
         marker = "👑" if (i == 1 and u in user_titles) else rank_marker(i)
-        lines.append(f"{marker} {await get_name(app, u, cid=cid, with_title=False)}：{val}｜{g}局{tag}")
+        lines.append(f"{marker} {await get_name(app, u, cid=cid, with_title=False)}：总{season_total_profit(cid, u):+d}｜当日{val}｜{g}局{tag}")
     # 个人排名行：请求者不在前 50 时，单独补一行真实名次，避免大群看不到自己
     if uid is not None and uid in users:
         full_rank = next((i for i, (u, _) in enumerate(standings, 1) if u == uid), None)
         if full_rank is not None and full_rank > 50:
             g = season_games[cid].get(uid, 0)
             tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
-            lines.append(f"…（仅显示前 50，你当前第 {full_rank} 名：{users[uid]} 分{tag}）")
+            lines.append(f"…（仅显示前 50，你当前第 {full_rank} 名：总{season_total_profit(cid, uid):+d}分{tag}）")
     return lines
 
 
 async def season_signup(app, cid, uid):
     """报名 / 赛中补报名。处理自动开赛。返回 (ok, key)。key∈joining/started/joined_active。"""
-    if uid in season_eliminated.get(cid, set()):
-        return False, "eliminated"
     if season_active:
         season_joined.setdefault(cid, set()).add(uid)
         if uid not in season_points.get(cid, {}):
@@ -2702,8 +2710,6 @@ async def cmd_season_join(update, context):
     if not await require_group_chat(update, "德州排位赛", "排位"): return
     cid, uid = update.effective_chat.id, update.effective_user.id
     ok, key = await season_signup(context.application, cid, uid)
-    if not ok:
-        await update.message.reply_text("❌ 你已被淘汰，无法报名本赛季。"); return
     await render_season_lobby(context.application, cid)
     if key == "started":
         await update.message.reply_text(f"🏆 报名满 {SEASON_MIN_PLAYERS} 人，第{season_id}赛季「{season_name or '排位赛'}」开始！每人 {SEASON_START_CHIPS} 分，周期 {SEASON_DAYS} 天。用 /排位 开局。")
@@ -2764,10 +2770,16 @@ async def cmd_god(update, context):
         for rec in champions_history[-12:][::-1]:
             streak = rec.get("streak", 1)
             sfx = f" · {streak}连冠" if streak > 1 else ""
-            lines.append(f"第{rec['season_id']}赛季：{rec.get('name', '?')}（{rec.get('score', 0)}分）{sfx}")
+            name = html.escape(str(rec.get("name", "?")))
+            lines.append(f"第{rec['season_id']}赛季：{name}（{rec.get('score', 0)}分）{sfx}")
     else:
         lines.append("", "📜 历届荣誉墙：暂无记录")
-    await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
+    text = "\n".join(lines)
+    try:
+        await safe_send_long(context.bot, update.effective_chat.id, text, parse_mode="HTML")
+    except Exception:
+        # 历史称号含 < & 等特殊字符导致 HTML 渲染失败时，降级为纯文本发送，避免命令“失效无响应”
+        await safe_send_long(context.bot, update.effective_chat.id, text)
 
 
 async def cmd_god_grant(update, context):
@@ -2803,6 +2815,28 @@ async def cmd_god_revoke(update, context):
         await update.message.reply_text("ℹ️ 该用户当前没有 🎰赌神 称号。")
 
 
+async def cmd_season_points(update, context):
+    """管理员加减排位分（正为加，负为减）。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    if not await need_auth(update): return
+    try:
+        uid, amount = await _parse_target_amount(update, context)
+        if amount == 0: raise ValueError
+    except (ValueError, IndexError):
+        await update.message.reply_text("用法：/赛季分 用户ID 数量（正加负减），或回复玩家消息后使用 /赛季分 数量"); return
+    cid = update.effective_chat.id
+    if not season_active and uid not in season_points.get(cid, {}):
+        await update.message.reply_text("⚠️ 该玩家不在当前赛季，且赛季未激活。"); return
+    if amount < 0 and season_points.get(cid, {}).get(uid, 0) < -amount:
+        await update.message.reply_text("❌ 该玩家排位分不足。"); return
+    season_points.setdefault(cid, defaultdict(int))[uid] += amount
+    season_joined.setdefault(cid, set()).add(uid)
+    save_data()
+    verb = "增加" if amount > 0 else "扣除"
+    await update.message.reply_text(f"✅ 已为 {await get_name(context.application, uid)} {verb} {abs(amount)} 排位分，当前 {season_points[cid][uid]}。")
+
+
 async def cmd_season_help(update, context):
     if not await need_auth(update): return
     cid = update.effective_chat.id
@@ -2822,7 +2856,7 @@ async def cmd_season_help(update, context):
         "<b>自动机制</b>\n"
         "• 每日 23:00 自动推一次排位榜\n"
         "• 开赛后第 7 天（到点后的首个午夜）自动结算，可能晚最多约 24 小时\n\n"
-        "📌 满 20 人开赛；起始 20000 分；输光可应急补分 3×2000，再输光淘汰；满 5 局才上榜。\n"
+        "📌 满 20 人开赛；起始 20000 分；输光可应急补分 3×2000；满 5 局才上榜；次日 0 点重置为 20000 分可继续打。\n"
         "💡 以上「排位」命令均可换「赛季」前缀，含义完全相同，如 /赛季榜 /赛季报名 /赛季开赛 /赛季结束。\n"
         "⚠️ 群里若中文命令无反应，多为 BotFather 隐私模式拦截，发 /setprivacy → Disable 即可。"
     )
@@ -2835,8 +2869,6 @@ async def cmd_season_play(update, context):
     cid, uid = update.effective_chat.id, update.effective_user.id
     if not season_active:
         ok, key = await season_signup(context.application, cid, uid)
-        if not ok:
-            await update.message.reply_text("❌ 你已被淘汰，无法参加本赛季排位。"); return
         if key == "started":
             await render_season_lobby(context.application, cid)  # 满 20 自动开赛：翻转看板为进行中，继续往下开房
         else:
@@ -2845,8 +2877,6 @@ async def cmd_season_play(update, context):
             await update.message.reply_text(f"✅ 已报名本赛季排位赛（{n}/{SEASON_MIN_PLAYERS}）。满 {SEASON_MIN_PLAYERS} 人自动开赛；发 /排位报名 可看报名大厅。")
             return
     # 赛季进行中：开 / 入房间（赛中未报名者自动补报名）
-    if uid in season_eliminated.get(cid, set()):
-        await update.message.reply_text("❌ 你已被淘汰，无法参加本赛季排位。"); return
     if uid not in season_joined.get(cid, set()):
         season_joined.setdefault(cid, set()).add(uid)
         if uid not in season_points.get(cid, {}):
@@ -2999,6 +3029,12 @@ def player_is_busy(cid, uid):
     bjl = active_baccarat_games.get(cid)
     if bjl and bjl.phase == "betting" and uid in bjl.bets:
         return True
+    sicbo = active_sicbo_games.get(cid)
+    if sicbo and sicbo.phase == "betting" and uid in sicbo.bets:
+        return True
+    niuniu = active_niuniu_games.get(cid)
+    if niuniu and niuniu.phase != "waiting" and uid in niuniu.players:
+        return True
     return False
 
 
@@ -3033,14 +3069,17 @@ async def cmd_adddz(update, context):
     if not await need_auth(update): return
     try:
         uid, amount = await _parse_target_amount(update, context)
-        if amount <= 0: raise ValueError
+        if amount == 0: raise ValueError
     except (ValueError, IndexError):
-        await update.message.reply_text("用法：/adddz 用户ID 数量，或回复玩家消息后使用 /adddz 数量"); return
+        await update.message.reply_text("用法：/adddz 用户ID 数量（正为加，负为减），或回复玩家消息后使用 /adddz 数量"); return
     cid = update.effective_chat.id
     if player_is_busy(cid, uid):
         await update.message.reply_text("该玩家正在游戏中，无法修改积分。"); return
+    if amount < 0 and texas_chips[cid][uid] < -amount:
+        await update.message.reply_text("❌ 该玩家德州积分不足。"); return
     texas_chips[cid][uid] += amount; save_data()
-    await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)} 添加 {amount} 德州积分，当前 {texas_chips[cid][uid]}。")
+    verb = "添加" if amount > 0 else "扣除"
+    await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)} {verb} {abs(amount)} 德州积分，当前 {texas_chips[cid][uid]}。")
 
 
 async def cmd_reduce(update, context):
@@ -3358,8 +3397,6 @@ async def on_button(update, context):
         if data.startswith("season_"):
             if data == "season_signup":
                 ok, key = await season_signup(context.application, cid, uid)
-                if not ok:
-                    await q.answer("你已被淘汰，无法报名", show_alert=True); return
                 await render_season_lobby(context.application, cid)
                 if key == "started":
                     await q.answer("🏆 报名已满，赛季自动开始！用 /排位 开局", show_alert=True)
@@ -3395,8 +3432,6 @@ async def on_button(update, context):
             if game.phase == "waiting":
                 if data == "texas_join":
                     if game.season:
-                        if uid in season_eliminated.get(cid, set()):
-                            await q.answer("已淘汰，无法加入", show_alert=True); return
                         if uid not in season_joined.get(cid, set()):
                             season_joined.setdefault(cid, set()).add(uid)
                             if uid not in season_points.get(cid, {}):
@@ -3602,6 +3637,16 @@ async def daily_reset_scheduler(app):
             for uid in users:
                 if (chat_id, uid) not in protected:
                     users[uid] = STARTING_CHIPS
+        # 排位赛：记录当日盈亏并重置为起始分（每天无论分数多少重置成 2W）
+        if season_active:
+            day_key = (now_bj() - timedelta(days=1)).strftime("%Y-%m-%d")
+            for cid, users in season_points.items():
+                for uid in list(users.keys()):
+                    day_profit = users[uid] - SEASON_START_CHIPS
+                    if day_profit:
+                        season_profit_by_date[day_key][cid][uid] += day_profit
+                    users[uid] = SEASON_START_CHIPS
+            save_data()
         for cid in race_daily_stats: race_daily_stats[cid] = [0] * HORSE_COUNT
         for cid in baccarat_daily_stats: baccarat_daily_stats[cid] = {"player": 0, "banker": 0, "tie": 0}
         archive_old_profit_data()
@@ -3614,15 +3659,29 @@ async def leaderboard_scheduler(app):
         await asyncio.sleep((target-now).total_seconds())
         # 只推送并清空德州当日榜；其他游戏榜保留累计（总数）
         date = now_bj().strftime("%Y-%m-%d"); texas_snapshot = poker_profit_by_date.pop(date, {})
+        # 兜底：业务日在 23:50 翻日，23:50-23:59 的下注记录在下一日业务日键下，一并并入当日榜避免丢失
+        date_next = business_date()
+        if date_next != date:
+            for c, ud in poker_profit_by_date.pop(date_next, {}).items():
+                texas_snapshot.setdefault(c, {})
+                for u, a in ud.items():
+                    texas_snapshot[c][u] = texas_snapshot.get(c, {}).get(u, 0) + a
         for cid, data in texas_snapshot.items():
             if not data: continue
             lines = [f"🏆 德州当日排行榜（{date}）", "━"*14]
             for i, (uid, amount) in enumerate(sorted(data.items(), key=lambda x:x[1], reverse=True)[:50], 1): lines.append(f"{rank_marker(i)} {await get_name(app, uid)}：{amount:+d}")
             await safe_send_long(app.bot, cid, "\n".join(lines))
-        # 排位赛每日推一次当前榜，给群友紧迫感
+        # 排位赛每日 23:50 推送「当日分数」（每人每天从 2W 起始，当日分即当前分）
         if season_active:
             for cid in list(season_points.keys()):
-                lines = await season_standings_lines(app, cid)
+                users = season_points.get(cid, {})
+                if not users: continue
+                day_standings = sorted(users.items(), key=lambda x: (-x[1], x[0]))
+                lines = [f"🏆 第{season_id}赛季 当日分数（每人起始 {SEASON_START_CHIPS}）", "━" * 18]
+                for i, (u, val) in enumerate(day_standings[:50], 1):
+                    g = season_games[cid].get(u, 0)
+                    tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
+                    lines.append(f"{rank_marker(i)} {await get_name(app, u, cid=cid, with_title=False)}：{val}｜{g}局{tag}")
                 await safe_send_long(app.bot, cid, "\n".join(lines))
         save_data()
 
@@ -3760,6 +3819,7 @@ async def post_init(app):
             BotCommand("god", "赌神称号/荣誉墙"),
             BotCommand("godgrant", "封赌神(管理员)"),
             BotCommand("godrevoke", "撤赌神(管理员)"),
+            BotCommand("seasonpoints", "加减排位分(管理员)"),
         ]
         await app.bot.set_my_commands(menu)
     except Exception:
@@ -3802,6 +3862,7 @@ CMD_ALIASES = {
     "排位开赛": cmd_season_start, "排位结束": cmd_season_end, "赛季开赛": cmd_season_start, "赛季结束": cmd_season_end,
     "赌神": cmd_god, "荣誉墙": cmd_god,
     "封赌神": cmd_god_grant, "撤赌神": cmd_god_revoke,
+    "赛季分": cmd_season_points, "加赛季分": cmd_season_points, "减赛季分": cmd_season_points, "seasonpoints": cmd_season_points,
     # 旧英文/数字别名（保留兼容，仍可用）
     "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm,
     "lhj": cmd_lhj, "21": cmd_21, "bjl": cmd_bjl, "end": cmd_end,
