@@ -890,19 +890,32 @@ class PokerGame:
         elif not skip_next: self._next(self.actor_idx + 1)
         return True, desc
 
+    def _draw(self):
+        """安全抽牌：牌堆耗尽时重洗一副新牌，避免抽牌 IndexError。"""
+        if not self.deck:
+            self.deck = [Card.new(rank + suit) for rank in "23456789TJQKA" for suit in "shdc"]
+            random.shuffle(self.deck)
+        return self.deck.pop()
+
     def _end_round(self):
         self.round_bets = {uid: 0 for uid in self.players}; self.current_bet = 0; self.acted.clear(); self.raise_locked.clear()
-        if self.phase == "preflop": self.deck.pop(); self.board.extend([self.deck.pop() for _ in range(3)]); self.phase = "flop"
-        elif self.phase == "flop": self.deck.pop(); self.board.append(self.deck.pop()); self.phase = "turn"
-        elif self.phase == "turn": self.deck.pop(); self.board.append(self.deck.pop()); self.phase = "river"
+        if self.phase == "preflop": self._draw(); self.board.extend([self._draw() for _ in range(3)]); self.phase = "flop"
+        elif self.phase == "flop": self._draw(); self.board.append(self._draw()); self.phase = "turn"
+        elif self.phase == "turn": self._draw(); self.board.append(self._draw()); self.phase = "river"
         else: self.phase = "showdown"; return
         # 基于 dealer 在 active 中的位置计算起始行动者（dealer 可能已弃牌）
         dealer = self.players[self.dealer_idx]
         if dealer in self.active:
             start = (self.active.index(dealer) + 1) % len(self.active)
         else:
-            # dealer 已弃牌，从 active 第一个开始找
+            # dealer 已弃牌：从按钮（dealer_idx）下一位开始，找第一个仍为 active 的玩家，以其 active 索引作为起点
+            n = len(self.players)
             start = 0
+            for i in range(1, n + 1):
+                cand = self.players[(self.dealer_idx + i) % n]
+                if cand in self.active:
+                    start = self.active.index(cand)
+                    break
         if self._next(start) is None: self.phase = "showdown"
 
     async def showdown(self):
@@ -925,11 +938,11 @@ class PokerGame:
 
         # 至少两人仍在局内，才补齐五张公牌并进行正常摊牌。
         while len(self.board) < 5:
-            self.deck.pop()
+            self._draw()
             if not self.board:
-                self.board.extend([self.deck.pop() for _ in range(3)])
+                self.board.extend([self._draw() for _ in range(3)])
             else:
-                self.board.append(self.deck.pop())
+                self.board.append(self._draw())
         scores = {uid: self.evaluator.evaluate(self.hands[uid], self.board) for uid in alive}
         names = {uid: HAND_NAME_CN.get(self.evaluator.class_to_string(self.evaluator.get_rank_class(score)), "未知") for uid, score in scores.items()}
         payouts = distribute_side_pots(self.total_bet, scores)
@@ -1353,17 +1366,20 @@ class HorseRace:
                 for uid in self.bets:
                     if uid not in self.name_cache: self.name_cache[uid] = await get_name(app, uid)
 
+                # 阶段一：计算派彩并记录盈亏（不动钱包，避免中途异常导致已派彩玩家被双重退款）
                 settlements, total_payout = [], 0
+                wallet = game_chips
                 for uid, bets in self.bets.items():
                     stake = sum(bets.values()); bet_on_winner = bets.get(winner, 0)
                     bet_odd = self.bet_odds[uid].get(winner, fallback_odd)
                     payout = int(bet_on_winner * bet_odd)
                     net = payout - stake
-                    wallet = game_chips
-                    wallet[self.chat_id][uid] += payout; total_payout += payout
                     if self.mode == "official":
                         race_profit_by_date[date][self.chat_id][uid] += net
                     settlements.append((uid, self.name_cache[uid], stake, bet_on_winner, payout, net, bet_odd))
+                # 阶段二：统一改写钱包（此处仅 dict 操作，不会抛异常，payouts_applied 必定置位）
+                for uid, _, _, _, payout, _, _ in settlements:
+                    wallet[self.chat_id][uid] += payout; total_payout += payout
                 payouts_applied = True
 
                 available_pool = self.jackpot + self.pool
@@ -1765,6 +1781,8 @@ async def settle_baccarat(game, app):
         except Exception: name_map[uid] = f"玩家{uid}"
 
     try:
+        # 阶段一：计算派彩、记录盈亏、清理退款记录（不动钱包，避免中途异常导致部分派彩）
+        compute_list = []
         for uid, bets in game.bets.items():
             win_amount = 0
             total_bet = sum(bets.values())
@@ -1773,14 +1791,16 @@ async def settle_baccarat(game, app):
             elif result == "tie": win_amount = bets["tie"] * 9 + bets["player"] + bets["banker"]  # 押和9倍 + 庄闲投注退还
 
             net = win_amount - total_bet
-            wallet[game.chat_id][uid] += win_amount
             if game.mode == "official":
                 baccarat_profit_by_date[date][game.chat_id][uid] += net
             if net != 0:
                 lines.append(f"👤 <b>玩家</b>：{name_map[uid]}\n<b>盈亏</b>：{net:+d}")
             # 清除退款记录（本局已结束，无论盈亏都清理本游戏的记录）
             pending_game_bets[game.chat_id].get(uid, {}).pop("baccarat", None)
-
+            compute_list.append((uid, win_amount))
+        # 阶段二：统一改写钱包（此处仅 dict 操作，不会抛异常，payouts_applied 必定置位）
+        for uid, win_amount in compute_list:
+            wallet[game.chat_id][uid] += win_amount
         payouts_applied = True
         save_data(); await asyncio.to_thread(force_save_now)
 
@@ -3462,7 +3482,7 @@ async def on_button(update, context):
                 # 抽奖成功后原地编辑为开奖结果（1 次 API，比删除+发送省一半请求）；编辑失败则直接发送
                 edited = await safe_edit(context.bot, cid, q.message.message_id, result_text, reply_markup=None, parse_mode="HTML")
                 if edited is None:
-                    await safe_send(context.bot, cid, result_text, parse_mode="HTML")
+                    await safe_send_long(context.bot, cid, result_text, parse_mode="HTML")
             return
 
         if data.startswith("season_"):
@@ -3698,8 +3718,9 @@ async def daily_reset_scheduler(app):
         # 排位赛到点自动结算（end_ts 为开赛+7天的时间戳）
         if season_active and now_bj().timestamp() >= season_end_ts:
             await season_settle(app)
-        # 午夜仅清理德州榜单（德州当日榜）；其他游戏榜单不清空，累计为总数
-        poker_profit_by_date.clear()
+        # 午夜仅清理「刚结束的那一天」德州当日榜；保留 _archive 与其他日期历史，避免清空全部历史盈亏
+        finished_day = (now_bj() - timedelta(days=1)).strftime("%Y-%m-%d")
+        poker_profit_by_date.pop(finished_day, None)
         # 不重置正在进行正式德州或赛车中的玩家，避免跨日覆盖未结算状态。
         protected = set()
         for poker in active_poker_games.values():
