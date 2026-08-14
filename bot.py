@@ -3063,6 +3063,51 @@ async def post_shutdown(app):
     force_save_now()
 
 
+def is_super_admin(uid):
+    """仅机器人所有者（种子管理员）拥有最高权限；其它 BOT_ADMINS 只能加减分。"""
+    return uid == ADMIN_USER_ID
+
+
+def is_auth(cid):
+    """判断群组是否已授权（cmd_* 与 on_text 文字交互用）。"""
+    return cid in AUTHORIZED_GROUPS
+
+
+def is_group_chat(update):
+    """判断消息是否来自群聊（group / supergroup）。"""
+    chat = update.effective_chat
+    return bool(chat and getattr(chat, "type", None) in ("group", "supergroup"))
+
+
+async def need_auth(update):
+    """通用授权校验：未授权群（非种子超管）一律拒绝。返回 True 表示放行。"""
+    cid = update.effective_chat.id if update.effective_chat else None
+    if cid is not None and cid < 0 and cid not in AUTHORIZED_GROUPS:
+        # 超管可在任何群操作，其它用户必须先 /授权 该群
+        uid = update.effective_user.id if update.effective_user else 0
+        if not is_super_admin(uid):
+            try:
+                await update.message.reply_text("⚠️ 本群未授权：请先联系 Bot 管理员发送 /授权 启用本群。")
+            except Exception:
+                pass
+            return False
+    return True
+
+
+async def require_group_chat(update, game_name, cmd_alias):
+    """要求命令必须在群聊里使用；私聊调用时给用户提示。返回 True 表示放行。"""
+    if is_group_chat(update):
+        return True
+    try:
+        await update.message.reply_text(
+            f"⚠️ 「{game_name}」需在群聊中进行：请在目标群里发送 /{cmd_alias}（机器人会把该群加入授权名单）。\n"
+            f"私聊里不能开{game_name}，否则开在私聊、别人看不到。"
+        )
+    except Exception:
+        pass
+    return False
+
+
 async def cmd_start(update, context):
     """/开始 /菜单 /帮助：列出全部可用命令与游戏。"""
     text = (
