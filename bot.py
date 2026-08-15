@@ -1462,9 +1462,13 @@ class HorseRace:
 def is_auth(cid): return cid in AUTHORIZED_GROUPS
 def is_bot_admin(uid): return uid in BOT_ADMINS
 async def need_auth(update):
-    if not update.effective_chat or not is_auth(update.effective_chat.id):
-        if update.effective_message: await update.effective_message.reply_text("❌ 此群组未授权，请联系管理员。")
-        return False
+    # 授权只针对「群聊」：私聊没有群组概念，不应被「群组未授权」拦截。
+    # 私聊里真正受限的游戏/管理命令，各自还有 require_group_chat / is_bot_admin 兜底。
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        if not is_auth(chat.id):
+            if update.effective_message: await update.effective_message.reply_text("❌ 此群组未授权，请联系管理员。")
+            return False
     return True
 
 
