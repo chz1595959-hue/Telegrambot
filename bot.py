@@ -2330,35 +2330,57 @@ async def settle_niuniu(game, app):
             involved_uids.append(dealer_uid)
         async with user_wallet_locks(involved_uids):
             for uid, p_niu, p_win, amount in results:
+                # 四种组合：庄家/闲家 谁是机器人，统一按"真人走钱包、机器人走系统奖池(robot_bank)"处理，
+                # 杜绝机器人当闲家时庄家白赢、或真人输给机器人闲家时积分凭空蒸发
                 if p_win:
-                    # 闲家赢：从庄家获得 amount；庄家余额不足则按余额封顶
-                    if dealer_uid >= 0:
+                    # 闲家赢：从庄家获得 amount
+                    if dealer_uid >= 0 and uid >= 0:
+                        # 真人对真人
                         pay = min(amount, wallet[game.chat_id][dealer_uid])
                         wallet[game.chat_id][dealer_uid] -= pay
                         actual_dealer_delta -= pay
-                        gained = pay
-                    else:
-                        # 机器人庄家：从系统奖池扣，封顶当前余额
+                        wallet[game.chat_id][uid] += pay
+                        actual_net = pay
+                    elif dealer_uid >= 0 and uid < 0:
+                        # 真人庄家 vs 机器人闲家赢：庄家付给系统奖池（house 吸收，避免积分凭空消失）
+                        pay = min(amount, wallet[game.chat_id][dealer_uid])
+                        wallet[game.chat_id][dealer_uid] -= pay
+                        actual_dealer_delta -= pay
+                        robot_budget += pay
+                        actual_net = pay
+                    elif dealer_uid < 0 and uid >= 0:
+                        # 机器人庄家 vs 真人闲家赢：从系统奖池付给真人，封顶当前余额
                         pay = min(amount, robot_budget)
                         robot_budget -= pay
-                        gained = pay
-                    if uid >= 0:
-                        wallet[game.chat_id][uid] += gained
-                    actual_net = gained
+                        wallet[game.chat_id][uid] += pay
+                        actual_net = pay
+                    else:
+                        # 机器人 vs 机器人：无实际钱包
+                        actual_net = 0
                 else:
                     # 闲家输：向庄家支付 amount
-                    if uid >= 0:
-                        wallet[game.chat_id][uid] -= amount
-                        paid = amount
+                    if dealer_uid >= 0 and uid >= 0:
+                        # 真人对真人
+                        pay = amount
+                        wallet[game.chat_id][uid] -= pay
+                        wallet[game.chat_id][dealer_uid] += pay
+                        actual_dealer_delta += pay
+                        actual_net = -pay
+                    elif dealer_uid >= 0 and uid < 0:
+                        # 真人庄家 vs 机器人闲家输：house 用系统奖池付给真人庄家，封顶余额
+                        pay = min(amount, robot_budget)
+                        robot_budget -= pay
+                        wallet[game.chat_id][dealer_uid] += pay
+                        actual_dealer_delta += pay
+                        actual_net = -pay
+                    elif dealer_uid < 0 and uid >= 0:
+                        # 机器人庄家 vs 真人闲家输：真人付给系统奖池
+                        pay = amount
+                        wallet[game.chat_id][uid] -= pay
+                        robot_budget += pay
+                        actual_net = -pay
                     else:
-                        paid = 0
-                    if dealer_uid >= 0:
-                        wallet[game.chat_id][dealer_uid] += paid
-                        actual_dealer_delta += paid
-                    else:
-                        # 机器人庄家收下闲家输的分，注入奖池
-                        robot_budget += paid
-                actual_net = -paid
+                        actual_net = 0
                 if game.mode == "official":
                     if uid >= 0: niuniu_profit_by_date[date][game.chat_id][uid] += actual_net
                     if dealer_uid >= 0: niuniu_profit_by_date[date][game.chat_id][dealer_uid] -= actual_net
@@ -2373,8 +2395,8 @@ async def settle_niuniu(game, app):
             payouts_applied = True
         save_data(); await asyncio.to_thread(force_save_now)
         dealer_net = actual_dealer_delta
-        if dealer_uid < 0:
-            # 奖池单局结算后封顶，避免无限累积
+        if dealer_uid < 0 or any(u < 0 for u in game.players):
+            # 奖池单局结算后封顶，避免无限累积（机器人当庄家或当闲家都需写回）
             robot_bank[game.chat_id] = min(NIU_ROBOT_BANK, robot_budget)
 
         # 庄家牌展示
