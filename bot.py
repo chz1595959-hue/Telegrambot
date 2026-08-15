@@ -128,7 +128,6 @@ season_points = defaultdict(lambda: defaultdict(int))    # season_points[cid][ui
 season_games = defaultdict(lambda: defaultdict(int))     # season_games[cid][uid] 参赛局数
 season_joined = defaultdict(set)                          # season_joined[cid] = {uid} 报名集合
 season_rebuy = defaultdict(lambda: defaultdict(int))      # season_rebuy[cid][uid] 已用应急补分次数
-season_eliminated = defaultdict(set)                      # 仅保留以兼容旧存档；淘汰机制已取消，不再使用
 season_lobby_msg = {}                                       # season_lobby_msg[cid] = 排位大厅看板消息 id（UI 态，不持久化）
 season_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # season_profit_by_date[date][cid][uid] = 当日盈亏（赛季每日重置成 2W 前记录；赛季总排行=7日累计之和）
 # ---------- 赌神称号（全局唯一，跨群共享荣誉） ----------
@@ -233,7 +232,6 @@ def force_save_now():
                 "season_games": {str(cid): dict(users) for cid, users in season_games.items()},
                 "season_joined": {str(cid): list(users) for cid, users in season_joined.items()},
                 "season_rebuy": {str(cid): dict(users) for cid, users in season_rebuy.items()},
-                "season_eliminated": {str(cid): list(users) for cid, users in season_eliminated.items()},
                 "season_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in season_profit_by_date.items()},
                 "user_titles": {str(uid): t for uid, t in user_titles.items()},
                 "champions_history": champions_history,
@@ -303,8 +301,6 @@ def load_data():
         restore_nested(season_rebuy, data.get("season_rebuy", {}))
         for cid, uids in data.get("season_joined", {}).items():
             season_joined[int(cid)] = set(int(u) for u in uids)
-        for cid, uids in data.get("season_eliminated", {}).items():
-            season_eliminated[int(cid)] = set(int(u) for u in uids)
         for date, chats in data.get("season_profit_by_date", {}).items(): restore_nested(season_profit_by_date[date], chats)
         # 赌神称号恢复
         user_titles.clear()
@@ -1184,7 +1180,10 @@ class HorseRace:
         self.task, self.settled, self.cancelled, self.lock = None, False, False, asyncio.Lock()
         self.final_odds = None
         self.bet_odds = defaultdict(dict)  # 每注下注瞬间锁定的赔率（uid->horse 金额加权平均）
-        rates = [random.uniform(.18, .35) for _ in range(HORSE_COUNT)]; total = sum(rates)
+        rates = [random.uniform(.18, .35) for _ in range(HORSE_COUNT)]
+        # 先按显示精度（整数%）四舍五入再归一化，避免"显示胜率相同、真实胜率不同"导致同胜率马赔率不同
+        rates = [round(r, 2) for r in rates]
+        total = sum(rates)
         self.rates = [value / total for value in rates]
         # 用胜率抽样每匹对象的精确完赛时间：长期获胜概率更接近显示胜率，仍保留随机爆冷。
         self.finish_durations = {}
@@ -1211,6 +1210,16 @@ class HorseRace:
         for a, b in zip(order, order[1:]):
             if raw[a] < raw[b]:
                 raw[b] = raw[a]
+        # 同显示胜率（整数%）的馬，赔率必须完全一致，避免"胜率一样赔率却不同"的困惑。
+        # 取组内最低赔率统一，不抬高任一匹，保证庄家不被过度赔付。
+        groups = {}
+        for i in range(HORSE_COUNT):
+            groups.setdefault(round(self.rates[i] * 100), []).append(i)
+        for grp in groups.values():
+            if len(grp) > 1:
+                lo = min(raw[i] for i in grp)
+                for i in grp:
+                    raw[i] = lo
         return [max(1.05, v) for v in raw]
 
     async def bet(self, uid, horse, amount):
@@ -2635,7 +2644,6 @@ async def start_season(cid, name="", forced=False):
         season_points[cid][uid] = SEASON_START_CHIPS
         season_games[cid][uid] = 0
         season_rebuy[cid][uid] = 0
-    season_eliminated[cid] = set()
     season_profit_by_date.pop(cid, None)
     save_data()
     return True, None
@@ -2686,7 +2694,7 @@ async def season_settle(app, manual=False):
     season_name = ""
     season_start_ts = 0
     season_end_ts = 0
-    season_points.clear(); season_games.clear(); season_joined.clear(); season_rebuy.clear(); season_eliminated.clear(); season_profit_by_date.clear()
+    season_points.clear(); season_games.clear(); season_joined.clear(); season_rebuy.clear(); season_profit_by_date.clear()
     season_lobby_msg.clear()  # 大厅看板为 UI 态，结算后清空，下赛季重新发
     save_data()
 
@@ -2940,7 +2948,7 @@ async def cmd_season_help(update, context):
         "• /排位开赛 [赛季名] — 强制开赛（可自定义名，如 /排位开赛 赌神大战秋季赛）\n"
         "• /排位结束 — 提前结算并推最终榜\n\n"
         "<b>自动机制</b>\n"
-        "• 每日 23:00 自动推一次排位榜\n"
+        "• 每日 23:50 自动推一次排位榜\n"
         "• 开赛后第 7 天（到点后的首个午夜）自动结算，可能晚最多约 24 小时\n\n"
         "📌 满 20 人开赛；起始 20000 分；输光可应急补分 3×2000；满 5 局才上榜；次日 0 点重置为 20000 分可继续打。\n"
         "💡 以上「排位」命令均可换「赛季」前缀，含义完全相同，如 /赛季榜 /赛季报名 /赛季开赛 /赛季结束。\n"
@@ -3144,7 +3152,8 @@ async def cmd_add(update, context):
     cid = update.effective_chat.id
     if player_is_busy(cid, uid):
         await update.message.reply_text("该玩家正在游戏中，无法修改积分。"); return
-    game_chips[cid][uid] += amount; save_data()
+    async with wallet_locks[uid]:
+        game_chips[cid][uid] += amount; save_data()
     await update.message.reply_text(f"✅ 已增加 {await get_name(context.application, uid)} {amount} 积分。")
 
 
@@ -3161,9 +3170,10 @@ async def cmd_adddz(update, context):
     cid = update.effective_chat.id
     if player_is_busy(cid, uid):
         await update.message.reply_text("该玩家正在游戏中，无法修改积分。"); return
-    if amount < 0 and texas_chips[cid][uid] < -amount:
-        await update.message.reply_text("❌ 该玩家德州积分不足。"); return
-    texas_chips[cid][uid] += amount; save_data()
+    async with wallet_locks[uid]:
+        if amount < 0 and texas_chips[cid][uid] < -amount:
+            await update.message.reply_text("❌ 该玩家德州积分不足。"); return
+        texas_chips[cid][uid] += amount; save_data()
     verb = "添加" if amount > 0 else "扣除"
     await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)} {verb} {abs(amount)} 德州积分，当前 {texas_chips[cid][uid]}。")
 
@@ -3180,9 +3190,10 @@ async def cmd_reduce(update, context):
     cid = update.effective_chat.id
     if player_is_busy(cid, uid):
         await update.message.reply_text("该玩家正在游戏中，无法修改积分。"); return
-    if game_chips[cid][uid] < amount:
-        await update.message.reply_text("❌ 玩家积分不足。"); return
-    game_chips[cid][uid] -= amount; save_data()
+    async with wallet_locks[uid]:
+        if game_chips[cid][uid] < amount:
+            await update.message.reply_text("❌ 玩家积分不足。"); return
+        game_chips[cid][uid] -= amount; save_data()
     await update.message.reply_text(f"✅ 已扣除 {await get_name(context.application, uid)} {amount} 积分。")
 
 
@@ -3763,7 +3774,7 @@ async def daily_reset_scheduler(app):
 
 async def leaderboard_scheduler(app):
     while True:
-        now = now_bj(); target = now.replace(hour=23, minute=0, second=0, microsecond=0)
+        now = now_bj(); target = now.replace(hour=23, minute=50, second=0, microsecond=0)
         if target <= now: target += timedelta(days=1)
         await asyncio.sleep((target-now).total_seconds())
         # 只推送并清空德州当日榜；其他游戏榜保留累计（总数）
