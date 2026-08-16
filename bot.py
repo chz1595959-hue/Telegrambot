@@ -437,6 +437,13 @@ def title_prefix(uid):
     ts = user_titles.get(uid)
     if not ts:
         return ""
+    # 过滤已过期的限时称号（避免 daily_reset 清理前仍显示过期称号）
+    _exp = title_expiry.get(uid)
+    if _exp:
+        _now = int(now_bj().timestamp())
+        ts = {t for t in ts if t not in _exp or _exp[t] > _now}
+    if not ts:
+        return ""
     equipped = title_equipped.get(uid)
     if equipped and equipped in ts:
         return f"{equipped} "
@@ -3047,7 +3054,7 @@ async def cmd_shop(update, context):
         dur = "永久" if cfg["duration"] is None else f"{cfg['duration'] // 86400}天"
         lines.append(f"• <b>{html.escape(t)}</b>：{cfg['price']} {cur}｜{dur}")
     lines.append("")
-    lines.append("💡 用 /兑换 称号名 购买；称号显示在昵称前（赌神优先）。")
+    lines.append("💡 用 /兑换 称号名 购买；/我的称号 查看，/佩戴 切换亮出的称号。")
     await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
 
 
@@ -3107,8 +3114,11 @@ async def cmd_my_titles(update, context):
             cfg = SHOP_TITLES.get(t, {})
             if cfg.get("duration") is not None:
                 exp = title_expiry.get(uid, {}).get(t, 0)
-                remain = max(1, (exp - now + 86399) // 86400)
-                lines.append(f"• {html.escape(t)}（剩余约 {remain} 天）{mark}")
+                if exp <= now:
+                    lines.append(f"• {html.escape(t)}（已过期，待清理）{mark}")
+                else:
+                    remain = max(1, (exp - now + 86399) // 86400)
+                    lines.append(f"• {html.escape(t)}（剩余约 {remain} 天）{mark}")
             else:
                 lines.append(f"• {html.escape(t)}（永久）{mark}")
     lines.append("")
