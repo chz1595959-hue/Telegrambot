@@ -2245,192 +2245,21 @@ async def cmd_sb(update, context):
     await start_sicbo_timer(game, context.application)
 
 
-# ==================== 足球射门（sendDice ⚽） ====================
-FOOTBALL_FIXED_BET = 500
-FOOTBALL_BET_NAMES = {"goal": "⚽进球", "miss": "🧤没进"}
-FOOTBALL_PAYOUT_NUM = {"goal": 7, "miss": 10}  # 赔率分母 5：goal=7/5=1.4倍，miss=10/5=2.0倍
-
-
-class FootballGame:
-    def __init__(self, cid, owner_id, mode=None):
-        self.chat_id, self.owner_id, self.mode = cid, owner_id, mode or current_game_mode()
-        self.phase = "betting"
-        self.settled = False
-        self.bets = {}      # {uid: {bet_type: amount}}
-        self.amounts = {}   # {uid: selected_amount}
-        self.last_amount = FOOTBALL_FIXED_BET
-        self.game_msg_id = None
-        self.create_time = time.time()
-        self.timer_task = None
-
-    def place_bet(self, uid, bet_type, amount):
-        if uid not in self.bets:
-            self.bets[uid] = {}
-        self.bets[uid][bet_type] = self.bets[uid].get(bet_type, 0) + amount
-        pending_game_bets[self.chat_id][uid]["football"] = {
-            "amount": sum(self.bets[uid].values()),
-            "mode": self.mode,
-        }
-
-    def get_amount(self, uid):
-        return self.amounts.get(uid, FOOTBALL_FIXED_BET)
-
-    def cancel_timer(self):
-        if self.timer_task and not self.timer_task.done():
-            self.timer_task.cancel()
-            self.timer_task = None
-
-
-async def build_football_bet_board(game, app):
-    remain = max(0, int(ROOM_WAIT_TIMEOUT - (time.time() - game.create_time)))
-    pool_total = sum(sum(b.values()) for b in game.bets.values())
-    text = [
-        "⚽ <b>足球射门</b>",
-        "━━━━━━━━━━━━━━━━━",
-        f"💰 <b>奖池</b>：{pool_total} 积分  |  💡 当前下注：{game.last_amount}",
-    ]
-    if game.bets:
-        text.append("📋 <b>实时下注</b>")
-        for uid, b in game.bets.items():
-            name = await get_name(app, uid)
-            parts = [f"{FOOTBALL_BET_NAMES.get(bt, bt)}×{amt}" for bt, amt in b.items()]
-            text.append(f"👤 {name} | {' '.join(parts)}")
-        text.append("")
-    text.append(f"⏰ <b>将在 {remain} 秒后自动开球，无人下注将取消</b>")
-    text.append("🔒 选金额 → 点进球/没进下注 → 等开球")
-    text.append("💡 进球(值1-3) 1.4倍 ｜ 没进(值4-5) 2.0倍")
-    kb = [
-        [InlineKeyboardButton(f"💰{a}" if a < 1000 else f"💰{a // 1000}K", callback_data=f"fb_amt_{a}") for a in (500, 1000, 2000, 5000)],
-        [InlineKeyboardButton("⚽ 进球 (1.4倍)", callback_data="fb_bet_goal"), InlineKeyboardButton("🧤 没进 (2.0倍)", callback_data="fb_bet_miss")],
-        [InlineKeyboardButton("🎮 开始游戏", callback_data="fb_start"), InlineKeyboardButton("❌ 终止", callback_data="fb_end")],
-    ]
-    return "\n".join(text), InlineKeyboardMarkup(kb)
-
-
-async def update_football_ui(game, app):
-    if game.phase != "betting": return
-    text, kb = await build_football_bet_board(game, app)
-    if game.game_msg_id:
-        await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=kb, parse_mode="HTML")
-    else:
-        msg = await safe_send(app.bot, game.chat_id, text, reply_markup=kb, parse_mode="HTML")
-        if msg: game.game_msg_id = msg.message_id
-
-
-async def settle_football(game, app):
-    # 重入保护：手动开球与 60 秒定时器可能同时触发，只派一次彩
-    if getattr(game, "settled", False):
-        return
-    game.settled = True
-    await safe_edit(app.bot, game.chat_id, game.game_msg_id, "⚽ <b>足球射门</b>\n━━━━━━━━━━━━━━━━━\n⚽ <b>正在开球...</b>", reply_markup=None, parse_mode="HTML")
-    # 发官方足球动画（Telegram 官方动画 + 官方随机，无法控球）
-    try:
-        dmsg = await app.bot.send_dice(game.chat_id, emoji="⚽")
-        value = dmsg.dice.value  # 1-5
-    except Exception:
-        logger.exception("send_dice 失败，回退本地随机")
-        value = random.randint(1, 5)
-    # 等动画播完再出结果（send_dice 的 value 在动画播放前就返回了）
-    await asyncio.sleep(3.5)
-    is_goal = value <= 3
-    result = "goal" if is_goal else "miss"
-
-    result_display = "⚽ 进球" if is_goal else "🧤 没进"
-    text = f"⚽ <b>足球射门 结算</b>\n\n结果：<b>{result_display}</b>（值 {value}）\n━━━━━━━━━━━━━━━━━\n"
-
-    date = business_date()
-    bet_uids = list(game.bets.keys())
-    name_map = {}
-    for uid in bet_uids:
-        try: name_map[uid] = await get_name(app, uid)
-        except Exception: name_map[uid] = f"玩家{uid}"
-    # 阶段一：先算派彩（不动钱包）
-    payout_list = []
-    for uid, bets in game.bets.items():
-        win_amount = 0
-        total_bet = sum(bets.values())
-        for bet_type, bet_amt in bets.items():
-            if bet_type == "goal" and result == "goal":
-                win_amount += bet_amt * FOOTBALL_PAYOUT_NUM["goal"] // 5
-            elif bet_type == "miss" and result == "miss":
-                win_amount += bet_amt * FOOTBALL_PAYOUT_NUM["miss"] // 5
-        net = win_amount - total_bet
-        payout_list.append((uid, win_amount, net, total_bet))
-    # 阶段二：应用派彩（先算后付）
-    wallet = game_chips
-    lines = []
-    payouts_applied = False
-    try:
-        for uid, win_amount, net, total_bet in payout_list:
-            wallet[game.chat_id][uid] += win_amount
-            if game.mode == "official": football_profit_by_date[date][game.chat_id][uid] += net
-            if net != 0: lines.append(f"👤 {name_map[uid]}\n盈亏：{net:+d}")
-            pending_game_bets[game.chat_id].get(uid, {}).pop("football", None)
-        payouts_applied = True
-        save_data(); await asyncio.to_thread(force_save_now)
-        text += "\n\n".join(lines) if lines else "本局无人下注，已取消。"
-        if game.mode == "official":
-            rank = sorted(total_profit_by_game(football_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
-            text += "\n\n🏆 <b>足球 累计盈利榜</b>\n"
-            text += "\n".join([f"{rank_marker(i)} {name_map.get(u, f'玩家{u}')}：{a:+d}" for i, (u, a) in enumerate(rank, 1)])
-        sent = await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
-        if sent is None:
-            await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=None, parse_mode="HTML")
-        else:
-            await safe_delete(app.bot, game.chat_id, game.game_msg_id)
-        if game.mode == "official":
-            for uid in game.bets.keys(): await emergency_if_needed(game.chat_id, uid, app)
-    except Exception:
-        logger.exception("足球结算异常，群 %s", game.chat_id)
-        if payouts_applied:
-            await safe_send(app.bot, game.chat_id, "⚠️ 足球派彩已完成，但结算展示异常，积分不受影响。")
-        else:
-            await safe_send(app.bot, game.chat_id, "⚠️ 足球结算异常，本局将退款以保护玩家积分。")
-            for uid, bets in game.bets.items(): wallet[game.chat_id][uid] += sum(bets.values())
-    finally:
-        active_football_games.pop(game.chat_id, None)
-        save_data()
-
-
-async def start_football_timer(game, app):
-    game.cancel_timer()
-    async def countdown():
-        start_ts = time.time()
-        while True:
-            await asyncio.sleep(1)
-            if time.time() - start_ts >= ROOM_WAIT_TIMEOUT: break
-            if int(time.time() - start_ts) % 10 == 0 and int(time.time() - start_ts) > 0:
-                if game.phase == "betting" and active_football_games.get(game.chat_id) is game:
-                    await update_football_ui(game, app)
-        if game.phase == "betting" and active_football_games.get(game.chat_id) is game:
-            await settle_football(game, app)
-    game.timer_task = asyncio.create_task(countdown())
-
-
-async def cmd_football(update, context):
-    if not await need_auth(update): return
-    if not await require_group_chat(update, "足球射门", "football"): return
-    cid, uid = update.effective_chat.id, update.effective_user.id
-    if cid in active_football_games:
-        g = active_football_games[cid]
-        if g.phase == "betting":
-            text, kb = await build_football_bet_board(g, context.application)
-            msg = await safe_send(context.bot, cid, text, reply_markup=kb, parse_mode="HTML")
-            if msg: g.game_msg_id = msg.message_id
-        else:
-            await update.message.reply_text("当前已有 足球射门 进行中。")
-        return
-    game = FootballGame(cid, uid, current_game_mode())
-    active_football_games[cid] = game
-    await update_football_ui(game, context.application)
-    await start_football_timer(game, context.application)
-
-
-# ==================== 通用 sendDice 游戏（篮球/飞镖/保龄球） ====================
+# ==================== 通用 sendDice 游戏（足球/篮球/飞镖/保龄球） ====================
 SENDDICE_FIXED_BET = 500
 
 # 配置：每个游戏一个条目。bets 每项为 (key, 按钮标签, 赢的value集合, 赔率分子, 赔率分母)
 SENDDICE_GAMES = {
+    "football": {
+        "title": "⚽ 足球射门",
+        "emoji": "⚽",
+        "settle_hint": "正在开球...",
+        "value_desc": {1: "⚽进球", 2: "⚽进球", 3: "⚽进球", 4: "🧤没进", 5: "🧤没进"},
+        "bets": [
+            ("goal", "⚽ 进球 (1.4倍)", [1, 2, 3], 7, 5),
+            ("miss", "🧤 没进 (2.0倍)", [4, 5], 10, 5),
+        ],
+    },
     "basketball": {
         "title": "🏀 篮球投篮",
         "emoji": "🏀",
@@ -2464,9 +2293,9 @@ SENDDICE_GAMES = {
 active_basketball_games = {}
 active_darts_games = {}
 active_bowling_games = {}
-SENDDICE_ACTIVE = {"basketball": active_basketball_games, "darts": active_darts_games, "bowling": active_bowling_games}
+SENDDICE_ACTIVE = {"football": active_football_games, "basketball": active_basketball_games, "darts": active_darts_games, "bowling": active_bowling_games}
 
-SENDDICE_PROFIT = {"basketball": basketball_profit_by_date, "darts": darts_profit_by_date, "bowling": bowling_profit_by_date}
+SENDDICE_PROFIT = {"football": football_profit_by_date, "basketball": basketball_profit_by_date, "darts": darts_profit_by_date, "bowling": bowling_profit_by_date}
 
 
 class SendDiceGame:
@@ -2583,7 +2412,8 @@ async def settle_senddice(game, app):
             pending_game_bets[game.chat_id].get(uid, {}).pop(game.game_type, None)
         payouts_applied = True
         save_data(); await asyncio.to_thread(force_save_now)
-        text = f"{cfg['title']} 结算\n\n结果值：<b>{value}</b>\n━━━━━━━━━━━━━━━━━\n"
+        desc = cfg.get("value_desc", {}).get(value, f"值 {value}")
+        text = f"{cfg['title']} 结算\n\n结果：<b>{desc}</b>\n━━━━━━━━━━━━━━━━━\n"
         text += "\n\n".join(lines) if lines else "本局无人下注，已取消。"
         if game.mode == "official":
             rank = sorted(total_profit_by_game(profit_dict, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
@@ -2654,6 +2484,10 @@ async def cmd_darts(update, context):
 
 async def cmd_bowling(update, context):
     await cmd_senddice(update, context, "bowling")
+
+
+async def cmd_football(update, context):
+    await cmd_senddice(update, context, "football")
 
 
 # ==================== 牛牛 PVP ====================
@@ -3713,10 +3547,9 @@ async def cmd_end(update, context):
     bjl = active_baccarat_games.get(cid)
     sb_game = active_sicbo_games.get(cid)
     nn_game = active_niuniu_games.get(cid)
-    fb_game = active_football_games.get(cid)
-    sd_games = [SENDDICE_ACTIVE[gt].get(cid) for gt in ("basketball", "darts", "bowling")]
+    sd_games = [SENDDICE_ACTIVE[gt].get(cid) for gt in ("football", "basketball", "darts", "bowling")]
 
-    if not any([poker, race, bj, bjl, sb_game, nn_game, fb_game] + sd_games):
+    if not any([poker, race, bj, bjl, sb_game, nn_game] + sd_games):
         await update.message.reply_text("当前没有进行中的游戏。"); return
 
     notices = []
@@ -3779,18 +3612,7 @@ async def cmd_end(update, context):
             await safe_edit(context.bot, cid, nn_game.game_msg_id, "🛑 牛牛已终止。", reply_markup=None)
             notices.append("牛牛已终止")
 
-    if fb_game and (target_all or arg in ["football", "fb", "足球"]):
-        if is_bot_admin(uid) or uid in fb_game.bets or uid == fb_game.owner_id:
-            fb_game.cancel_timer()
-            wallet = game_chips
-            for p_uid, b_dict in fb_game.bets.items():
-                wallet[cid][p_uid] += sum(b_dict.values())
-                pending_game_bets[cid].get(p_uid, {}).pop("football", None)  # 清退款记录，避免重启后二次退款
-            active_football_games.pop(cid, None)
-            await safe_edit(context.bot, cid, fb_game.game_msg_id, "🛑 足球射门已终止，积分已退回。", reply_markup=None)
-            notices.append("足球已退款")
-
-    for gt, gt_cn in (("basketball", "篮球"), ("darts", "飞镖"), ("bowling", "保龄球")):
+    for gt, gt_cn in (("football", "足球"), ("basketball", "篮球"), ("darts", "飞镖"), ("bowling", "保龄球")):
         sdg = SENDDICE_ACTIVE[gt].get(cid)
         if sdg and (target_all or arg in [gt, gt_cn]):
             if is_bot_admin(uid) or uid in sdg.bets or uid == sdg.owner_id:
@@ -3827,10 +3649,7 @@ def player_is_busy(cid, uid):
     niuniu = active_niuniu_games.get(cid)
     if niuniu and niuniu.phase != "waiting" and uid in niuniu.players:
         return True
-    football = active_football_games.get(cid)
-    if football and football.phase == "betting" and uid in football.bets:
-        return True
-    for gt in ("basketball", "darts", "bowling"):
+    for gt in ("football", "basketball", "darts", "bowling"):
         sdg = SENDDICE_ACTIVE[gt].get(cid)
         if sdg and sdg.phase == "betting" and uid in sdg.bets:
             return True
@@ -4285,40 +4104,7 @@ async def on_button(update, context):
                 await safe_edit(context.bot, cid, game.game_msg_id, "🛑 骰子已手动终止，积分已退回。", reply_markup=None)
             return
 
-        # --- 足球射门 回调 ---
-        if data.startswith("fb_"):
-            game = active_football_games.get(cid)
-            if not game: await q.answer("游戏已结束", show_alert=True); return
-            if data.startswith("fb_amt_"):
-                amt = int(data.split("_")[2])
-                game.amounts[uid] = amt; game.last_amount = amt
-                await q.answer(f"已切换到 {amt} 积分")
-                await update_football_ui(game, context.application)
-            elif data.startswith("fb_bet_"):
-                bet_type = data.split("_")[2]; amt = game.get_amount(uid)
-                if game.phase != "betting": await q.answer("已开球，无法下注", show_alert=True); return
-                async with wallet_locks[uid]:
-                    if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
-                    game_chips[cid][uid] -= amt
-                game.place_bet(uid, bet_type, amt)
-                await q.answer(f"✅ 押 {FOOTBALL_BET_NAMES.get(bet_type, bet_type)} ({amt}积分)")
-                await update_football_ui(game, context.application)
-            elif data == "fb_start":
-                # 开始游戏：仅已下注的参与者可提前开球
-                if uid not in game.bets: await q.answer("仅已下注的参与者可开始", show_alert=True); return
-                await q.answer("⚽ 正在开球...")
-                game.cancel_timer(); await settle_football(game, context.application)
-            elif data == "fb_end":
-                if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
-                game.cancel_timer()
-                for p_uid, b_dict in game.bets.items():
-                    game_chips[cid][p_uid] += sum(b_dict.values())
-                    pending_game_bets[cid].get(p_uid, {}).pop("football", None)  # 清退款记录，避免重启后二次退款
-                active_football_games.pop(cid, None)
-                await safe_edit(context.bot, cid, game.game_msg_id, "🛑 足球射门已手动终止，积分已退回。", reply_markup=None)
-            return
-
-        # --- 通用 sendDice 回调（篮球/飞镖/保龄球） ---
+        # --- 通用 sendDice 回调（足球/篮球/飞镖/保龄球） ---
         if data.startswith("sd_"):
             parts = data.split("_")
             if len(parts) < 3: await q.answer("无效操作", show_alert=True); return
@@ -4570,35 +4356,17 @@ async def on_text(update, context):
             await update_baccarat_ui(baccarat, context.application)
             return
 
-        # 足球射门文字下注
-        football = active_football_games.get(cid)
-        fb_match = re.fullmatch(r"(?:押|下|买)?(进球|没进)\s*(\d+)", text)
-        if fb_match and football:
-            if football.phase != "betting":
-                await message.reply_text("❌ 足球射门当前不在下注阶段。"); return
-            bet_map = {"进球": "goal", "没进": "miss"}
-            bet_cn = fb_match.group(1); bet_type = bet_map[bet_cn]
-            amount = int(fb_match.group(2))
-            wallet = game_chips
-            async with wallet_locks[user.id]:
-                if wallet[cid][user.id] < amount:
-                    await message.reply_text(f"❌ 积分不足，你只有 {wallet[cid][user.id]}。"); return
-                wallet[cid][user.id] -= amount
-            football.place_bet(user.id, bet_type, amount)
-            await action_notice(cid, context.application, user.id, f"在足球射门押注了 {bet_cn} {amount}")
-            await update_football_ui(football, context.application)
-            return
-
-        # 篮球/飞镖/保龄球 文字下注
-        sd_text_match = re.fullmatch(r"(篮球|飞镖|保龄球)\s*(投进|没进|靶心|大|小|全中|没全中)\s*(\d+)", text)
+        # 足球/篮球/飞镖/保龄球 文字下注
+        sd_text_match = re.fullmatch(r"(足球|篮球|飞镖|保龄球)\s*(进球|没进|投进|靶心|大|小|全中|没全中)\s*(\d+)", text)
         if sd_text_match:
             game_cn = sd_text_match.group(1)
             opt_cn = sd_text_match.group(2)
             amount = int(sd_text_match.group(3))
-            game_type = {"篮球": "basketball", "飞镖": "darts", "保龄球": "bowling"}.get(game_cn)
+            game_type = {"足球": "football", "篮球": "basketball", "飞镖": "darts", "保龄球": "bowling"}.get(game_cn)
             if game_type:
                 game = SENDDICE_ACTIVE[game_type].get(cid)
                 opt_map = {
+                    "football": {"进球": "goal", "没进": "miss"},
                     "basketball": {"投进": "in", "没进": "out"},
                     "darts": {"靶心": "bull", "大": "big", "小": "small"},
                     "bowling": {"全中": "strike", "没全中": "miss"},
