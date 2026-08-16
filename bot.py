@@ -107,6 +107,9 @@ slot_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 sicbo_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 niuniu_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 football_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+basketball_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+darts_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
+bowling_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))
 sicbo_history = defaultdict(list)  # 骰子路书：大🔴 小🔵 单🟡 双🟢 豹子⚫
 sicbo_daily_stats = defaultdict(lambda: {"big": 0, "small": 0, "triple": 0})
 race_jackpot = defaultdict(int)
@@ -254,6 +257,9 @@ def force_save_now():
                 "sicbo_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in sicbo_profit_by_date.items()},
                 "niuniu_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in niuniu_profit_by_date.items()},
                 "football_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in football_profit_by_date.items()},
+                "basketball_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in basketball_profit_by_date.items()},
+                "darts_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in darts_profit_by_date.items()},
+                "bowling_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in bowling_profit_by_date.items()},
                 "sicbo_history": {str(cid): value[-12:] for cid, value in sicbo_history.items()},
                 "sicbo_daily_stats": {str(cid): dict(value) for cid, value in sicbo_daily_stats.items()},
                 "authorized_groups": list(AUTHORIZED_GROUPS),
@@ -345,6 +351,9 @@ def load_data():
         for date, chats in data.get("sicbo_profit_by_date", {}).items(): restore_nested(sicbo_profit_by_date[date], chats)
         for date, chats in data.get("niuniu_profit_by_date", {}).items(): restore_nested(niuniu_profit_by_date[date], chats)
         for date, chats in data.get("football_profit_by_date", {}).items(): restore_nested(football_profit_by_date[date], chats)
+        for date, chats in data.get("basketball_profit_by_date", {}).items(): restore_nested(basketball_profit_by_date[date], chats)
+        for date, chats in data.get("darts_profit_by_date", {}).items(): restore_nested(darts_profit_by_date[date], chats)
+        for date, chats in data.get("bowling_profit_by_date", {}).items(): restore_nested(bowling_profit_by_date[date], chats)
         # 德州排位赛状态恢复
         season_active = data.get("season_active", False)
         season_id = data.get("season_id")
@@ -417,6 +426,7 @@ def archive_old_profit_data(keep_days=90):
     for profit_dict in (race_profit_by_date, blackjack_profit_by_date,
                         baccarat_profit_by_date, slot_profit_by_date,
                         sicbo_profit_by_date, niuniu_profit_by_date, football_profit_by_date,
+                        basketball_profit_by_date, darts_profit_by_date, bowling_profit_by_date,
                         season_profit_by_date):
         old_dates = [d for d in list(profit_dict.keys()) if d != "_archive" and d < cutoff]
         if not old_dates:
@@ -2118,6 +2128,8 @@ async def settle_sicbo(game, app):
     except Exception:
         logger.exception("send_dice 失败，回退本地随机")
         dice, total, is_triple = game.play()
+    # 等动画播完再出结果（send_dice 的 value 在动画播放前就返回了）
+    await asyncio.sleep(3.5)
     if is_triple:
         result = "triple"
     elif 11 <= total <= 17:
@@ -2318,6 +2330,8 @@ async def settle_football(game, app):
     except Exception:
         logger.exception("send_dice 失败，回退本地随机")
         value = random.randint(1, 5)
+    # 等动画播完再出结果（send_dice 的 value 在动画播放前就返回了）
+    await asyncio.sleep(3.5)
     is_goal = value <= 3
     result = "goal" if is_goal else "miss"
 
@@ -2408,6 +2422,234 @@ async def cmd_football(update, context):
     active_football_games[cid] = game
     await update_football_ui(game, context.application)
     await start_football_timer(game, context.application)
+
+
+# ==================== 通用 sendDice 游戏（篮球/飞镖/保龄球） ====================
+SENDDICE_FIXED_BET = 500
+
+# 配置：每个游戏一个条目。bets 每项为 (key, 按钮标签, 赢的value集合, 赔率分子, 赔率分母)
+SENDDICE_GAMES = {
+    "basketball": {
+        "title": "🏀 篮球投篮",
+        "emoji": "🏀",
+        "settle_hint": "正在投篮...",
+        "bets": [
+            ("in", "🏀 投进 (1.15倍)", [1, 2, 3, 4], 23, 20),
+            ("out", "🧱 没进 (3.6倍)", [5], 18, 5),
+        ],
+    },
+    "darts": {
+        "title": "🎯 飞镖",
+        "emoji": "🎯",
+        "settle_hint": "正在投镖...",
+        "bets": [
+            ("bull", "🎯 靶心 (5.5倍)", [6], 11, 2),
+            ("big", "🔴 大4-6 (1.8倍)", [4, 5, 6], 9, 5),
+            ("small", "🔵 小1-3 (1.8倍)", [1, 2, 3], 9, 5),
+        ],
+    },
+    "bowling": {
+        "title": "🎳 保龄球",
+        "emoji": "🎳",
+        "settle_hint": "正在投球...",
+        "bets": [
+            ("strike", "🎳 全中 (5倍)", [6], 5, 1),
+            ("miss", "🚫 没全中 (1.15倍)", [1, 2, 3, 4, 5], 23, 20),
+        ],
+    },
+}
+
+active_basketball_games = {}
+active_darts_games = {}
+active_bowling_games = {}
+SENDDICE_ACTIVE = {"basketball": active_basketball_games, "darts": active_darts_games, "bowling": active_bowling_games}
+
+SENDDICE_PROFIT = {"basketball": basketball_profit_by_date, "darts": darts_profit_by_date, "bowling": bowling_profit_by_date}
+
+
+class SendDiceGame:
+    def __init__(self, cid, owner_id, game_type, mode=None):
+        self.chat_id, self.owner_id, self.game_type = cid, owner_id, game_type
+        self.mode = mode or current_game_mode()
+        self.cfg = SENDDICE_GAMES[game_type]
+        self.phase = "betting"
+        self.settled = False
+        self.bets = {}
+        self.amounts = {}
+        self.last_amount = SENDDICE_FIXED_BET
+        self.game_msg_id = None
+        self.create_time = time.time()
+        self.timer_task = None
+
+    def place_bet(self, uid, bet_key, amount):
+        if uid not in self.bets:
+            self.bets[uid] = {}
+        self.bets[uid][bet_key] = self.bets[uid].get(bet_key, 0) + amount
+        pending_game_bets[self.chat_id][uid][self.game_type] = {
+            "amount": sum(self.bets[uid].values()),
+            "mode": self.mode,
+        }
+
+    def get_amount(self, uid):
+        return self.amounts.get(uid, SENDDICE_FIXED_BET)
+
+    def cancel_timer(self):
+        if self.timer_task and not self.timer_task.done():
+            self.timer_task.cancel()
+            self.timer_task = None
+
+
+async def build_senddice_board(game, app):
+    cfg = game.cfg
+    remain = max(0, int(ROOM_WAIT_TIMEOUT - (time.time() - game.create_time)))
+    pool_total = sum(sum(b.values()) for b in game.bets.values())
+    text = [
+        f"{cfg['title']}",
+        "━━━━━━━━━━━━━━━━━",
+        f"💰 <b>奖池</b>：{pool_total} 积分  |  💡 当前下注：{game.last_amount}",
+    ]
+    if game.bets:
+        bet_labels = {key: label for key, label, *_ in cfg["bets"]}
+        text.append("📋 <b>实时下注</b>")
+        for uid, b in game.bets.items():
+            name = await get_name(app, uid)
+            parts = [f"{bet_labels.get(bt, bt)}×{amt}" for bt, amt in b.items()]
+            text.append(f"👤 {name} | {' '.join(parts)}")
+        text.append("")
+    text.append(f"⏰ <b>将在 {remain} 秒后自动开奖，无人下注将取消</b>")
+    text.append("🔒 选金额 → 点选项下注 → 等开奖")
+    kb = [
+        [InlineKeyboardButton(f"💰{a}" if a < 1000 else f"💰{a // 1000}K", callback_data=f"sd_amt_{game.game_type}_{a}") for a in (500, 1000, 2000, 5000)],
+        [InlineKeyboardButton(label, callback_data=f"sd_bet_{game.game_type}_{key}") for key, label, *_ in cfg["bets"]],
+        [InlineKeyboardButton("🎮 开始游戏", callback_data=f"sd_start_{game.game_type}"), InlineKeyboardButton("❌ 终止", callback_data=f"sd_end_{game.game_type}")],
+    ]
+    return "\n".join(text), InlineKeyboardMarkup(kb)
+
+
+async def update_senddice_ui(game, app):
+    if game.phase != "betting": return
+    text, kb = await build_senddice_board(game, app)
+    if game.game_msg_id:
+        await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=kb, parse_mode="HTML")
+    else:
+        msg = await safe_send(app.bot, game.chat_id, text, reply_markup=kb, parse_mode="HTML")
+        if msg: game.game_msg_id = msg.message_id
+
+
+async def settle_senddice(game, app):
+    if getattr(game, "settled", False):
+        return
+    game.settled = True
+    cfg = game.cfg
+    await safe_edit(app.bot, game.chat_id, game.game_msg_id, f"{cfg['title']}\n━━━━━━━━━━━━━━━━━\n<b>{cfg['settle_hint']}</b>", reply_markup=None, parse_mode="HTML")
+    # 发官方动画（Telegram 官方动画 + 官方随机，无法控结果）
+    try:
+        dmsg = await app.bot.send_dice(game.chat_id, emoji=cfg["emoji"])
+        value = dmsg.dice.value
+    except Exception:
+        logger.exception("send_dice 失败，回退本地随机")
+        value = random.randint(1, 6)
+    # 等动画播完再出结果（send_dice 的 value 在动画播放前就返回了）
+    await asyncio.sleep(3.5)
+    date = business_date()
+    bet_uids = list(game.bets.keys())
+    name_map = {}
+    for uid in bet_uids:
+        try: name_map[uid] = await get_name(app, uid)
+        except Exception: name_map[uid] = f"玩家{uid}"
+    # 阶段一：先算派彩（不动钱包）
+    payout_list = []
+    for uid, bets in game.bets.items():
+        win_amount = 0
+        total_bet = sum(bets.values())
+        for bet_key, bet_amt in bets.items():
+            for key, _label, win_values, num, den in cfg["bets"]:
+                if key == bet_key and value in win_values:
+                    win_amount += bet_amt * num // den
+        net = win_amount - total_bet
+        payout_list.append((uid, win_amount, net, total_bet))
+    # 阶段二：应用派彩（先算后付）
+    wallet = game_chips
+    lines = []
+    payouts_applied = False
+    profit_dict = SENDDICE_PROFIT[game.game_type]
+    try:
+        for uid, win_amount, net, total_bet in payout_list:
+            wallet[game.chat_id][uid] += win_amount
+            if game.mode == "official": profit_dict[date][game.chat_id][uid] += net
+            if net != 0: lines.append(f"👤 {name_map[uid]}\n盈亏：{net:+d}")
+            pending_game_bets[game.chat_id].get(uid, {}).pop(game.game_type, None)
+        payouts_applied = True
+        save_data(); await asyncio.to_thread(force_save_now)
+        text = f"{cfg['title']} 结算\n\n结果值：<b>{value}</b>\n━━━━━━━━━━━━━━━━━\n"
+        text += "\n\n".join(lines) if lines else "本局无人下注，已取消。"
+        if game.mode == "official":
+            rank = sorted(total_profit_by_game(profit_dict, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
+            text += "\n\n🏆 <b>累计盈利榜</b>\n"
+            text += "\n".join([f"{rank_marker(i)} {name_map.get(u, f'玩家{u}')}：{a:+d}" for i, (u, a) in enumerate(rank, 1)])
+        edited = await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=None, parse_mode="HTML")
+        if edited is None:
+            await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
+        if game.mode == "official":
+            for uid in game.bets.keys(): await emergency_if_needed(game.chat_id, uid, app)
+    except Exception:
+        logger.exception("%s 结算异常，群 %s", game.game_type, game.chat_id)
+        if payouts_applied:
+            await safe_send(app.bot, game.chat_id, "⚠️ 派彩已完成，但结算展示异常，积分不受影响。")
+        else:
+            await safe_send(app.bot, game.chat_id, "⚠️ 结算异常，本局将退款以保护玩家积分。")
+            for uid, bets in game.bets.items(): wallet[game.chat_id][uid] += sum(bets.values())
+    finally:
+        SENDDICE_ACTIVE[game.game_type].pop(game.chat_id, None)
+        save_data()
+
+
+async def start_senddice_timer(game, app):
+    game.cancel_timer()
+    async def countdown():
+        start_ts = time.time()
+        while True:
+            await asyncio.sleep(1)
+            if time.time() - start_ts >= ROOM_WAIT_TIMEOUT: break
+            if int(time.time() - start_ts) % 10 == 0 and int(time.time() - start_ts) > 0:
+                if game.phase == "betting" and SENDDICE_ACTIVE[game.game_type].get(game.chat_id) is game:
+                    await update_senddice_ui(game, app)
+        if game.phase == "betting" and SENDDICE_ACTIVE[game.game_type].get(game.chat_id) is game:
+            await settle_senddice(game, app)
+    game.timer_task = asyncio.create_task(countdown())
+
+
+async def cmd_senddice(update, context, game_type):
+    if not await need_auth(update): return
+    cfg = SENDDICE_GAMES[game_type]
+    if not await require_group_chat(update, cfg["title"], game_type): return
+    cid, uid = update.effective_chat.id, update.effective_user.id
+    active_dict = SENDDICE_ACTIVE[game_type]
+    if cid in active_dict:
+        g = active_dict[cid]
+        if g.phase == "betting":
+            text, kb = await build_senddice_board(g, context.application)
+            msg = await safe_send(context.bot, cid, text, reply_markup=kb, parse_mode="HTML")
+            if msg: g.game_msg_id = msg.message_id
+        else:
+            await update.message.reply_text(f"当前已有 {cfg['title']} 进行中。")
+        return
+    game = SendDiceGame(cid, uid, game_type, current_game_mode())
+    active_dict[cid] = game
+    await update_senddice_ui(game, context.application)
+    await start_senddice_timer(game, context.application)
+
+
+async def cmd_basketball(update, context):
+    await cmd_senddice(update, context, "basketball")
+
+
+async def cmd_darts(update, context):
+    await cmd_senddice(update, context, "darts")
+
+
+async def cmd_bowling(update, context):
+    await cmd_senddice(update, context, "bowling")
 
 
 # ==================== 牛牛 PVP ====================
@@ -3468,8 +3710,9 @@ async def cmd_end(update, context):
     sb_game = active_sicbo_games.get(cid)
     nn_game = active_niuniu_games.get(cid)
     fb_game = active_football_games.get(cid)
+    sd_games = [SENDDICE_ACTIVE[gt].get(cid) for gt in ("basketball", "darts", "bowling")]
 
-    if not any([poker, race, bj, bjl, sb_game, nn_game, fb_game]):
+    if not any([poker, race, bj, bjl, sb_game, nn_game, fb_game] + sd_games):
         await update.message.reply_text("当前没有进行中的游戏。"); return
 
     notices = []
@@ -3543,6 +3786,19 @@ async def cmd_end(update, context):
             await safe_edit(context.bot, cid, fb_game.game_msg_id, "🛑 足球射门已终止，积分已退回。", reply_markup=None)
             notices.append("足球已退款")
 
+    for gt, gt_cn in (("basketball", "篮球"), ("darts", "飞镖"), ("bowling", "保龄球")):
+        sdg = SENDDICE_ACTIVE[gt].get(cid)
+        if sdg and (target_all or arg in [gt, gt_cn]):
+            if is_bot_admin(uid) or uid in sdg.bets or uid == sdg.owner_id:
+                sdg.cancel_timer()
+                wallet = game_chips
+                for p_uid, b_dict in sdg.bets.items():
+                    wallet[cid][p_uid] += sum(b_dict.values())
+                    pending_game_bets[cid].get(p_uid, {}).pop(gt, None)  # 清退款记录，避免重启后二次退款
+                SENDDICE_ACTIVE[gt].pop(cid, None)
+                await safe_edit(context.bot, cid, sdg.game_msg_id, f"🛑 {gt_cn}已终止，积分已退回。", reply_markup=None)
+                notices.append(f"{gt_cn}已退款")
+
     if not notices:
         await update.message.reply_text("❌ 权限不足或未找到匹配的游戏指令。用法示例：/end dz")
     else:
@@ -3570,6 +3826,10 @@ def player_is_busy(cid, uid):
     football = active_football_games.get(cid)
     if football and football.phase == "betting" and uid in football.bets:
         return True
+    for gt in ("basketball", "darts", "bowling"):
+        sdg = SENDDICE_ACTIVE[gt].get(cid)
+        if sdg and sdg.phase == "betting" and uid in sdg.bets:
+            return True
     return False
 
 
@@ -3628,7 +3888,7 @@ async def cmd_cx(update, context):
     date = business_date()
     texas = poker_profit_by_date[date].get(cid, {})
     combined = {}
-    for g in (blackjack_profit_by_date, race_profit_by_date, baccarat_profit_by_date, slot_profit_by_date, sicbo_profit_by_date, niuniu_profit_by_date, football_profit_by_date):
+    for g in (blackjack_profit_by_date, race_profit_by_date, baccarat_profit_by_date, slot_profit_by_date, sicbo_profit_by_date, niuniu_profit_by_date, football_profit_by_date, basketball_profit_by_date, darts_profit_by_date, bowling_profit_by_date):
         for uid, v in total_profit_by_game(g, cid).items():
             combined[uid] = combined.get(uid, 0) + v
     if not texas and not combined:
@@ -3658,7 +3918,7 @@ async def cmd_ph(update, context):
         lines.append(f"{rank_marker(i)} {await get_name(context.application, uid, cid=cid)}：{value}")
     # 累计盈利榜（含老虎机），方便随时核对战绩，不再只能从抽奖结果里看滞后的榜单
     combined = {}
-    for g in (blackjack_profit_by_date, race_profit_by_date, baccarat_profit_by_date, slot_profit_by_date, sicbo_profit_by_date, niuniu_profit_by_date, football_profit_by_date):
+    for g in (blackjack_profit_by_date, race_profit_by_date, baccarat_profit_by_date, slot_profit_by_date, sicbo_profit_by_date, niuniu_profit_by_date, football_profit_by_date, basketball_profit_by_date, darts_profit_by_date, bowling_profit_by_date):
         for u, v in total_profit_by_game(g, cid).items():
             combined[u] = combined.get(u, 0) + v
     if combined:
@@ -4054,6 +4314,44 @@ async def on_button(update, context):
                 await safe_edit(context.bot, cid, game.game_msg_id, "🛑 足球射门已手动终止，积分已退回。", reply_markup=None)
             return
 
+        # --- 通用 sendDice 回调（篮球/飞镖/保龄球） ---
+        if data.startswith("sd_"):
+            parts = data.split("_")
+            if len(parts) < 3: await q.answer("无效操作", show_alert=True); return
+            action, game_type = parts[1], parts[2]
+            active_dict = SENDDICE_ACTIVE.get(game_type)
+            if not active_dict: await q.answer("游戏类型无效", show_alert=True); return
+            game = active_dict.get(cid)
+            if not game: await q.answer("游戏已结束", show_alert=True); return
+            if action == "amt":
+                amt = int(parts[3])
+                game.amounts[uid] = amt; game.last_amount = amt
+                await q.answer(f"已切换到 {amt} 积分")
+                await update_senddice_ui(game, context.application)
+            elif action == "bet":
+                bet_key = parts[3]
+                amt = game.get_amount(uid)
+                if game.phase != "betting": await q.answer("已开奖，无法下注", show_alert=True); return
+                async with wallet_locks[uid]:
+                    if game_chips[cid][uid] < amt: await q.answer("积分不足", show_alert=True); return
+                    game_chips[cid][uid] -= amt
+                game.place_bet(uid, bet_key, amt)
+                await q.answer(f"✅ 下注成功 ({amt}积分)")
+                await update_senddice_ui(game, context.application)
+            elif action == "start":
+                if uid not in game.bets: await q.answer("仅已下注的参与者可开始", show_alert=True); return
+                await q.answer("正在开奖...")
+                game.cancel_timer(); await settle_senddice(game, context.application)
+            elif action == "end":
+                if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
+                game.cancel_timer()
+                for p_uid, b_dict in game.bets.items():
+                    game_chips[cid][p_uid] += sum(b_dict.values())
+                    pending_game_bets[cid].get(p_uid, {}).pop(game_type, None)
+                active_dict.pop(cid, None)
+                await safe_edit(context.bot, cid, game.game_msg_id, "🛑 游戏已手动终止，积分已退回。", reply_markup=None)
+            return
+
         # --- 牛牛 回调 ---
         if data.startswith("nn_"):
             game = active_niuniu_games.get(cid)
@@ -4286,6 +4584,32 @@ async def on_text(update, context):
             await action_notice(cid, context.application, user.id, f"在足球射门押注了 {bet_cn} {amount}")
             await update_football_ui(football, context.application)
             return
+
+        # 篮球/飞镖/保龄球 文字下注
+        sd_text_match = re.fullmatch(r"(篮球|飞镖|保龄球)\s*(投进|没进|靶心|大|小|全中|没全中)\s*(\d+)", text)
+        if sd_text_match:
+            game_cn = sd_text_match.group(1)
+            opt_cn = sd_text_match.group(2)
+            amount = int(sd_text_match.group(3))
+            game_type = {"篮球": "basketball", "飞镖": "darts", "保龄球": "bowling"}.get(game_cn)
+            if game_type:
+                game = SENDDICE_ACTIVE[game_type].get(cid)
+                opt_map = {
+                    "basketball": {"投进": "in", "没进": "out"},
+                    "darts": {"靶心": "bull", "大": "big", "小": "small"},
+                    "bowling": {"全中": "strike", "没全中": "miss"},
+                }
+                bet_key = opt_map[game_type].get(opt_cn)
+                if game and bet_key and game.phase == "betting":
+                    wallet = game_chips
+                    async with wallet_locks[user.id]:
+                        if wallet[cid][user.id] < amount:
+                            await message.reply_text(f"❌ 积分不足，你只有 {wallet[cid][user.id]}。"); return
+                        wallet[cid][user.id] -= amount
+                    game.place_bet(user.id, bet_key, amount)
+                    await action_notice(cid, context.application, user.id, f"在{game_cn}下注了 {opt_cn} {amount}")
+                    await update_senddice_ui(game, context.application)
+                    return
 
         # 21点文字加入
         blackjack = active_blackjack_games.get(cid)
@@ -4561,6 +4885,9 @@ async def post_init(app):
             BotCommand("sb", "骰子"),
             BotCommand("nn", "牛牛"),
             BotCommand("football", "足球射门"),
+            BotCommand("basketball", "篮球投篮"),
+            BotCommand("darts", "飞镖"),
+            BotCommand("bowling", "保龄球"),
             BotCommand("end", "结束当前游戏"),
             BotCommand("add", "加/减通用积分(正加负减)"),
             BotCommand("adddz", "加/减德州积分(正加负减)"),
@@ -4633,6 +4960,9 @@ CMD_ALIASES = {
     "骰子": cmd_sb,
     "牛牛": cmd_nn,
     "足球": cmd_football, "足球射门": cmd_football, "football": cmd_football,
+    "篮球": cmd_basketball, "篮球投篮": cmd_basketball, "basketball": cmd_basketball,
+    "飞镖": cmd_darts, "darts": cmd_darts,
+    "保龄球": cmd_bowling, "bowling": cmd_bowling,
     "排位": cmd_season_play, "排位赛": cmd_season_play, "赛季": cmd_season_play, "赛季赛": cmd_season_play,
     "排位报名": cmd_season_join, "报名排位": cmd_season_join, "赛季报名": cmd_season_join,
     "排位榜": cmd_season_rank, "赛季榜": cmd_season_rank, "赛季排名": cmd_season_rank,
