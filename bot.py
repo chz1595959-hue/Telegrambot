@@ -261,10 +261,13 @@ async def data_save_worker():
         except asyncio.TimeoutError:
             pass  # 60 秒无触发，走保底保存
         save_event.clear()
-        if data_dirty:
-            # 在单独的线程中执行写盘，不阻塞主循环
-            await asyncio.to_thread(force_save_now)
-            data_dirty = False
+        try:
+            if data_dirty:
+                # 在单独的线程中执行写盘，不阻塞主循环
+                await asyncio.to_thread(force_save_now)
+                data_dirty = False
+        except Exception:
+            logger.exception("data_save_worker 写盘异常（已吞并继续）")
         await asyncio.sleep(3)
 
 
@@ -3830,88 +3833,98 @@ async def daily_reset_scheduler(app):
     while True:
         now = now_bj(); target = (now + timedelta(days=1)).replace(hour=0, minute=0, second=1, microsecond=0)
         await asyncio.sleep((target-now).total_seconds())
-        today = now_bj().strftime("%Y-%m-%d")
-        # 排位赛到点自动结算（end_ts 为开赛+7天的时间戳）
-        if season_active and now_bj().timestamp() >= season_end_ts:
-            await season_settle(app)
-        # 午夜仅清理「刚结束的那一天」德州当日榜；保留 _archive 与其他日期历史，避免清空全部历史盈亏
-        finished_day = (now_bj() - timedelta(days=1)).strftime("%Y-%m-%d")
-        poker_profit_by_date.pop(finished_day, None)
-        # 不重置正在进行正式德州或赛车中的玩家，避免跨日覆盖未结算状态。
-        protected = set()
-        for poker in active_poker_games.values():
-            if poker.phase != "waiting":
-                protected.update((poker.chat_id, uid) for uid in poker.players)
-        # 仅 texas_chips 每日重置；赛车/21点/百家乐用 game_chips（永久不清零），
-        # 故无需把它们的玩家加入保护集（原 race/bj/bjl 分支为无效死代码，已移除）
-        for chat_id, users in texas_chips.items():
-            for uid in users:
-                if (chat_id, uid) not in protected:
-                    users[uid] = STARTING_CHIPS
-        # 排位赛：记录当日盈亏并重置为起始分（每天无论分数多少重置成 2W）
-        if season_active:
-            day_key = (now_bj() - timedelta(days=1)).strftime("%Y-%m-%d")
-            for cid, users in season_points.items():
-                for uid in list(users.keys()):
-                    day_profit = users[uid] - SEASON_START_CHIPS
-                    if day_profit:
-                        season_profit_by_date[day_key][cid][uid] += day_profit
-                    users[uid] = SEASON_START_CHIPS
-            save_data()
-        for cid in race_daily_stats: race_daily_stats[cid] = [0] * HORSE_COUNT
-        for cid in baccarat_daily_stats: baccarat_daily_stats[cid] = {"player": 0, "banker": 0, "tie": 0}
-        archive_old_profit_data()
-        daily_emergency_used.clear(); last_business_date = today; save_data()
+        try:
+            today = now_bj().strftime("%Y-%m-%d")
+            # 排位赛到点自动结算（end_ts 为开赛+7天的时间戳）
+            if season_active and now_bj().timestamp() >= season_end_ts:
+                await season_settle(app)
+            # 午夜仅清理「刚结束的那一天」德州当日榜；保留 _archive 与其他日期历史，避免清空全部历史盈亏
+            finished_day = (now_bj() - timedelta(days=1)).strftime("%Y-%m-%d")
+            poker_profit_by_date.pop(finished_day, None)
+            # 不重置正在进行正式德州或赛车中的玩家，避免跨日覆盖未结算状态。
+            protected = set()
+            for poker in active_poker_games.values():
+                if poker.phase != "waiting":
+                    protected.update((poker.chat_id, uid) for uid in poker.players)
+            # 仅 texas_chips 每日重置；赛车/21点/百家乐用 game_chips（永久不清零），
+            # 故无需把它们的玩家加入保护集（原 race/bj/bjl 分支为无效死代码，已移除）
+            for chat_id, users in texas_chips.items():
+                for uid in users:
+                    if (chat_id, uid) not in protected:
+                        users[uid] = STARTING_CHIPS
+            # 排位赛：记录当日盈亏并重置为起始分（每天无论分数多少重置成 2W）
+            if season_active:
+                day_key = (now_bj() - timedelta(days=1)).strftime("%Y-%m-%d")
+                for cid, users in season_points.items():
+                    for uid in list(users.keys()):
+                        day_profit = users[uid] - SEASON_START_CHIPS
+                        if day_profit:
+                            season_profit_by_date[day_key][cid][uid] += day_profit
+                        users[uid] = SEASON_START_CHIPS
+                save_data()
+            for cid in race_daily_stats: race_daily_stats[cid] = [0] * HORSE_COUNT
+            for cid in baccarat_daily_stats: baccarat_daily_stats[cid] = {"player": 0, "banker": 0, "tie": 0}
+            archive_old_profit_data()
+            daily_emergency_used.clear(); last_business_date = today; save_data()
+        except Exception:
+            logger.exception("daily_reset_scheduler 本轮异常（已吞并继续，下个周期重试）")
 
 async def leaderboard_scheduler(app):
     while True:
         now = now_bj(); target = now.replace(hour=23, minute=50, second=0, microsecond=0)
         if target <= now: target += timedelta(days=1)
         await asyncio.sleep((target-now).total_seconds())
-        # 只推送并清空德州当日榜；其他游戏榜保留累计（总数）
-        date = now_bj().strftime("%Y-%m-%d"); texas_snapshot = poker_profit_by_date.pop(date, {})
-        # 兜底：业务日在 23:50 翻日，23:50-23:59 的下注记录在下一日业务日键下，一并并入当日榜避免丢失
-        date_next = business_date()
-        if date_next != date:
-            for c, ud in poker_profit_by_date.pop(date_next, {}).items():
-                texas_snapshot.setdefault(c, {})
-                for u, a in ud.items():
-                    texas_snapshot[c][u] = texas_snapshot.get(c, {}).get(u, 0) + a
-        for cid, data in texas_snapshot.items():
-            if not data: continue
-            lines = [f"🏆 德州当日排行榜（{date}）", "━"*14]
-            for i, (uid, amount) in enumerate(sorted(data.items(), key=lambda x:x[1], reverse=True)[:50], 1): lines.append(f"{rank_marker(i)} {await get_name(app, uid)}：{amount:+d}")
-            await safe_send_long(app.bot, cid, "\n".join(lines))
-        # 排位赛每日 23:50 推送「当日分数」（每人每天从 2W 起始，当日分即当前分）
-        if season_active:
-            for cid in list(season_points.keys()):
-                users = season_points.get(cid, {})
-                if not users: continue
-                day_standings = sorted(users.items(), key=lambda x: (-x[1], x[0]))
-                lines = [f"🏆 第{season_id}赛季 当日分数（每人起始 {SEASON_START_CHIPS}）", "━" * 18]
-                for i, (u, val) in enumerate(day_standings[:50], 1):
-                    g = season_games[cid].get(u, 0)
-                    tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
-                    lines.append(f"{rank_marker(i)} {await get_name(app, u, cid=cid, with_title=False)}：{val}｜{g}局{tag}")
+        try:
+            # 只推送并清空德州当日榜；其他游戏榜保留累计（总数）
+            date = now_bj().strftime("%Y-%m-%d"); texas_snapshot = poker_profit_by_date.pop(date, {})
+            # 兜底：业务日在 23:50 翻日，23:50-23:59 的下注记录在下一日业务日键下，一并并入当日榜避免丢失
+            date_next = business_date()
+            if date_next != date:
+                for c, ud in poker_profit_by_date.pop(date_next, {}).items():
+                    texas_snapshot.setdefault(c, {})
+                    for u, a in ud.items():
+                        texas_snapshot[c][u] = texas_snapshot.get(c, {}).get(u, 0) + a
+            for cid, data in texas_snapshot.items():
+                if not data: continue
+                lines = [f"🏆 德州当日排行榜（{date}）", "━"*14]
+                for i, (uid, amount) in enumerate(sorted(data.items(), key=lambda x:x[1], reverse=True)[:50], 1): lines.append(f"{rank_marker(i)} {await get_name(app, uid)}：{amount:+d}")
                 await safe_send_long(app.bot, cid, "\n".join(lines))
-        save_data()
+            # 排位赛每日 23:50 推送「当日分数」（每人每天从 2W 起始，当日分即当前分）
+            if season_active:
+                for cid in list(season_points.keys()):
+                    users = season_points.get(cid, {})
+                    if not users: continue
+                    day_standings = sorted(users.items(), key=lambda x: (-x[1], x[0]))
+                    lines = [f"🏆 第{season_id}赛季 当日分数（每人起始 {SEASON_START_CHIPS}）", "━" * 18]
+                    for i, (u, val) in enumerate(day_standings[:50], 1):
+                        g = season_games[cid].get(u, 0)
+                        tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
+                        lines.append(f"{rank_marker(i)} {await get_name(app, u, cid=cid, with_title=False)}：{val}｜{g}局{tag}")
+                    await safe_send_long(app.bot, cid, "\n".join(lines))
+            save_data()
+        except Exception:
+            logger.exception("leaderboard_scheduler 本轮异常（已吞并继续，下个周期重试）")
 
 async def hourly_race_scheduler(app):
     last_key = None
     while True:
-        now = now_bj(); key = now.strftime("%Y%m%d%H")
-        if now.minute == 0 and key != last_key:
-            last_key = key
-            for cid, enabled in list(hourly_race_enabled.items()):
-                if not enabled or cid in active_horse_races: continue
-                mode = current_game_mode()
-                jackpot = race_jackpot.get(cid, 0) if mode == "official" else 0
-                race = HorseRace(cid, ADMIN_USER_ID, jackpot, mode); active_horse_races[cid] = race
-                msg = await safe_send(app.bot, cid, await race.view(app), reply_markup=race.buttons())
-                if msg: race.game_msg_id = msg.message_id
-                race.task = asyncio.create_task(race.run(app)); save_data()
-        next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-        await asyncio.sleep(max(1, (next_minute-now).total_seconds()))
+        try:
+            now = now_bj(); key = now.strftime("%Y%m%d%H")
+            if now.minute == 0 and key != last_key:
+                last_key = key
+                for cid, enabled in list(hourly_race_enabled.items()):
+                    if not enabled or cid in active_horse_races: continue
+                    mode = current_game_mode()
+                    jackpot = race_jackpot.get(cid, 0) if mode == "official" else 0
+                    race = HorseRace(cid, ADMIN_USER_ID, jackpot, mode); active_horse_races[cid] = race
+                    msg = await safe_send(app.bot, cid, await race.view(app), reply_markup=race.buttons())
+                    if msg: race.game_msg_id = msg.message_id
+                    race.task = asyncio.create_task(race.run(app)); save_data()
+            next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+            await asyncio.sleep(max(1, (next_minute-now).total_seconds()))
+        except Exception:
+            logger.exception("hourly_race_scheduler 本轮异常（已吞并继续）")
+            await asyncio.sleep(60)
 
 
 # ---------- 数据备份/恢复 ----------
@@ -3988,7 +4001,29 @@ async def cmd_restore(update, context):
             os.remove(tmp_path)
 
 
+async def refund_pending_bets(app):
+    """启动退款：进程 crash 重启后，把所有残留的未结算下注退还给用户钱包，避免用户下注丢失。"""
+    if not pending_game_bets:
+        return
+    refunded_count = 0
+    for cid, users in list(pending_game_bets.items()):
+        for uid, bets in list(users.items()):
+            total = sum(int(b.get("amount", 0)) for b in bets.values() if isinstance(b, dict))
+            if total > 0:
+                game_chips[cid][uid] += total
+                refunded_count += 1
+                try:
+                    await app.bot.send_message(cid, f"♻️ 系统重启，已自动退还未结算下注 {total} 积分。")
+                except Exception:
+                    pass
+    pending_game_bets.clear()
+    if refunded_count:
+        save_data()
+        logger.info("启动退款完成：已退还 %d 名用户的残留下注", refunded_count)
+
+
 async def post_init(app):
+    await refund_pending_bets(app)
     background_tasks.update({
         asyncio.create_task(daily_reset_scheduler(app)), 
         asyncio.create_task(leaderboard_scheduler(app)), 
