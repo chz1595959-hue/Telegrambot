@@ -137,6 +137,7 @@ champions_history = []         # [{"season_id","uid","name","score","streak"}] �
 TITLE_GAMBLING_GOD = "🎰赌神"
 # ---------- 昵称缓存（持久化）：群里每条消息/回调直接拿 effective_user 真名，避免 get_chat 失败回退成"玩家{uid}" ----------
 user_names = {}                # user_names[uid] = "真名"（原始串，输出时再 html.escape）
+chat_name_cache = {}           # chat_name_cache[cid] = 群名（入站消息自动缓存，授权列表等无需再调 get_chat）
 # 用于老虎机等功能的冷却时间限制。
 user_cooldowns = defaultdict(float)
 # 高性能保存逻辑变量
@@ -392,6 +393,10 @@ def _remember_name(update):
     if not u or u.is_bot: return
     name = u.full_name or (f"@{u.username}" if u.username else None)
     if name: user_names[u.id] = name
+    # 顺带缓存群名：授权列表等场景无需再调 get_chat（避免被异常静默吞掉导致只显示 ID）
+    c = update.effective_chat
+    if c and c.title:
+        chat_name_cache[c.id] = c.title
 
 
 async def get_name(app, uid, with_title=True, cid=None):
@@ -2324,8 +2329,9 @@ async def settle_niuniu(game, app):
     lines = []
     actual_dealer_delta = 0
     robot_budget = 0
-    if dealer_uid < 0:
-        # 机器人庄家：从系统奖池结算，奖池不足则封顶赔付，杜绝凭空发分
+    # 只要有机器人参与（庄家或闲家），就必须从现有系统奖池余额起步结算，
+    # 否则「真人庄家 vs 机器人闲家」时 robot_budget=0 会导致：庄家打赢机器人白赢(+0)、且写回时把原有奖池清零
+    if dealer_uid < 0 or any(u < 0 for u in game.players):
         robot_budget = robot_bank[game.chat_id]
         if robot_budget <= 0:
             robot_budget = NIU_ROBOT_BANK
@@ -3279,14 +3285,16 @@ async def cmd_auth_list(update, context):
         await update.message.reply_text("📋 当前没有任何已授权群组。"); return
     lines = ["📋 <b>已授权群组列表</b>", f"共 {len(AUTHORIZED_GROUPS)} 个：", "━"*14]
     for cid in sorted(AUTHORIZED_GROUPS):
-        title = str(cid)
-        try:
-            chat = await context.bot.get_chat(cid)
-            if getattr(chat, "title", None):
-                title = f"{chat.title}（{cid}）"
-        except Exception:
-            pass
-        lines.append(f"• {title}")
+        title = chat_name_cache.get(cid)
+        if not title:
+            try:
+                chat = await context.bot.get_chat(cid)
+                if getattr(chat, "title", None):
+                    title = chat.title
+                    chat_name_cache[cid] = title
+            except Exception as e:
+                logger.warning("授权列表取群名失败 cid=%s: %s", cid, e)
+        lines.append(f"• {title}（{cid}）" if title else f"• {cid}（群名未知，bot 可能已不在该群）")
     await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines))
 
 async def cmd_ban(update, context):
