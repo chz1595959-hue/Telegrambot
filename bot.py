@@ -3305,8 +3305,14 @@ async def cmd_ban(update, context):
     if not is_bot_admin(update.effective_user.id):
         await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
     target = None
-    if update.message.reply_to_message:
-        target = update.message.reply_to_message.from_user.id
+    replied = update.message.reply_to_message
+    if replied:
+        target = replied.from_user.id
+        # 顺带缓存被回复者的真名，黑名单列表不再显示"玩家{ID}"
+        ru = replied.from_user
+        if not ru.is_bot:
+            nm = ru.full_name or (f"@{ru.username}" if ru.username else None)
+            if nm: user_names[target] = nm
     else:
         try: target = int(context.args[0])
         except (IndexError, ValueError): pass
@@ -3316,6 +3322,14 @@ async def cmd_ban(update, context):
         await update.message.reply_text("⚠️ 不能拉黑管理员。"); return
     if target in BLACKLISTED_USERS:
         await update.message.reply_text("ℹ️ 该用户已在黑名单中。"); return
+    # 用 ID 拉黑且尚无缓存名字时，主动 get_chat 取名缓存（失败则回退"玩家{ID}"）
+    if target not in user_names:
+        try:
+            chat = await context.bot.get_chat(target)
+            nm = getattr(chat, "first_name", None) or getattr(chat, "title", None) or (f"@{chat.username}" if getattr(chat, "username", None) else None)
+            if nm: user_names[target] = nm
+        except Exception:
+            pass
     BLACKLISTED_USERS.add(target); save_data()
     await update.message.reply_text(f"🚫 已拉黑 {await get_name(context.application, target)}（{target}），该用户已被禁止使用机器人。")
 
