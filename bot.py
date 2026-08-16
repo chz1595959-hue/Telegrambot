@@ -2191,12 +2191,12 @@ async def settle_sicbo(game, app):
             rank = sorted(total_profit_by_game(sicbo_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
             text += "\n\n🏆 <b>骰子 累计盈利榜</b>\n"
             text += "\n".join([f"{rank_marker(i)} {name_map.get(u, f'玩家{u}')}：{a:+d}" for i, (u, a) in enumerate(rank, 1)])
-        # 原地编辑为结算结果（不再「删旧消息+发新消息」）：骰子此前唯一用删+重发，
-        # 群里删除/重发任一步失败就会只剩“正在摇骰子”而结果丢失，看着像“不能结算”。
-        # 优先原地编辑；编辑失败（超长/消息过旧等）再降级为发新消息，结果绝不丢失。
-        edited = await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=None, parse_mode="HTML")
-        if edited is None:
-            await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
+        # 结算结果独立发新消息（先发结果保证不丢失，再删下注看板）；发新消息失败才降级为原地编辑
+        sent = await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
+        if sent is None:
+            await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=None, parse_mode="HTML")
+        else:
+            await safe_delete(app.bot, game.chat_id, game.game_msg_id)
         if game.mode == "official":
             for uid in game.bets.keys(): await emergency_if_needed(game.chat_id, uid, app)
     except Exception:
@@ -2373,9 +2373,11 @@ async def settle_football(game, app):
             rank = sorted(total_profit_by_game(football_profit_by_date, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
             text += "\n\n🏆 <b>足球 累计盈利榜</b>\n"
             text += "\n".join([f"{rank_marker(i)} {name_map.get(u, f'玩家{u}')}：{a:+d}" for i, (u, a) in enumerate(rank, 1)])
-        edited = await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=None, parse_mode="HTML")
-        if edited is None:
-            await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
+        sent = await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
+        if sent is None:
+            await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=None, parse_mode="HTML")
+        else:
+            await safe_delete(app.bot, game.chat_id, game.game_msg_id)
         if game.mode == "official":
             for uid in game.bets.keys(): await emergency_if_needed(game.chat_id, uid, app)
     except Exception:
@@ -2587,9 +2589,11 @@ async def settle_senddice(game, app):
             rank = sorted(total_profit_by_game(profit_dict, game.chat_id).items(), key=lambda item: item[1], reverse=True)[:30]
             text += "\n\n🏆 <b>累计盈利榜</b>\n"
             text += "\n".join([f"{rank_marker(i)} {name_map.get(u, f'玩家{u}')}：{a:+d}" for i, (u, a) in enumerate(rank, 1)])
-        edited = await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=None, parse_mode="HTML")
-        if edited is None:
-            await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
+        sent = await safe_send_long(app.bot, game.chat_id, text, parse_mode="HTML")
+        if sent is None:
+            await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=None, parse_mode="HTML")
+        else:
+            await safe_delete(app.bot, game.chat_id, game.game_msg_id)
         if game.mode == "official":
             for uid in game.bets.keys(): await emergency_if_needed(game.chat_id, uid, app)
     except Exception:
