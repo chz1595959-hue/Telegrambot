@@ -2103,8 +2103,17 @@ async def settle_sicbo(game, app):
         return
     game.settled = True
     await safe_edit(app.bot, game.chat_id, game.game_msg_id, "🎲 <b>骰子</b>\n━━━━━━━━━━━━━━━━━\n🎲 <b>正在摇骰子...</b>", reply_markup=None, parse_mode="HTML")
-    await asyncio.sleep(1.5)
-    dice, total, is_triple = game.play()
+    # 发三个官方动画骰子（Telegram 官方动画 + 官方随机，无法控骰）
+    try:
+        dice = []
+        for _ in range(3):
+            dmsg = await app.bot.send_dice(game.chat_id, emoji="🎲")
+            dice.append(dmsg.dice.value)
+        total = sum(dice)
+        is_triple = dice[0] == dice[1] == dice[2]
+    except Exception:
+        logger.exception("send_dice 失败，回退本地随机")
+        dice, total, is_triple = game.play()
     if is_triple:
         result = "triple"
     elif 11 <= total <= 17:
