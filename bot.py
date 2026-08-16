@@ -92,6 +92,7 @@ def total_profit_by_game(game_profit, chat_id):
 texas_chips = defaultdict(lambda: defaultdict(lambda: STARTING_CHIPS))  # 德州专用积分（每日重置 20000）
 game_chips = defaultdict(lambda: defaultdict(lambda: GAME_STARTING_CHIPS))  # 其他游戏通用积分（不重置，初始 5W）
 AUTHORIZED_GROUPS = set()
+BLACKLISTED_USERS = set()  # 被拉黑、禁止使用该机器人的用户（管理员可解封）
 race_history = defaultdict(list)
 baccarat_history = defaultdict(list)
 blackjack_history = defaultdict(list) # 新增 21点历史
@@ -210,6 +211,7 @@ def force_save_now():
                 "sicbo_daily_stats": {str(cid): dict(value) for cid, value in sicbo_daily_stats.items()},
                 "authorized_groups": list(AUTHORIZED_GROUPS),
                 "bot_admins": list(BOT_ADMINS),
+                "blacklist": list(BLACKLISTED_USERS),
                 "race_jackpot": {str(cid): value for cid, value in race_jackpot.items()},
                 "hourly_race_enabled": {str(cid): value for cid, value in hourly_race_enabled.items()},
                 "race_history": {str(cid): value[-10:] for cid, value in race_history.items()},
@@ -318,6 +320,7 @@ def load_data():
         AUTHORIZED_GROUPS.update(int(cid) for cid in data.get("authorized_groups", []))
         BOT_ADMINS.clear(); BOT_ADMINS.update(ADMIN_USER_IDS)
         BOT_ADMINS.update(int(x) for x in data.get("bot_admins", []))
+        BLACKLISTED_USERS.update(int(x) for x in data.get("blacklist", []))
         for cid, value in data.get("race_jackpot", {}).items(): race_jackpot[int(cid)] = int(value)
         for cid, value in data.get("hourly_race_enabled", {}).items(): hourly_race_enabled[int(cid)] = bool(value)
         for cid, value in data.get("race_history", {}).items(): race_history[int(cid)] = list(value)[-10:]
@@ -1488,7 +1491,7 @@ async def require_group_chat(update, game_name, cmd):
 
 async def cmd_start(update, context):
     if not await need_auth(update): return
-    await update.message.reply_text("🎮 欢迎使用娱乐机器人！\n\n🎲 发起游戏：\n/开始 或 /菜单 - 查看本帮助\n/德州 - 发起德州扑克\n/赛车 - 发起赛车\n/老虎机 - 老虎机抽奖\n/21点 - 发起21点\n/百家乐 - 发起百家乐\n/骰子 - 发起骰子\n/牛牛 - 发起牛牛\n\n📊 数据查询：\n/盈亏 - 当日盈亏榜\n/排行 - 总积分榜\n/结束 - 终止当前游戏\n\n🔧 管理命令（仅管理员）：\n/授权 - 授权当前群使用\n/取消授权 - 取消群授权\n/加管理员 - 添加管理员(动态)\n/减管理员 - 移除管理员(动态)\n/加积分 /减积分 /备份 /恢复 …\n\n（旧英文命令 /dz /sc /sb /addadmin … 仍可继续使用）")
+    await update.message.reply_text("🎮 欢迎使用娱乐机器人！\n\n🎲 发起游戏：\n/开始 或 /菜单 - 查看本帮助\n/德州 - 发起德州扑克\n/赛车 - 发起赛车\n/老虎机 - 老虎机抽奖\n/21点 - 发起21点\n/百家乐 - 发起百家乐\n/骰子 - 发起骰子\n/牛牛 - 发起牛牛\n\n📊 数据查询：\n/盈亏 - 当日盈亏榜\n/排行 - 总积分榜\n/结束 - 终止当前游戏\n\n🔧 管理命令（仅管理员）：\n/授权 - 授权当前群使用\n/qxsh - 取消群授权\n/授权列表 - 查看已授权群\n/加管理员 /减管理员 /管理员列表\n/加积分(负数即减) /加德州(负数即减) /赛季分\n/拉黑 /解黑 /黑名单 - 封禁违规玩家\n/备份 /恢复\n💡 加减积分快捷用法：回复玩家消息后发 /add 数量，无需输ID\n\n（旧英文命令 /dz /sc /sb /addadmin … 仍可继续使用）")
 
 # ---------- 21点 / 百家乐 界面与逻辑 ----------
 async def start_bj_turn_timer(game, app):
@@ -3172,15 +3175,18 @@ async def cmd_add(update, context):
     if not await need_auth(update): return
     try:
         uid, amount = await _parse_target_amount(update, context)
-        if amount <= 0: raise ValueError
+        if amount == 0: raise ValueError
     except (ValueError, IndexError):
-        await update.message.reply_text("用法：/add 用户ID 数量，或回复玩家消息后使用 /add 数量"); return
+        await update.message.reply_text("用法：/add 用户ID 数量（正为加，负为减），或回复玩家消息后使用 /add 数量"); return
     cid = update.effective_chat.id
     if player_is_busy(cid, uid):
         await update.message.reply_text("该玩家正在游戏中，无法修改积分。"); return
     async with wallet_locks[uid]:
+        if amount < 0 and game_chips[cid][uid] < -amount:
+            await update.message.reply_text("❌ 玩家积分不足。"); return
         game_chips[cid][uid] += amount; save_data()
-    await update.message.reply_text(f"✅ 已增加 {await get_name(context.application, uid)} {amount} 积分。")
+    verb = "添加" if amount > 0 else "扣除"
+    await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)} {verb} {abs(amount)} 通用积分，当前 {game_chips[cid][uid]}。")
 
 
 
@@ -3202,25 +3208,6 @@ async def cmd_adddz(update, context):
         texas_chips[cid][uid] += amount; save_data()
     verb = "添加" if amount > 0 else "扣除"
     await update.message.reply_text(f"✅ 已给 {await get_name(context.application, uid)} {verb} {abs(amount)} 德州积分，当前 {texas_chips[cid][uid]}。")
-
-
-async def cmd_reduce(update, context):
-    if not is_bot_admin(update.effective_user.id):
-        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
-    if not await need_auth(update): return
-    try:
-        uid, amount = await _parse_target_amount(update, context)
-        if amount <= 0: raise ValueError
-    except (ValueError, IndexError):
-        await update.message.reply_text("用法：/reduce 用户ID 数量，或回复玩家消息后使用 /reduce 数量"); return
-    cid = update.effective_chat.id
-    if player_is_busy(cid, uid):
-        await update.message.reply_text("该玩家正在游戏中，无法修改积分。"); return
-    async with wallet_locks[uid]:
-        if game_chips[cid][uid] < amount:
-            await update.message.reply_text("❌ 玩家积分不足。"); return
-        game_chips[cid][uid] -= amount; save_data()
-    await update.message.reply_text(f"✅ 已扣除 {await get_name(context.application, uid)} {amount} 积分。")
 
 
 async def cmd_cx(update, context):
@@ -3281,8 +3268,73 @@ async def cmd_sq(update, context):
 async def cmd_qxshouquan(update, context):
     if not is_bot_admin(update.effective_user.id): return
     try: cid = int(context.args[0])
-    except (IndexError, ValueError): await update.message.reply_text("用法：/qxshouquan 群ID"); return
+    except (IndexError, ValueError): await update.message.reply_text("用法：/qxsh 群ID"); return
     AUTHORIZED_GROUPS.discard(cid); save_data(); await update.message.reply_text(f"✅ 已取消授权 {cid}")
+
+async def cmd_auth_list(update, context):
+    """管理员查看所有已授权群组（列出群 ID，尽量附带群名）。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    if not AUTHORIZED_GROUPS:
+        await update.message.reply_text("📋 当前没有任何已授权群组。"); return
+    lines = ["📋 <b>已授权群组列表</b>", f"共 {len(AUTHORIZED_GROUPS)} 个：", "━"*14]
+    for cid in sorted(AUTHORIZED_GROUPS):
+        title = str(cid)
+        try:
+            chat = await context.bot.get_chat(cid)
+            if getattr(chat, "title", None):
+                title = f"{chat.title}（{cid}）"
+        except Exception:
+            pass
+        lines.append(f"• {title}")
+    await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines))
+
+async def cmd_ban(update, context):
+    """管理员拉黑玩家（禁止使用机器人）。支持 /拉黑 用户ID 或 回复玩家消息 /拉黑"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    target = None
+    if update.message.reply_to_message:
+        target = update.message.reply_to_message.from_user.id
+    else:
+        try: target = int(context.args[0])
+        except (IndexError, ValueError): pass
+    if not target:
+        await update.message.reply_text("用法：/拉黑 用户ID，或回复玩家消息后使用 /拉黑"); return
+    if is_bot_admin(target):
+        await update.message.reply_text("⚠️ 不能拉黑管理员。"); return
+    if target in BLACKLISTED_USERS:
+        await update.message.reply_text("ℹ️ 该用户已在黑名单中。"); return
+    BLACKLISTED_USERS.add(target); save_data()
+    await update.message.reply_text(f"🚫 已拉黑 {await get_name(context.application, target)}（{target}），该用户已被禁止使用机器人。")
+
+async def cmd_unban(update, context):
+    """管理员解封玩家。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    target = None
+    if update.message.reply_to_message:
+        target = update.message.reply_to_message.from_user.id
+    else:
+        try: target = int(context.args[0])
+        except (IndexError, ValueError): pass
+    if not target:
+        await update.message.reply_text("用法：/解黑 用户ID，或回复玩家消息后使用 /解黑"); return
+    if target not in BLACKLISTED_USERS:
+        await update.message.reply_text("ℹ️ 该用户不在黑名单中。"); return
+    BLACKLISTED_USERS.discard(target); save_data()
+    await update.message.reply_text(f"✅ 已解封 {await get_name(context.application, target)}（{target}）。")
+
+async def cmd_banlist(update, context):
+    """管理员查看黑名单。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    if not BLACKLISTED_USERS:
+        await update.message.reply_text("📋 当前黑名单为空。"); return
+    lines = [f"📋 <b>黑名单（共 {len(BLACKLISTED_USERS)} 人）</b>", "━"*14]
+    for uid in sorted(BLACKLISTED_USERS):
+        lines.append(f"• {await get_name(context.application, uid)}（{uid}）")
+    await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
 
 async def cmd_addadmin(update, context):
     if not is_bot_admin(update.effective_user.id):
@@ -3342,6 +3394,7 @@ async def on_button(update, context):
         cid, uid, data = q.message.chat.id, q.from_user.id, q.data or ""
         _remember_name(update)
         if not is_auth(cid): await q.answer("未授权", show_alert=True); return
+        if uid in BLACKLISTED_USERS and not is_bot_admin(uid): await q.answer("🚫 你已被禁止使用本机器人", show_alert=True); return
         
         # --- 21点 回调 ---
         if data.startswith("bj_"):
@@ -3636,6 +3689,10 @@ async def on_text(update, context):
             _remember_name(update)
         except Exception:
             return
+
+        # 拉黑拦截：被封禁用户（非管理员）禁止使用全部功能，连帮助都看不到
+        if update.effective_user.id in BLACKLISTED_USERS and not is_bot_admin(update.effective_user.id):
+            await message.reply_text("🚫 你已被禁止使用本机器人，如有疑问请联系管理员。"); return
 
         # 不带 / 的命令直达：若首词是已知命令别名，按命令处理（全部命令均可不带 / 触发）
         _words = text.split()
@@ -3943,16 +4000,16 @@ async def post_init(app):
             BotCommand("sb", "骰子"),
             BotCommand("nn", "牛牛"),
             BotCommand("end", "结束当前游戏"),
-            BotCommand("add", "加积分"),
-            BotCommand("adddz", "加德州积分"),
-            BotCommand("reduce", "减积分"),
+            BotCommand("add", "加/减通用积分(正加负减)"),
+            BotCommand("adddz", "加/减德州积分(正加负减)"),
             BotCommand("cx", "盈亏查询"),
             BotCommand("ph", "排行榜"),
             BotCommand("sq", "授权群组"),
-            BotCommand("qxshouquan", "取消授权"),
+            BotCommand("qxsh", "取消授权"),
             BotCommand("addadmin", "添加机器人管理员"),
             BotCommand("deladmin", "移除机器人管理员"),
             BotCommand("adminlist", "查看管理员列表"),
+            BotCommand("authlist", "查看已授权群"),
             BotCommand("autosm", "切换整点自动赛车"),
             BotCommand("backup", "备份数据"),
             BotCommand("restore", "恢复数据"),
@@ -3966,6 +4023,9 @@ async def post_init(app):
             BotCommand("godgrant", "封赌神(管理员)"),
             BotCommand("godrevoke", "撤赌神(管理员)"),
             BotCommand("seasonpoints", "加减排位分(管理员)"),
+            BotCommand("ban", "拉黑玩家(管理员)"),
+            BotCommand("unban", "解封玩家(管理员)"),
+            BotCommand("banlist", "查看黑名单(管理员)"),
         ]
         await app.bot.set_my_commands(menu)
     except Exception:
@@ -3988,11 +4048,14 @@ CMD_ALIASES = {
     "结束": cmd_end,
     "加积分": cmd_add, "加分": cmd_add,
     "加德州": cmd_adddz,
-    "减积分": cmd_reduce, "减分": cmd_reduce,
     "盈亏": cmd_cx, "查询": cmd_cx,
     "排行": cmd_ph, "排行榜": cmd_ph, "积分榜": cmd_ph, "积分": cmd_ph,
     "授权": cmd_sq,
     "取消授权": cmd_qxshouquan,
+    "授权列表": cmd_auth_list, "authlist": cmd_auth_list,
+    "拉黑": cmd_ban, "ban": cmd_ban,
+    "解黑": cmd_unban, "解封": cmd_unban, "取消拉黑": cmd_unban, "unban": cmd_unban,
+    "黑名单": cmd_banlist, "黑名单列表": cmd_banlist, "banlist": cmd_banlist,
     "加管理员": cmd_addadmin,
     "减管理员": cmd_deladmin,
     "管理员列表": cmd_admin_list, "管理员": cmd_admin_list,
@@ -4012,8 +4075,8 @@ CMD_ALIASES = {
     # 旧英文/数字别名（保留兼容，仍可用）
     "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm,
     "lhj": cmd_lhj, "21": cmd_21, "bjl": cmd_bjl, "end": cmd_end,
-    "END": cmd_end, "add": cmd_add, "adddz": cmd_adddz, "reduce": cmd_reduce,
-    "cx": cmd_cx, "ph": cmd_ph, "sq": cmd_sq, "qxshouquan": cmd_qxshouquan,
+    "END": cmd_end, "add": cmd_add, "adddz": cmd_adddz,
+    "cx": cmd_cx, "ph": cmd_ph, "sq": cmd_sq, "qxsh": cmd_qxshouquan,
     "addadmin": cmd_addadmin, "deladmin": cmd_deladmin,
     "autosm": cmd_autosm, "backup": cmd_backup, "restore": cmd_restore,
     "sb": cmd_sb, "nn": cmd_nn,
@@ -4038,6 +4101,9 @@ async def route_command(update, context):
     if not update.message or not update.message.text:
         return
     _remember_name(update)
+    # 拉黑拦截：被封禁用户（非管理员）禁止使用全部命令
+    if update.effective_user.id in BLACKLISTED_USERS and not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("🚫 你已被禁止使用本机器人，如有疑问请联系管理员。"); return
     parts = update.message.text.strip().split()
     if not parts or not parts[0].startswith("/"):
         return
