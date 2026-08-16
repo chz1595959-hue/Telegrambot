@@ -60,6 +60,7 @@ SEASON_MIN_GAMES = 5           # 上榜最少局数
 SEASON_REBUY_COUNT = 3         # 破产应急补分次数
 SEASON_REBUY_AMOUNT = 2000     # 每次应急补分
 SEASON_DAYS = 7                # 赛季周期（天）
+SEASON_BET_PERCENT = 0.2       # 排位赛单局每人投入上限 = 本局落座玩家筹码总和 × 此比例（人少上限低，防串通）
 DATA_FILE = os.environ.get("DATA_FILE", "bot_data.json")
 # --------------------------------
 
@@ -132,9 +133,50 @@ season_rebuy = defaultdict(lambda: defaultdict(int))      # season_rebuy[cid][ui
 season_lobby_msg = {}                                       # season_lobby_msg[cid] = 排位大厅看板消息 id（UI 态，不持久化）
 season_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)))  # season_profit_by_date[date][cid][uid] = 当日盈亏（赛季每日重置成 2W 前记录；赛季总排行=7日累计之和）
 # ---------- 赌神称号（全局唯一，跨群共享荣誉） ----------
-user_titles = {}               # user_titles[uid] = "🎰赌神"  当前在任赌神（全局唯一）
+user_titles = {}               # user_titles[uid] = {"🎰赌神", ...}  每人拥有的称号集合（赌神全局唯一，其余称号可叠加）
 champions_history = []         # [{"season_id","uid","name","score","streak"}] 历届荣誉墙
 TITLE_GAMBLING_GOD = "🎰赌神"
+title_expiry = {}              # title_expiry[uid][称号] = 到期时间戳（仅限时称号；永久称号不在此）
+# ---------- 积分商店（称号兑换）：price 价格 / currency "game"通用积分或"texas"德州积分 / duration 时限秒或 None=永久 ----------
+SHOP_TITLES = {
+    # 通用积分（永久，价格从低到高）
+    "赌狗":     {"price": 5000, "currency": "game", "duration": None},
+    "赌鬼":     {"price": 10000, "currency": "game", "duration": None},
+    "赌徒":     {"price": 15000, "currency": "game", "duration": None},
+    "散财童子": {"price": 20000, "currency": "game", "duration": None},
+    "小赌怡情": {"price": 25000, "currency": "game", "duration": None},
+    "见好就收": {"price": 30000, "currency": "game", "duration": None},
+    "幸运星":   {"price": 35000, "currency": "game", "duration": None},
+    "一夜暴富": {"price": 40000, "currency": "game", "duration": None},
+    "鸿运当头": {"price": 45000, "currency": "game", "duration": None},
+    "财神爷":   {"price": 55000, "currency": "game", "duration": None},
+    "赌怪":     {"price": 65000, "currency": "game", "duration": None},
+    "赌侠":     {"price": 85000, "currency": "game", "duration": None},
+    "快枪手":   {"price": 105000, "currency": "game", "duration": None},
+    "常胜将军": {"price": 135000, "currency": "game", "duration": None},
+    "老千":     {"price": 165000, "currency": "game", "duration": None},
+    "赌王":     {"price": 200000, "currency": "game", "duration": None},
+    "赌霸":     {"price": 240000, "currency": "game", "duration": None},
+    "赌魔":     {"price": 280000, "currency": "game", "duration": None},
+    "赌圣":     {"price": 320000, "currency": "game", "duration": None},
+    "赌尊":     {"price": 360000, "currency": "game", "duration": None},
+    "赌皇":     {"price": 400000, "currency": "game", "duration": None},
+    "赌帝":     {"price": 450000, "currency": "game", "duration": None},
+    "赌仙":     {"price": 500000, "currency": "game", "duration": None},
+    "赌魂":     {"price": 550000, "currency": "game", "duration": None},
+    "千王之王": {"price": 600000, "currency": "game", "duration": None},
+    # 德州积分（永久）
+    "德州新手": {"price": 2000, "currency": "texas", "duration": None},
+    "德州小将": {"price": 4000, "currency": "texas", "duration": None},
+    "德州老千": {"price": 6000, "currency": "texas", "duration": None},
+    "诈唬大师": {"price": 8000, "currency": "texas", "duration": None},
+    "葫芦王":   {"price": 10000, "currency": "texas", "duration": None},
+    "四条王":   {"price": 12000, "currency": "texas", "duration": None},
+    "同花顺王": {"price": 15000, "currency": "texas", "duration": None},
+    "皇家同花顺": {"price": 18000, "currency": "texas", "duration": None},
+    "德扑之王": {"price": 20000, "currency": "texas", "duration": None},
+    "河牌之王": {"price": 20000, "currency": "texas", "duration": None},
+}
 # ---------- 昵称缓存（持久化）：群里每条消息/回调直接拿 effective_user 真名，避免 get_chat 失败回退成"玩家{uid}" ----------
 user_names = {}                # user_names[uid] = "真名"（原始串，输出时再 html.escape）
 chat_name_cache = {}           # chat_name_cache[cid] = 群名（入站消息自动缓存，授权列表等无需再调 get_chat）
@@ -236,7 +278,8 @@ def force_save_now():
                 "season_joined": {str(cid): list(users) for cid, users in season_joined.items()},
                 "season_rebuy": {str(cid): dict(users) for cid, users in season_rebuy.items()},
                 "season_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in season_profit_by_date.items()},
-                "user_titles": {str(uid): t for uid, t in user_titles.items()},
+                "user_titles": {str(uid): sorted(t) for uid, t in user_titles.items()},
+                "title_expiry": {str(uid): {t: int(exp) for t, exp in ts.items()} for uid, ts in title_expiry.items()},
                 "champions_history": champions_history,
                 "user_names": {str(uid): n for uid, n in user_names.items()},
             }
@@ -272,7 +315,7 @@ async def data_save_worker():
 
 
 def load_data():
-    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history, user_names
+    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history, user_names, title_expiry
     source = DATA_FILE if os.path.exists(DATA_FILE) else DATA_BACKUP_FILE
     if not os.path.exists(source): return
     try:
@@ -311,7 +354,11 @@ def load_data():
         # 赌神称号恢复
         user_titles.clear()
         for uid, t in data.get("user_titles", {}).items():
-            user_titles[int(uid)] = t
+            # 兼容旧数据格式（单个称号字符串）与新格式（称号列表）
+            user_titles[int(uid)] = {t} if isinstance(t, str) else set(t)
+        title_expiry.clear()
+        for uid, ts in data.get("title_expiry", {}).items():
+            title_expiry[int(uid)] = {t: int(exp) for t, exp in ts.items()}
         champions_history.clear()
         champions_history.extend(data.get("champions_history", []))
         # 昵称缓存恢复：群里成员真名（避免重启后大量回退成“玩家{uid}”）
@@ -380,8 +427,15 @@ force_save_now()  # 归档结果立即物理落盘，避免启动后 60 秒内�
 
 # ---------- Telegram 工具 ----------
 def title_prefix(uid):
-    """持赌神称号的玩家在名字前加 🎰赌神 前缀（全局展示；称号为固定串不含 <>&，HTML/纯文本均安全）。"""
-    return f"{TITLE_GAMBLING_GOD} " if uid in user_titles else ""
+    """持称号的玩家在名字前加称号前缀。优先级：赌神 > 商店称号（兑换的抢不了赌神风头）。
+    多个商店称号时显示价格最高者。称号均为预设固定串（不含 <>&），HTML/纯文本均安全。"""
+    ts = user_titles.get(uid)
+    if not ts:
+        return ""
+    if TITLE_GAMBLING_GOD in ts:
+        return f"{TITLE_GAMBLING_GOD} "
+    best = max((t for t in ts if t in SHOP_TITLES), key=lambda t: SHOP_TITLES[t]["price"], default=None)
+    return f"{best} " if best else ""
 
 
 def _extract_name(chat):
@@ -791,6 +845,7 @@ class PokerGame:
         self.game_msg_id = self.action_msg_id = None
         self.turn_task = self.auto_task = self.wait_task = None
         self.evaluator, self.settled, self.showdown_order = Evaluator(), False, []
+        self.max_total_bet = None  # 排位赛单局每人投入上限（仅 season，start 时按总筹码×百分比算）
 
     def add(self, uid):
         if self.phase != "waiting" or uid in self.players: return False
@@ -816,6 +871,8 @@ class PokerGame:
             self.total_bet[uid] = self.round_bets[uid] = 0
             ante = min(ANTE, self.chips[uid]); self.chips[uid] -= ante; self.total_bet[uid] += ante; self.pot += ante
             if not self.chips[uid]: self.all_in.add(uid)
+        # 排位赛：单局每人投入上限 = 本局落座玩家带入筹码总和 × 百分比（人少上限低，防串通）
+        self.max_total_bet = max(int(sum(self.initial_chips.values()) * SEASON_BET_PERCENT), ANTE) if self.season else None
         self.deck = [Card.new(rank + suit) for rank in "23456789TJQKA" for suit in "shdc"]
         random.shuffle(self.deck); self.hands = {uid: [self.deck.pop(), self.deck.pop()] for uid in self.players}
         self.dealer_idx = len(self.players) - 1; self.active = self.players.copy()
@@ -859,11 +916,15 @@ class PokerGame:
             self.acted.add(uid); desc = "过牌"
         elif kind == "call":
             paid = min(self.current_bet - self.round_bets[uid], self.chips[uid])
+            if self.max_total_bet is not None and self.total_bet[uid] + paid > self.max_total_bet:
+                return False, f"单局每人投入上限 {self.max_total_bet}，你已投入 {self.total_bet[uid]}"
             self.chips[uid] -= paid; self.round_bets[uid] += paid; self.total_bet[uid] += paid; self.pot += paid
             if not self.chips[uid]: self.all_in.add(uid)
             self.acted.add(uid); desc = f"跟注 {paid}"
         elif kind == "allin":
             paid = self.chips[uid]
+            if self.max_total_bet is not None and self.total_bet[uid] + paid > self.max_total_bet:
+                return False, f"单局每人投入上限 {self.max_total_bet}，你已投入 {self.total_bet[uid]}，可用加注补齐"
             old_bet = self.current_bet; new_total = self.round_bets[uid] + paid
             self.chips[uid] = 0; self.round_bets[uid] = new_total; self.total_bet[uid] += paid; self.pot += paid; self.all_in.add(uid)
             if new_total > old_bet:
@@ -885,6 +946,8 @@ class PokerGame:
             to_call = self.current_bet - self.round_bets[uid]; paid = to_call + extra; new_total = self.round_bets[uid] + paid
             if extra < FIXED_MIN_RAISE: return False, f"最低加注为 {FIXED_MIN_RAISE}"
             if paid > self.chips[uid]: return False, f"积分不足：本次需要跟注 {to_call} + 加注 {extra}，共 {paid}，你只有 {self.chips[uid]}"
+            if self.max_total_bet is not None and self.total_bet[uid] + paid > self.max_total_bet:
+                return False, f"单局每人投入上限 {self.max_total_bet}，你已投入 {self.total_bet[uid]}"
             if new_total <= self.current_bet: return False, "加注后总下注必须高于当前下注"
             if uid in self.raise_locked: return False, "短全下后已行动玩家只能跟注或弃牌"
             self.chips[uid] -= paid; self.round_bets[uid] = new_total; self.total_bet[uid] += paid; self.pot += paid; self.current_bet = new_total; self.acted = {uid}; self.raise_locked.clear()
@@ -1499,7 +1562,7 @@ async def require_group_chat(update, game_name, cmd):
 
 async def cmd_start(update, context):
     if not await need_auth(update): return
-    await update.message.reply_text("🎮 欢迎使用娱乐机器人！\n\n🎲 发起游戏：\n/开始 或 /菜单 - 查看本帮助\n/德州 - 发起德州扑克\n/赛车 - 发起赛车\n/老虎机 - 老虎机抽奖\n/21点 - 发起21点\n/百家乐 - 发起百家乐\n/骰子 - 发起骰子\n/牛牛 - 发起牛牛\n\n📊 数据查询：\n/盈亏 - 当日盈亏榜\n/排行 - 总积分榜\n/结束 - 终止当前游戏\n\n🔧 管理命令（仅管理员）：\n/授权 - 授权当前群使用\n/qxsh - 取消群授权\n/授权列表 - 查看已授权群\n/加管理员 /减管理员 /管理员列表\n/加积分(负数即减) /加德州(负数即减) /赛季分\n/拉黑 /解黑 /黑名单 - 封禁违规玩家\n/列表 - 管理总览(管理员/授权群/黑名单三合一)\n/备份 /恢复\n💡 加减积分快捷用法：回复玩家消息后发 /add 数量，无需输ID\n\n（旧英文命令 /dz /sc /sb /addadmin … 仍可继续使用）")
+    await update.message.reply_text("🎮 欢迎使用娱乐机器人！\n\n🎲 发起游戏：\n/开始 或 /菜单 - 查看本帮助\n/德州 - 发起德州扑克\n/赛车 - 发起赛车\n/老虎机 - 老虎机抽奖\n/21点 - 发起21点\n/百家乐 - 发起百家乐\n/骰子 - 发起骰子\n/牛牛 - 发起牛牛\n\n📊 数据查询：\n/盈亏 - 当日盈亏榜\n/排行 - 总积分榜\n/结束 - 终止当前游戏\n\n🏪 积分商店：\n/商店 - 查看可兑换称号\n/兑换 称号名 - 用通用/德州积分换称号\n\n🔧 管理命令（仅管理员）：\n/授权 - 授权当前群使用\n/qxsh - 取消群授权\n/授权列表 - 查看已授权群\n/加管理员 /减管理员 /管理员列表\n/加积分(负数即减) /加德州(负数即减) /赛季分\n/拉黑 /解黑 /黑名单 - 封禁违规玩家\n/列表 - 管理总览(管理员/授权群/黑名单三合一)\n/备份 /恢复\n💡 加减积分快捷用法：回复玩家消息后发 /add 数量，无需输ID\n\n（旧英文命令 /dz /sc /sb /addadmin … 仍可继续使用）")
 
 # ---------- 21点 / 百家乐 界面与逻辑 ----------
 async def start_bj_turn_timer(game, app):
@@ -2692,8 +2755,10 @@ async def season_settle(app, manual=False):
     global season_active, season_id, season_name, season_start_ts, season_end_ts
     if not season_active:
         return
-    # 快照：防止结算过程中并发的 showdown 修改 season_points 导致 RuntimeError
-    season_snapshot = dict(season_points)
+    # 提前置位：结算一旦开始立即标记赛季结束，防止并发重入（如 daily_reset 的每日重置在结算中途误触发）
+    season_active = False
+    # 快照（外层+内层均拷贝）：防止结算过程中并发的 showdown 修改 season_points 导致 RuntimeError
+    season_snapshot = {cid: dict(users) for cid, users in season_points.items()}
     for cid, users in season_snapshot.items():
         standings = sorted(users.items(), key=lambda x: (-season_total_profit(cid, x[0]), x[0]))
         eligible = [(uid, val) for uid, val in standings if uid >= 0 and season_games[cid].get(uid, 0) >= SEASON_MIN_GAMES]
@@ -2702,7 +2767,7 @@ async def season_settle(app, manual=False):
             lines.append("本赛季无达标玩家，赌神称号保留在任者。")
         for i, (uid, val) in enumerate(eligible[:50], 1):
             g = season_games[cid].get(uid, 0)
-            marker = "👑" if (i == 1 and uid in user_titles) else rank_marker(i)
+            marker = "👑" if (i == 1 and uid in user_titles and TITLE_GAMBLING_GOD in user_titles[uid]) else rank_marker(i)
             lines.append(f"{marker} {await get_name(app, uid, cid=cid, with_title=False)}：总{season_total_profit(cid, uid):+d}｜{g}局")
         lines.extend(["", "⚠️ 结算时刻进行中的牌局不计入本赛季。", "🎁 奖励由管理员另行发放。"])
         await safe_send_long(app.bot, cid, "\n".join(lines))
@@ -2713,8 +2778,13 @@ async def season_settle(app, manual=False):
             streak = 1
             if champions_history and champions_history[-1]["uid"] == champ_uid:
                 streak = champions_history[-1].get("streak", 1) + 1
-            user_titles.clear(); user_titles[champ_uid] = TITLE_GAMBLING_GOD
-            champions_history.append({"season_id": season_id, "uid": champ_uid, "name": champ_name, "score": eligible[0][1], "streak": streak})
+            # 移除旧赌神称号（赌神全局唯一），保留其余称号；再给新冠军加冕
+            for _u in list(user_titles.keys()):
+                user_titles[_u].discard(TITLE_GAMBLING_GOD)
+                if not user_titles[_u]:
+                    del user_titles[_u]
+            user_titles.setdefault(champ_uid, set()).add(TITLE_GAMBLING_GOD)
+            champions_history.append({"season_id": season_id, "uid": champ_uid, "name": champ_name, "score": season_total_profit(cid, champ_uid), "streak": streak})
             crown = f"👑 恭喜 {await get_name(app, champ_uid, cid=cid, with_title=False)} 加冕本赛季 🎰赌神" + (f"（{streak}连冠！）" if streak > 1 else "！")
             try:
                 await safe_send(app.bot, cid, crown)
@@ -2738,11 +2808,14 @@ async def season_settle(app, manual=False):
 
 
 def season_total_profit(cid, uid):
-    """赛季总盈亏 = 各日已结算盈亏之和 + 当前未结算当日盈亏（当前分 - 起始分）。"""
+    """赛季总盈亏 = 各日已结算盈亏之和 + 当前未结算当日盈亏（当前分 - 起始分）。
+    仅对已报名玩家有意义；未报名 uid 不参与当日盈亏计算，避免凭空 -起始分。"""
     total = 0
     for d in season_profit_by_date:
         total += season_profit_by_date[d].get(cid, {}).get(uid, 0)
-    total += season_points.get(cid, {}).get(uid, 0) - SEASON_START_CHIPS
+    pts = season_points.get(cid, {}).get(uid)
+    if pts is not None:
+        total += pts - SEASON_START_CHIPS
     return total
 
 
@@ -2757,7 +2830,7 @@ async def season_standings_lines(app, cid, uid=None):
     for i, (u, val) in enumerate(standings[:50], 1):
         g = season_games[cid].get(u, 0)
         tag = "" if g >= SEASON_MIN_GAMES else f"（{g}局·未达标）"
-        marker = "👑" if (i == 1 and u in user_titles) else rank_marker(i)
+        marker = "👑" if (i == 1 and u in user_titles and TITLE_GAMBLING_GOD in user_titles[u]) else rank_marker(i)
         lines.append(f"{marker} {await get_name(app, u, cid=cid, with_title=False)}：总{season_total_profit(cid, u):+d}｜当日{val}｜{g}局{tag}")
     # 个人排名行：请求者不在前 50 时，单独补一行真实名次，避免大群看不到自己
     if uid is not None and uid in users:
@@ -2890,11 +2963,11 @@ async def cmd_god(update, context):
     app = context.application
     cid = update.effective_chat.id
     lines = ["👑 <b>🎰赌神 荣誉殿堂</b>", "━" * 16]
-    if not user_titles:
+    champ_uid = next((u for u, ts in user_titles.items() if TITLE_GAMBLING_GOD in ts), None)
+    if champ_uid is None:
         lines.append("当前暂无 🎰赌神。拿下排位赛冠军即可加冕！")
     else:
-        uid = next(iter(user_titles))
-        lines.append(f"🏅 现任赌神：{await get_name(app, uid, cid=cid, with_title=False)}")
+        lines.append(f"🏅 现任赌神：{await get_name(app, champ_uid, cid=cid, with_title=False)}")
     if champions_history:
         lines.append("")
         lines.append("📜 <b>历届荣誉墙</b>")
@@ -2924,7 +2997,11 @@ async def cmd_god_grant(update, context):
         uid = int(context.args[0])
     except ValueError:
         await update.message.reply_text("❌ 用户 ID 必须是数字。"); return
-    user_titles.clear(); user_titles[uid] = TITLE_GAMBLING_GOD
+    for _u in list(user_titles.keys()):
+        user_titles[_u].discard(TITLE_GAMBLING_GOD)
+        if not user_titles[_u]:
+            del user_titles[_u]
+    user_titles.setdefault(uid, set()).add(TITLE_GAMBLING_GOD)
     save_data()
     await update.message.reply_text(f"👑 已将 {uid} 封为 🎰赌神（覆盖上任）。")
 
@@ -2939,12 +3016,66 @@ async def cmd_god_revoke(update, context):
         uid = int(context.args[0])
     except ValueError:
         await update.message.reply_text("❌ 用户 ID 必须是数字。"); return
-    if uid in user_titles:
-        del user_titles[uid]
+    if uid in user_titles and TITLE_GAMBLING_GOD in user_titles[uid]:
+        user_titles[uid].discard(TITLE_GAMBLING_GOD)
+        if not user_titles[uid]:
+            del user_titles[uid]
         save_data()
         await update.message.reply_text(f"🔻 已撤销 {uid} 的 🎰赌神 称号。")
     else:
         await update.message.reply_text("ℹ️ 该用户当前没有 🎰赌神 称号。")
+
+
+async def cmd_shop(update, context):
+    """积分商店：列出可兑换的称号。"""
+    if not await need_auth(update): return
+    if not is_group_chat(update):
+        await update.message.reply_text("🏪 积分商店请在群聊中使用（发 /商店）。"); return
+    lines = ["🏪 <b>积分商店 · 称号兑换</b>", "━" * 16]
+    for t, cfg in SHOP_TITLES.items():
+        cur = "通用积分" if cfg["currency"] == "game" else "德州积分"
+        dur = "永久" if cfg["duration"] is None else f"{cfg['duration'] // 86400}天"
+        lines.append(f"• <b>{html.escape(t)}</b>：{cfg['price']} {cur}｜{dur}")
+    lines.append("")
+    lines.append("💡 用 /兑换 称号名 购买；称号显示在昵称前（赌神优先）。")
+    await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_redeem(update, context):
+    """兑换称号：扣通用/德州积分 + 挂称号（永久或限时）。"""
+    if not await need_auth(update): return
+    if not is_group_chat(update):
+        await update.message.reply_text("🏪 积分商店请在群聊中使用（发 /商店）。"); return
+    if not context.args:
+        await update.message.reply_text("用法：/兑换 称号名（用 /商店 查看可兑换称号）"); return
+    title = "".join(context.args)
+    cfg = SHOP_TITLES.get(title)
+    if not cfg:
+        await update.message.reply_text("❌ 该称号不存在，用 /商店 查看可兑换称号。"); return
+    uid = update.effective_user.id
+    cid = update.effective_chat.id
+    # 已持有且未过期则拒绝重复兑换
+    held = user_titles.get(uid, set())
+    if title in held:
+        exp = title_expiry.get(uid, {}).get(title)
+        if exp is None or exp > int(now_bj().timestamp()):
+            await update.message.reply_text("ℹ️ 你已持有该称号，无需重复兑换。"); return
+    if player_is_busy(cid, uid):
+        await update.message.reply_text("⚠️ 你正在游戏中，请先结束当前游戏再兑换。"); return
+    wallet = game_chips if cfg["currency"] == "game" else texas_chips
+    cur = "通用积分" if cfg["currency"] == "game" else "德州积分"
+    async with wallet_locks[uid]:
+        if wallet[cid][uid] < cfg["price"]:
+            await update.message.reply_text(f"❌ 你的{cur}不足：需要 {cfg['price']}，当前 {wallet[cid][uid]}。"); return
+        wallet[cid][uid] -= cfg["price"]
+        user_titles.setdefault(uid, set()).add(title)
+        if cfg["duration"] is not None:
+            title_expiry.setdefault(uid, {})[title] = int(now_bj().timestamp()) + cfg["duration"]
+        else:
+            title_expiry.setdefault(uid, {}).pop(title, None)
+        save_data()
+    dur = "永久" if cfg["duration"] is None else f"{cfg['duration'] // 86400}天"
+    await update.message.reply_text(f"🎉 兑换成功！获得称号 <b>{html.escape(title)}</b>（{dur}），花费 {cfg['price']} {cur}，剩余 {wallet[cid][uid]}。", parse_mode="HTML")
 
 
 async def cmd_season_points(update, context):
@@ -3888,6 +4019,17 @@ async def on_text(update, context):
 
 
 # ---------- 定时任务与启动 ----------
+async def season_settle_scheduler(app):
+    """独立赛季结算调度：每 60 秒检查一次到点，精确到分钟结算（不再依赖每日 0 点循环，避免最多延迟 ~24h）。"""
+    while True:
+        try:
+            if season_active and now_bj().timestamp() >= season_end_ts:
+                await season_settle(app)
+        except Exception:
+            logger.exception("season_settle_scheduler 本轮异常（已吞并继续，下个周期重试）")
+        await asyncio.sleep(60)
+
+
 async def daily_reset_scheduler(app):
     global last_business_date
     today = now_bj().strftime("%Y-%m-%d")
@@ -3899,9 +4041,7 @@ async def daily_reset_scheduler(app):
         await asyncio.sleep((target-now).total_seconds())
         try:
             today = now_bj().strftime("%Y-%m-%d")
-            # 排位赛到点自动结算（end_ts 为开赛+7天的时间戳）
-            if season_active and now_bj().timestamp() >= season_end_ts:
-                await season_settle(app)
+            # 排位赛到点自动结算已移至独立的 season_settle_scheduler（精确到分钟），此处不再处理
             # 午夜仅清理「刚结束的那一天」德州当日榜；保留 _archive 与其他日期历史，避免清空全部历史盈亏
             finished_day = (now_bj() - timedelta(days=1)).strftime("%Y-%m-%d")
             poker_profit_by_date.pop(finished_day, None)
@@ -3929,6 +4069,17 @@ async def daily_reset_scheduler(app):
             for cid in race_daily_stats: race_daily_stats[cid] = [0] * HORSE_COUNT
             for cid in baccarat_daily_stats: baccarat_daily_stats[cid] = {"player": 0, "banker": 0, "tie": 0}
             archive_old_profit_data()
+            # 清理已到期的限时商店称号
+            _now_ts = int(now_bj().timestamp())
+            for _u in list(title_expiry.keys()):
+                for _t in list(title_expiry[_u].keys()):
+                    if title_expiry[_u][_t] <= _now_ts:
+                        title_expiry[_u].pop(_t, None)
+                        user_titles.get(_u, set()).discard(_t)
+                if not title_expiry[_u]:
+                    del title_expiry[_u]
+                if _u in user_titles and not user_titles[_u]:
+                    del user_titles[_u]
             daily_emergency_used.clear(); last_business_date = today; save_data()
         except Exception:
             logger.exception("daily_reset_scheduler 本轮异常（已吞并继续，下个周期重试）")
@@ -4069,6 +4220,7 @@ async def post_init(app):
     background_tasks.update({
         asyncio.create_task(daily_reset_scheduler(app)), 
         asyncio.create_task(leaderboard_scheduler(app)), 
+        asyncio.create_task(season_settle_scheduler(app)), 
         asyncio.create_task(hourly_race_scheduler(app)),
         asyncio.create_task(data_save_worker()) 
     })
@@ -4107,6 +4259,8 @@ async def post_init(app):
             BotCommand("god", "赌神称号/荣誉墙"),
             BotCommand("godgrant", "封赌神(管理员)"),
             BotCommand("godrevoke", "撤赌神(管理员)"),
+            BotCommand("shop", "积分商店-称号兑换"),
+            BotCommand("redeem", "兑换称号"),
             BotCommand("seasonpoints", "加减排位分(管理员)"),
             BotCommand("ban", "拉黑玩家(管理员)"),
             BotCommand("unban", "解封玩家(管理员)"),
@@ -4158,6 +4312,8 @@ CMD_ALIASES = {
     "排位开赛": cmd_season_start, "排位结束": cmd_season_end, "赛季开赛": cmd_season_start, "赛季结束": cmd_season_end,
     "赌神": cmd_god, "荣誉墙": cmd_god,
     "封赌神": cmd_god_grant, "撤赌神": cmd_god_revoke,
+    "商店": cmd_shop, "积分商店": cmd_shop, "称号商店": cmd_shop, "shop": cmd_shop,
+    "兑换": cmd_redeem, "兑换称号": cmd_redeem, "redeem": cmd_redeem,
     "赛季分": cmd_season_points, "加赛季分": cmd_season_points, "减赛季分": cmd_season_points, "seasonpoints": cmd_season_points,
     # 旧英文/数字别名（保留兼容，仍可用）
     "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm,
