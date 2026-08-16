@@ -3131,7 +3131,9 @@ async def cmd_end(update, context):
         if is_bot_admin(uid) or uid in sb_game.bets.keys() or uid == sb_game.owner_id:
             sb_game.cancel_timer()
             wallet = game_chips
-            for p_uid, b_dict in sb_game.bets.items(): wallet[cid][p_uid] += sum(b_dict.values())
+            for p_uid, b_dict in sb_game.bets.items():
+                wallet[cid][p_uid] += sum(b_dict.values())
+                pending_game_bets[cid].get(p_uid, {}).pop("sicbo", None)  # 清退款记录，避免重启后二次退款
             active_sicbo_games.pop(cid, None)
             await safe_edit(context.bot, cid, sb_game.game_msg_id, "🛑 骰子已终止，积分已退回。", reply_markup=None)
             notices.append("骰子已退款")
@@ -3611,7 +3613,9 @@ async def on_button(update, context):
             elif data == "sb_end":
                 if not is_bot_admin(uid) and uid != game.owner_id: await q.answer("权限不足", show_alert=True); return
                 game.cancel_timer()
-                for p_uid, b_dict in game.bets.items(): game_chips[cid][p_uid] += sum(b_dict.values())
+                for p_uid, b_dict in game.bets.items():
+                    game_chips[cid][p_uid] += sum(b_dict.values())
+                    pending_game_bets[cid].get(p_uid, {}).pop("sicbo", None)  # 清退款记录，避免重启后二次退款
                 active_sicbo_games.pop(cid, None)
                 await safe_edit(context.bot, cid, game.game_msg_id, "🛑 骰子已手动终止，积分已退回。", reply_markup=None)
             return
@@ -4061,29 +4065,7 @@ async def cmd_restore(update, context):
             os.remove(tmp_path)
 
 
-async def refund_pending_bets(app):
-    """启动退款：进程 crash 重启后，把所有残留的未结算下注退还给用户钱包，避免用户下注丢失。"""
-    if not pending_game_bets:
-        return
-    refunded_count = 0
-    for cid, users in list(pending_game_bets.items()):
-        for uid, bets in list(users.items()):
-            total = sum(int(b.get("amount", 0)) for b in bets.values() if isinstance(b, dict))
-            if total > 0:
-                game_chips[cid][uid] += total
-                refunded_count += 1
-                try:
-                    await app.bot.send_message(cid, f"♻️ 系统重启，已自动退还未结算下注 {total} 积分。")
-                except Exception:
-                    pass
-    pending_game_bets.clear()
-    if refunded_count:
-        save_data()
-        logger.info("启动退款完成：已退还 %d 名用户的残留下注", refunded_count)
-
-
 async def post_init(app):
-    await refund_pending_bets(app)
     background_tasks.update({
         asyncio.create_task(daily_reset_scheduler(app)), 
         asyncio.create_task(leaderboard_scheduler(app)), 
