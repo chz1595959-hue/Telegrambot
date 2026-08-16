@@ -137,6 +137,7 @@ user_titles = {}               # user_titles[uid] = {"🎰赌神", ...}  每人�
 champions_history = []         # [{"season_id","uid","name","score","streak"}] 历届荣誉墙
 TITLE_GAMBLING_GOD = "🎰赌神"
 title_expiry = {}              # title_expiry[uid][称号] = 到期时间戳（仅限时称号；永久称号不在此）
+title_equipped = {}            # title_equipped[uid] = 当前佩戴的称号（玩家手动选择，可覆盖默认显示）
 # ---------- 积分商店（称号兑换）：price 价格 / currency "game"通用积分或"texas"德州积分 / duration 时限秒或 None=永久 ----------
 SHOP_TITLES = {
     # 通用积分（永久，价格从低到高）
@@ -280,6 +281,7 @@ def force_save_now():
                 "season_profit_by_date": {date: {str(cid): dict(users) for cid, users in chats.items()} for date, chats in season_profit_by_date.items()},
                 "user_titles": {str(uid): sorted(t) for uid, t in user_titles.items()},
                 "title_expiry": {str(uid): {t: int(exp) for t, exp in ts.items()} for uid, ts in title_expiry.items()},
+                "title_equipped": {str(uid): t for uid, t in title_equipped.items()},
                 "champions_history": champions_history,
                 "user_names": {str(uid): n for uid, n in user_names.items()},
             }
@@ -315,7 +317,7 @@ async def data_save_worker():
 
 
 def load_data():
-    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history, user_names, title_expiry
+    global last_business_date, season_active, season_id, season_name, season_start_ts, season_end_ts, user_titles, champions_history, user_names, title_expiry, title_equipped
     source = DATA_FILE if os.path.exists(DATA_FILE) else DATA_BACKUP_FILE
     if not os.path.exists(source): return
     try:
@@ -359,6 +361,9 @@ def load_data():
         title_expiry.clear()
         for uid, ts in data.get("title_expiry", {}).items():
             title_expiry[int(uid)] = {t: int(exp) for t, exp in ts.items()}
+        title_equipped.clear()
+        for uid, t in data.get("title_equipped", {}).items():
+            title_equipped[int(uid)] = t
         champions_history.clear()
         champions_history.extend(data.get("champions_history", []))
         # 昵称缓存恢复：群里成员真名（避免重启后大量回退成“玩家{uid}”）
@@ -427,11 +432,14 @@ force_save_now()  # 归档结果立即物理落盘，避免启动后 60 秒内�
 
 # ---------- Telegram 工具 ----------
 def title_prefix(uid):
-    """持称号的玩家在名字前加称号前缀。优先级：赌神 > 商店称号（兑换的抢不了赌神风头）。
-    多个商店称号时显示价格最高者。称号均为预设固定串（不含 <>&），HTML/纯文本均安全。"""
+    """持称号的玩家在名字前加称号前缀。优先级：手动佩戴 > 赌神 > 最贵商店称号。
+    称号均为预设固定串（不含 <>&），HTML/纯文本均安全。"""
     ts = user_titles.get(uid)
     if not ts:
         return ""
+    equipped = title_equipped.get(uid)
+    if equipped and equipped in ts:
+        return f"{equipped} "
     if TITLE_GAMBLING_GOD in ts:
         return f"{TITLE_GAMBLING_GOD} "
     best = max((t for t in ts if t in SHOP_TITLES), key=lambda t: SHOP_TITLES[t]["price"], default=None)
@@ -3018,6 +3026,8 @@ async def cmd_god_revoke(update, context):
         await update.message.reply_text("❌ 用户 ID 必须是数字。"); return
     if uid in user_titles and TITLE_GAMBLING_GOD in user_titles[uid]:
         user_titles[uid].discard(TITLE_GAMBLING_GOD)
+        if title_equipped.get(uid) == TITLE_GAMBLING_GOD:
+            title_equipped.pop(uid, None)
         if not user_titles[uid]:
             del user_titles[uid]
         save_data()
@@ -3076,6 +3086,51 @@ async def cmd_redeem(update, context):
         save_data()
     dur = "永久" if cfg["duration"] is None else f"{cfg['duration'] // 86400}天"
     await update.message.reply_text(f"🎉 兑换成功！获得称号 <b>{html.escape(title)}</b>（{dur}），花费 {cfg['price']} {cur}，剩余 {wallet[cid][uid]}。", parse_mode="HTML")
+
+
+async def cmd_my_titles(update, context):
+    """查看我持有的所有称号。"""
+    if not await need_auth(update): return
+    uid = update.effective_user.id
+    ts = user_titles.get(uid, set())
+    if not ts:
+        await update.message.reply_text("你还没有任何称号，用 /商店 查看可兑换称号。")
+        return
+    lines = ["🎖 <b>我的称号</b>", "━" * 16]
+    equipped = title_equipped.get(uid)
+    now = int(now_bj().timestamp())
+    for t in sorted(ts, key=lambda x: (-SHOP_TITLES.get(x, {}).get("price", 0), x)):
+        mark = " 👈佩戴中" if t == equipped else ""
+        if t == TITLE_GAMBLING_GOD:
+            lines.append(f"👑 {html.escape(t)}（赛季冠军专属）{mark}")
+        else:
+            cfg = SHOP_TITLES.get(t, {})
+            if cfg.get("duration") is not None:
+                exp = title_expiry.get(uid, {}).get(t, 0)
+                remain = max(1, (exp - now + 86399) // 86400)
+                lines.append(f"• {html.escape(t)}（剩余约 {remain} 天）{mark}")
+            else:
+                lines.append(f"• {html.escape(t)}（永久）{mark}")
+    lines.append("")
+    lines.append("💡 用 /佩戴 称号名 切换亮出的称号；不佩戴则默认显示最贵的。")
+    await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
+
+
+async def cmd_equip(update, context):
+    """佩戴某个已持有的称号（切换昵称前缀，可覆盖默认）。"""
+    if not await need_auth(update): return
+    if not context.args:
+        await update.message.reply_text("用法：/佩戴 称号名（用 /我的称号 查看你持有的称号）")
+        return
+    title = "".join(context.args)
+    uid = update.effective_user.id
+    ts = user_titles.get(uid, set())
+    if title not in ts:
+        await update.message.reply_text("❌ 你尚未持有该称号，用 /我的称号 查看。")
+        return
+    title_equipped[uid] = title
+    save_data()
+    await update.message.reply_text(f"✅ 已佩戴 <b>{html.escape(title)}</b>，将显示在昵称前。", parse_mode="HTML")
 
 
 async def cmd_season_points(update, context):
@@ -4076,6 +4131,8 @@ async def daily_reset_scheduler(app):
                     if title_expiry[_u][_t] <= _now_ts:
                         title_expiry[_u].pop(_t, None)
                         user_titles.get(_u, set()).discard(_t)
+                        if title_equipped.get(_u) == _t:
+                            title_equipped.pop(_u, None)
                 if not title_expiry[_u]:
                     del title_expiry[_u]
                 if _u in user_titles and not user_titles[_u]:
@@ -4261,6 +4318,8 @@ async def post_init(app):
             BotCommand("godrevoke", "撤赌神(管理员)"),
             BotCommand("shop", "积分商店-称号兑换"),
             BotCommand("redeem", "兑换称号"),
+            BotCommand("mytitles", "查看我的称号"),
+            BotCommand("equip", "佩戴称号"),
             BotCommand("seasonpoints", "加减排位分(管理员)"),
             BotCommand("ban", "拉黑玩家(管理员)"),
             BotCommand("unban", "解封玩家(管理员)"),
@@ -4314,6 +4373,8 @@ CMD_ALIASES = {
     "封赌神": cmd_god_grant, "撤赌神": cmd_god_revoke,
     "商店": cmd_shop, "积分商店": cmd_shop, "称号商店": cmd_shop, "shop": cmd_shop,
     "兑换": cmd_redeem, "兑换称号": cmd_redeem, "redeem": cmd_redeem,
+    "我的称号": cmd_my_titles, "我的头衔": cmd_my_titles, "mytitles": cmd_my_titles,
+    "佩戴": cmd_equip, "佩戴称号": cmd_equip, "equip": cmd_equip,
     "赛季分": cmd_season_points, "加赛季分": cmd_season_points, "减赛季分": cmd_season_points, "seasonpoints": cmd_season_points,
     # 旧英文/数字别名（保留兼容，仍可用）
     "start": cmd_start, "dz": cmd_dz, "sm": cmd_sm,
