@@ -1499,7 +1499,7 @@ async def require_group_chat(update, game_name, cmd):
 
 async def cmd_start(update, context):
     if not await need_auth(update): return
-    await update.message.reply_text("🎮 欢迎使用娱乐机器人！\n\n🎲 发起游戏：\n/开始 或 /菜单 - 查看本帮助\n/德州 - 发起德州扑克\n/赛车 - 发起赛车\n/老虎机 - 老虎机抽奖\n/21点 - 发起21点\n/百家乐 - 发起百家乐\n/骰子 - 发起骰子\n/牛牛 - 发起牛牛\n\n📊 数据查询：\n/盈亏 - 当日盈亏榜\n/排行 - 总积分榜\n/结束 - 终止当前游戏\n\n🔧 管理命令（仅管理员）：\n/授权 - 授权当前群使用\n/qxsh - 取消群授权\n/授权列表 - 查看已授权群\n/加管理员 /减管理员 /管理员列表\n/加积分(负数即减) /加德州(负数即减) /赛季分\n/拉黑 /解黑 /黑名单 - 封禁违规玩家\n/备份 /恢复\n💡 加减积分快捷用法：回复玩家消息后发 /add 数量，无需输ID\n\n（旧英文命令 /dz /sc /sb /addadmin … 仍可继续使用）")
+    await update.message.reply_text("🎮 欢迎使用娱乐机器人！\n\n🎲 发起游戏：\n/开始 或 /菜单 - 查看本帮助\n/德州 - 发起德州扑克\n/赛车 - 发起赛车\n/老虎机 - 老虎机抽奖\n/21点 - 发起21点\n/百家乐 - 发起百家乐\n/骰子 - 发起骰子\n/牛牛 - 发起牛牛\n\n📊 数据查询：\n/盈亏 - 当日盈亏榜\n/排行 - 总积分榜\n/结束 - 终止当前游戏\n\n🔧 管理命令（仅管理员）：\n/授权 - 授权当前群使用\n/qxsh - 取消群授权\n/授权列表 - 查看已授权群\n/加管理员 /减管理员 /管理员列表\n/加积分(负数即减) /加德州(负数即减) /赛季分\n/拉黑 /解黑 /黑名单 - 封禁违规玩家\n/列表 - 管理总览(管理员/授权群/黑名单三合一)\n/备份 /恢复\n💡 加减积分快捷用法：回复玩家消息后发 /add 数量，无需输ID\n\n（旧英文命令 /dz /sc /sb /addadmin … 仍可继续使用）")
 
 # ---------- 21点 / 百家乐 界面与逻辑 ----------
 async def start_bj_turn_timer(game, app):
@@ -3347,6 +3347,52 @@ async def cmd_banlist(update, context):
         lines.append(f"• {await get_name(context.application, uid)}（{uid}）")
     await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
 
+async def cmd_list_all(update, context):
+    """管理员一键查看：管理员 / 授权群 / 黑名单 三合一总览。"""
+    if not is_bot_admin(update.effective_user.id):
+        await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
+    app = context.application
+    lines = ["📋 <b>管理总览</b>", "━"*18]
+
+    # 管理员
+    seeds = set(ADMIN_USER_IDS)
+    dynamic = BOT_ADMINS - seeds
+    lines.append(f"👑 <b>管理员（{len(BOT_ADMINS)}）</b>")
+    for uid in sorted(seeds):
+        lines.append(f"  🔒 {await get_name(app, uid)}（{uid}）")
+    for uid in sorted(dynamic):
+        lines.append(f"  ➕ {await get_name(app, uid)}（{uid}）")
+    if not dynamic:
+        lines.append("  （无动态管理员）")
+    lines.append("")
+
+    # 授权群
+    lines.append(f"✅ <b>已授权群（{len(AUTHORIZED_GROUPS)}）</b>")
+    if not AUTHORIZED_GROUPS:
+        lines.append("  （无）")
+    else:
+        for cid in sorted(AUTHORIZED_GROUPS):
+            title = chat_name_cache.get(cid)
+            if not title:
+                try:
+                    chat = await context.bot.get_chat(cid)
+                    if getattr(chat, "title", None):
+                        title = chat.title; chat_name_cache[cid] = title
+                except Exception as e:
+                    logger.warning("取群名失败 %s: %s", cid, e)
+            lines.append(f"  • {title}（{cid}）" if title else f"  • {cid}（群名未知）")
+    lines.append("")
+
+    # 黑名单
+    lines.append(f"🚫 <b>黑名单（{len(BLACKLISTED_USERS)}）</b>")
+    if not BLACKLISTED_USERS:
+        lines.append("  （无）")
+    else:
+        for uid in sorted(BLACKLISTED_USERS):
+            lines.append(f"  • {await get_name(app, uid)}（{uid}）")
+
+    await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
+
 async def cmd_addadmin(update, context):
     if not is_bot_admin(update.effective_user.id):
         await update.message.reply_text("❌ 仅 Bot 管理员可操作"); return
@@ -4069,6 +4115,7 @@ async def post_init(app):
             BotCommand("ban", "拉黑玩家(管理员)"),
             BotCommand("unban", "解封玩家(管理员)"),
             BotCommand("banlist", "查看黑名单(管理员)"),
+            BotCommand("list", "管理总览(管理员/群/黑名单)"),
         ]
         await app.bot.set_my_commands(menu)
     except Exception:
@@ -4099,6 +4146,7 @@ CMD_ALIASES = {
     "拉黑": cmd_ban, "ban": cmd_ban,
     "解黑": cmd_unban, "解封": cmd_unban, "取消拉黑": cmd_unban, "unban": cmd_unban,
     "黑名单": cmd_banlist, "黑名单列表": cmd_banlist, "banlist": cmd_banlist,
+    "列表": cmd_list_all, "list": cmd_list_all, "总览": cmd_list_all,
     "加管理员": cmd_addadmin,
     "减管理员": cmd_deladmin,
     "管理员列表": cmd_admin_list, "管理员": cmd_admin_list,
