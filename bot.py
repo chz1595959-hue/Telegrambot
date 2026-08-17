@@ -2154,36 +2154,71 @@ async def settle_sicbo(game, app):
     for uid in bet_uids:
         try: name_map[uid] = await get_name(app, uid)
         except Exception: name_map[uid] = f"玩家{uid}"
-    # 阶段一：先计算每位玩家派彩（不动钱包，异常时不会误退已发放玩家的钱）
+    # 阶段一：先计算每位玩家派彩（不动钱包，异常时不会误退已发放玩家的钱），同时生成逐项对账明细
     payout_list = []
     for uid, bets in game.bets.items():
         win_amount = 0
         total_bet = sum(bets.values())
+        detail = []
         for bet_type, bet_amt in bets.items():
-            if bet_type == "big" and result == "big": win_amount += bet_amt * 2
-            elif bet_type == "small" and result == "small": win_amount += bet_amt * 2
-            elif bet_type == "odd" and not is_triple and total % 2 == 1: win_amount += bet_amt * 2
-            elif bet_type == "even" and not is_triple and total % 2 == 0: win_amount += bet_amt * 2
-            elif bet_type == "triple" and is_triple: win_amount += bet_amt * 31
+            if bet_type == "big":
+                if result == "big":
+                    win_amount += bet_amt * 2
+                    detail.append(f"🔴大 {bet_amt} → ✅ 1:1 = +{bet_amt * 2}")
+                else:
+                    detail.append(f"🔴大 {bet_amt} → ❌")
+            elif bet_type == "small":
+                if result == "small":
+                    win_amount += bet_amt * 2
+                    detail.append(f"🔵小 {bet_amt} → ✅ 1:1 = +{bet_amt * 2}")
+                else:
+                    detail.append(f"🔵小 {bet_amt} → ❌")
+            elif bet_type == "odd":
+                if not is_triple and total % 2 == 1:
+                    win_amount += bet_amt * 2
+                    detail.append(f"🟡单 {bet_amt} → ✅ 1:1 = +{bet_amt * 2}")
+                else:
+                    detail.append(f"🟡单 {bet_amt} → ❌")
+            elif bet_type == "even":
+                if not is_triple and total % 2 == 0:
+                    win_amount += bet_amt * 2
+                    detail.append(f"🟢双 {bet_amt} → ✅ 1:1 = +{bet_amt * 2}")
+                else:
+                    detail.append(f"🟢双 {bet_amt} → ❌")
+            elif bet_type == "triple":
+                if is_triple:
+                    win_amount += bet_amt * 31
+                    detail.append(f"⚫豹子 {bet_amt} → ✅ 1:30 = +{bet_amt * 31}")
+                else:
+                    detail.append(f"⚫豹子 {bet_amt} → ❌")
             elif bet_type.startswith("spec_"):
                 n = int(bet_type.split("_")[1])
                 if is_triple and dice[0] == n:
-                    win_amount += bet_amt * (1 + SICBO_SPEC_TRIPLE_PAYOUT)
+                    pay = bet_amt * (1 + SICBO_SPEC_TRIPLE_PAYOUT)
+                    win_amount += pay
+                    detail.append(f"豹子{n} {bet_amt} → ✅ 1:{SICBO_SPEC_TRIPLE_PAYOUT} = +{pay}")
+                else:
+                    detail.append(f"豹子{n} {bet_amt} → ❌")
             elif bet_type.startswith("sum_"):
                 nums = [int(x) for x in bet_type.split("_")[1:]]
+                label = "/".join(str(x) for x in nums) if len(nums) <= 2 else f"{nums[0]}-{nums[-1]}"
                 if total in nums:
-                    win_amount += bet_amt * (1 + SICBO_SUM_PAYOUT.get(total, 6))
+                    pay = bet_amt * (1 + SICBO_SUM_PAYOUT.get(total, 6))
+                    win_amount += pay
+                    detail.append(f"总点{label} {bet_amt} → ✅ 1:{SICBO_SUM_PAYOUT.get(total, 6)} = +{pay}")
+                else:
+                    detail.append(f"总点{label} {bet_amt} → ❌")
         net = win_amount - total_bet
-        payout_list.append((uid, win_amount, net, total_bet))
+        payout_list.append((uid, win_amount, net, total_bet, detail))
     # 阶段二：应用派彩（先算后付，阶段一异常则钱包未动可安全全额退款）
     wallet = game_chips
     lines = []
     payouts_applied = False
     try:
-        for uid, win_amount, net, total_bet in payout_list:
+        for uid, win_amount, net, total_bet, detail in payout_list:
             wallet[game.chat_id][uid] += win_amount
             if game.mode == "official": sicbo_profit_by_date[date][game.chat_id][uid] += net
-            if net != 0: lines.append(f"👤 {name_map[uid]}\n盈亏：{net:+d}")
+            lines.append(f"👤 {name_map[uid]}\n  " + "\n  ".join(detail) + f"\n  本金 {total_bet}｜派彩 {win_amount}｜盈亏 {net:+d}")
             pending_game_bets[game.chat_id].get(uid, {}).pop("sicbo", None)
         payouts_applied = True
         save_data(); await asyncio.to_thread(force_save_now)
@@ -2393,27 +2428,37 @@ async def settle_senddice(game, app):
     for uid in bet_uids:
         try: name_map[uid] = await get_name(app, uid)
         except Exception: name_map[uid] = f"玩家{uid}"
-    # 阶段一：先算派彩（不动钱包）
+    # 阶段一：先算派彩（不动钱包），同时生成逐项对账明细
     payout_list = []
     for uid, bets in game.bets.items():
         win_amount = 0
         total_bet = sum(bets.values())
+        detail = []
         for bet_key, bet_amt in bets.items():
-            for key, _label, win_values, num, den in cfg["bets"]:
-                if key == bet_key and value in win_values:
-                    win_amount += bet_amt * num // den
+            for key, label, win_values, num, den in cfg["bets"]:
+                if key != bet_key:
+                    continue
+                short = label.split(" (")[0]
+                if value in win_values:
+                    pay = bet_amt * num // den
+                    win_amount += pay
+                    mult = str(num // den) if num % den == 0 else f"{num / den:g}"
+                    detail.append(f"{short} {bet_amt} → ✅ ×{mult} = +{pay}")
+                else:
+                    detail.append(f"{short} {bet_amt} → ❌")
+                break
         net = win_amount - total_bet
-        payout_list.append((uid, win_amount, net, total_bet))
+        payout_list.append((uid, win_amount, net, total_bet, detail))
     # 阶段二：应用派彩（先算后付）
     wallet = game_chips
     lines = []
     payouts_applied = False
     profit_dict = SENDDICE_PROFIT[game.game_type]
     try:
-        for uid, win_amount, net, total_bet in payout_list:
+        for uid, win_amount, net, total_bet, detail in payout_list:
             wallet[game.chat_id][uid] += win_amount
             if game.mode == "official": profit_dict[date][game.chat_id][uid] += net
-            if net != 0: lines.append(f"👤 {name_map[uid]}\n盈亏：{net:+d}")
+            lines.append(f"👤 {name_map[uid]}\n  " + "\n  ".join(detail) + f"\n  本金 {total_bet}｜派彩 {win_amount}｜盈亏 {net:+d}")
             pending_game_bets[game.chat_id].get(uid, {}).pop(game.game_type, None)
         payouts_applied = True
         save_data(); await asyncio.to_thread(force_save_now)
