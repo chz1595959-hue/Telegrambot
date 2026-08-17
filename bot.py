@@ -140,7 +140,7 @@ season_profit_by_date = defaultdict(lambda: defaultdict(lambda: defaultdict(int)
 # ---------- 赌神称号（全局唯一，跨群共享荣誉） ----------
 user_titles = {}               # user_titles[uid] = {"🎰赌神", ...}  每人拥有的称号集合（赌神全局唯一，其余称号可叠加）
 champions_history = []         # [{"season_id","uid","name","score","streak"}] 历届荣誉墙
-TITLE_GAMBLING_GOD = "🎰赌神"
+TITLE_GAMBLING_GOD = "🔱赌神"
 title_expiry = {}              # title_expiry[uid][称号] = 到期时间戳（仅限时称号；永久称号不在此）
 title_equipped = {}            # title_equipped[uid] = 当前佩戴的称号（玩家手动选择，可覆盖默认显示）
 # ---------- 积分商店（称号兑换）：price 价格 / currency "game"通用积分或"texas"德州积分 / duration 时限秒或 None=永久 ----------
@@ -399,6 +399,15 @@ def load_data():
         title_equipped.clear()
         for uid, t in data.get("title_equipped", {}).items():
             title_equipped[int(uid)] = t
+        # 数据迁移：赌神图标 🎰→🔱（兼容旧数据，避免已持有玩家丢失称号）
+        _OLD_GOD = "🎰赌神"
+        for _uid, _titles in list(user_titles.items()):
+            if _OLD_GOD in _titles:
+                _titles.discard(_OLD_GOD)
+                _titles.add(TITLE_GAMBLING_GOD)
+        for _uid, _t in list(title_equipped.items()):
+            if _t == _OLD_GOD:
+                title_equipped[_uid] = TITLE_GAMBLING_GOD
         champions_history.clear()
         champions_history.extend(data.get("champions_history", []))
         # 昵称缓存恢复：群里成员真名（避免重启后大量回退成“玩家{uid}”）
