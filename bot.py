@@ -2129,7 +2129,8 @@ async def settle_sicbo(game, app):
         logger.exception("send_dice 失败，回退本地随机")
         dice, total, is_triple = game.play()
     # 等动画播完再出结果（send_dice 的 value 在动画播放前就返回了）
-    await asyncio.sleep(3.5)
+    # 三个骰子依次发出，最后一个动画最晚开始，需给足时间
+    await asyncio.sleep(5.5)
     if is_triple:
         result = "triple"
     elif 11 <= total <= 17:
@@ -2253,6 +2254,7 @@ SENDDICE_GAMES = {
     "football": {
         "title": "⚽ 足球射门",
         "emoji": "⚽",
+        "anim_seconds": 5.0,
         "settle_hint": "正在开球...",
         "value_desc": {1: "⚽进球", 2: "⚽进球", 3: "⚽进球", 4: "🧤没进", 5: "🧤没进"},
         "bets": [
@@ -2263,6 +2265,7 @@ SENDDICE_GAMES = {
     "basketball": {
         "title": "🏀 篮球投篮",
         "emoji": "🏀",
+        "anim_seconds": 5.5,
         "settle_hint": "正在投篮...",
         "bets": [
             ("in", "🏀 投进 (1.15倍)", [1, 2, 3, 4], 23, 20),
@@ -2272,6 +2275,7 @@ SENDDICE_GAMES = {
     "darts": {
         "title": "🎯 飞镖",
         "emoji": "🎯",
+        "anim_seconds": 5.5,
         "settle_hint": "正在投镖...",
         "bets": [
             ("bull", "🎯 靶心 (5.5倍)", [6], 11, 2),
@@ -2282,6 +2286,7 @@ SENDDICE_GAMES = {
     "bowling": {
         "title": "🎳 保龄球",
         "emoji": "🎳",
+        "anim_seconds": 5.5,
         "settle_hint": "正在投球...",
         "bets": [
             ("strike", "🎳 全中 (5倍)", [6], 5, 1),
@@ -2381,7 +2386,7 @@ async def settle_senddice(game, app):
         logger.exception("send_dice 失败，回退本地随机")
         value = random.randint(1, 6)
     # 等动画播完再出结果（send_dice 的 value 在动画播放前就返回了）
-    await asyncio.sleep(3.5)
+    await asyncio.sleep(cfg.get("anim_seconds", 5.0))
     date = business_date()
     bet_uids = list(game.bets.keys())
     name_map = {}
