@@ -183,6 +183,28 @@ SHOP_TITLES = {
     "德扑之王": {"price": 20000, "currency": "texas", "duration": None},
     "河牌之王": {"price": 20000, "currency": "texas", "duration": None},
 }
+
+# 称号图标（展示层）：与 SHOP_TITLES 的 key 一一对应，缺省为空串。赌神自带 🎰 无需在此。
+TITLE_ICONS = {
+    # 通用积分
+    "赌狗": "🐶", "赌鬼": "👻", "赌徒": "🎲", "散财童子": "💸",
+    "小赌怡情": "🍵", "见好就收": "🧘", "幸运星": "⭐", "一夜暴富": "💰",
+    "鸿运当头": "🍀", "财神爷": "🧧", "赌怪": "👾", "赌侠": "🦸",
+    "快枪手": "🔫", "常胜将军": "🏆", "老千": "🃏", "赌王": "👑",
+    "赌霸": "🐯", "赌魔": "😈", "赌圣": "✨", "赌尊": "🏔️",
+    "赌皇": "🐲", "赌帝": "⚜️", "赌仙": "🧚", "赌魂": "🔥",
+    "千王之王": "🎴",
+    # 德州积分
+    "德州新手": "🌱", "德州小将": "🎖️", "德州老千": "🎭", "诈唬大师": "😏",
+    "葫芦王": "🏠", "四条王": "🀄", "同花顺王": "♠️", "皇家同花顺": "💎",
+    "德扑之王": "🤴", "河牌之王": "🌊",
+}
+
+
+def title_icon(title):
+    """称号图标，缺省空串。"""
+    return TITLE_ICONS.get(title, "")
+
 # ---------- 昵称缓存（持久化）：群里每条消息/回调直接拿 effective_user 真名，避免 get_chat 失败回退成"玩家{uid}" ----------
 user_names = {}                # user_names[uid] = "真名"（原始串，输出时再 html.escape）
 chat_name_cache = {}           # chat_name_cache[cid] = 群名（入站消息自动缓存，授权列表等无需再调 get_chat）
@@ -460,11 +482,11 @@ def title_prefix(uid):
         return ""
     equipped = title_equipped.get(uid)
     if equipped and equipped in ts:
-        return f"{equipped} "
+        return f"{title_icon(equipped)}{equipped} "
     if TITLE_GAMBLING_GOD in ts:
         return f"{TITLE_GAMBLING_GOD} "
     best = max((t for t in ts if t in SHOP_TITLES), key=lambda t: SHOP_TITLES[t]["price"], default=None)
-    return f"{best} " if best else ""
+    return f"{title_icon(best)}{best} " if best else ""
 
 
 def _extract_name(chat):
@@ -3375,7 +3397,7 @@ async def cmd_shop(update, context):
     for t, cfg in SHOP_TITLES.items():
         cur = "通用积分" if cfg["currency"] == "game" else "德州积分"
         dur = "永久" if cfg["duration"] is None else f"{cfg['duration'] // 86400}天"
-        lines.append(f"• <b>{html.escape(t)}</b>：{cfg['price']} {cur}｜{dur}")
+        lines.append(f"• {title_icon(t)}<b>{html.escape(t)}</b>：{cfg['price']} {cur}｜{dur}")
     lines.append("")
     lines.append("💡 用 /兑换 称号名 购买；/我的称号 查看，/佩戴 切换亮出的称号。")
     await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
@@ -3388,8 +3410,10 @@ async def cmd_redeem(update, context):
         await update.message.reply_text("🏪 积分商店请在群聊中使用（发 /商店）。"); return
     if not context.args:
         await update.message.reply_text("用法：/兑换 称号名（用 /商店 查看可兑换称号）"); return
-    title = "".join(context.args)
-    cfg = SHOP_TITLES.get(title)
+    # 容错：用户经常顺手多打「购买/一个/来一个」之类，按空格 join 后找不到。
+    # 优先取第一个参数（称号意图词），join 作为兜底（SHOP_TITLES 实际全无空格）。
+    title = context.args[0].strip()
+    cfg = SHOP_TITLES.get(title) or SHOP_TITLES.get("".join(context.args).strip())
     if not cfg:
         await update.message.reply_text("❌ 该称号不存在，用 /商店 查看可兑换称号。"); return
     uid = update.effective_user.id
@@ -3415,7 +3439,7 @@ async def cmd_redeem(update, context):
             title_expiry.setdefault(uid, {}).pop(title, None)
         save_data()
     dur = "永久" if cfg["duration"] is None else f"{cfg['duration'] // 86400}天"
-    await update.message.reply_text(f"🎉 兑换成功！获得称号 <b>{html.escape(title)}</b>（{dur}），花费 {cfg['price']} {cur}，剩余 {wallet[cid][uid]}。", parse_mode="HTML")
+    await update.message.reply_text(f"🎉 兑换成功！获得称号 {title_icon(title)}<b>{html.escape(title)}</b>（{dur}），花费 {cfg['price']} {cur}，剩余 {wallet[cid][uid]}。", parse_mode="HTML")
 
 
 async def cmd_my_titles(update, context):
@@ -3438,12 +3462,12 @@ async def cmd_my_titles(update, context):
             if cfg.get("duration") is not None:
                 exp = title_expiry.get(uid, {}).get(t, 0)
                 if exp <= now:
-                    lines.append(f"• {html.escape(t)}（已过期，待清理）{mark}")
+                    lines.append(f"• {title_icon(t)}{html.escape(t)}（已过期，待清理）{mark}")
                 else:
                     remain = max(1, (exp - now + 86399) // 86400)
-                    lines.append(f"• {html.escape(t)}（剩余约 {remain} 天）{mark}")
+                    lines.append(f"• {title_icon(t)}{html.escape(t)}（剩余约 {remain} 天）{mark}")
             else:
-                lines.append(f"• {html.escape(t)}（永久）{mark}")
+                lines.append(f"• {title_icon(t)}{html.escape(t)}（永久）{mark}")
     lines.append("")
     lines.append("💡 用 /佩戴 称号名 切换亮出的称号；不佩戴则默认显示最贵的。")
     await safe_send_long(context.bot, update.effective_chat.id, "\n".join(lines), parse_mode="HTML")
