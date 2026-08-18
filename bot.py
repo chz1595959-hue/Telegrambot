@@ -2665,10 +2665,10 @@ class StudGame:
         return (Card.get_rank_int(card), SUIT_ORDER.get(Card.get_suit_int(card), 0))
 
     def _bring_in(self):
-        """明牌最大者先行动：所有明牌中 rank 最大者，同 rank 比花色 ♠>♥>♦>♣。"""
+        """明牌最大者先行动：所有明牌中 rank 最大者，同 rank 比花色 ♠>♥>♦>♣。跳过 all_in 玩家（他们无法加注）。"""
         best_uid, best_key = None, None
         for uid in self.players:
-            if uid in self.folded: continue
+            if uid in self.folded or uid in self.all_in: continue
             for card in self.upcards.get(uid, []):
                 key = self._upcard_key(card)
                 if best_key is None or key > best_key:
@@ -2747,6 +2747,11 @@ class StudGame:
                 self.upcards[uid].append(self.deck.pop())
 
     def _end_round(self):
+        alive = [p for p in self.players if p not in self.folded]
+        # 所有存活玩家都已 all_in：直接进入 showdown，不要继续发牌（避免 _bring_in 选到 all_in 卡死）
+        if len(alive) <= 1 or all(p in self.all_in for p in alive):
+            self.round_bets = {uid: 0 for uid in self.players}; self.current_bet = 0; self.acted.clear(); self.raise_locked.clear()
+            self.phase = "showdown"; return
         self.round_bets = {uid: 0 for uid in self.players}; self.current_bet = 0; self.acted.clear(); self.raise_locked.clear()
         if self.phase == "round0": self._deal_upcard(); self.phase = "round1"
         elif self.phase == "round1": self._deal_upcard(); self.phase = "round2"
@@ -2849,7 +2854,11 @@ async def start_stud_turn_timer(game, app):
     game.cancel_timer()
     uid = game.current()
     if uid is None:
-        if game.phase == "showdown": await settle_stud(game, app)
+        # 兜底：current() 为空时主动检查是否应进 showdown（避免 all_in 后 _end_round 漏判卡死）
+        alive = [p for p in game.players if p not in game.folded]
+        if len(alive) <= 1 or all(p in game.all_in for p in alive) or game._round_done():
+            game.phase = "showdown"
+            await settle_stud(game, app)
         return
     await safe_delete(app.bot, game.chat_id, game.action_msg_id)
     text = f"{await stud_table_text(game, app)}\n\n⏰ <b>{await get_name(app, uid)}</b> 请在 {TURN_TIMEOUT} 秒内行动。"
@@ -3292,6 +3301,7 @@ def jinhua_buttons(game, uid):
         rows.append([InlineKeyboardButton(f"🔼 加注 {JINHUA_BASE}", callback_data=f"jh_raise_{JINHUA_BASE}")])
     if game.chips[uid] > 0:
         rows.append([InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data="jh_allin")])
+    rows.append([InlineKeyboardButton("🔄 刷新界面", callback_data="jh_refresh")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -3306,6 +3316,7 @@ async def show_jinhua_action(game, app):
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🃏 开牌比大小", callback_data="jh_open")],
             [InlineKeyboardButton(f"🔼 继续加注 {JINHUA_BASE}", callback_data=f"jh_raise_{JINHUA_BASE}")],
+            [InlineKeyboardButton("🔄 刷新界面", callback_data="jh_refresh")],
         ])
         await safe_edit(app.bot, game.chat_id, game.game_msg_id, text, reply_markup=kb, parse_mode="HTML")
         return
@@ -3344,6 +3355,24 @@ async def start_jinhua_turn_timer(game, app):
             await show_jinhua_action(game, app)
         else: await update_jinhua_table(game, app); await start_jinhua_turn_timer(game, app)
     game.turn_task = asyncio.create_task(timeout_action())
+
+
+async def _refresh_jinhua_table(game, app):
+    """炸金花刷新发新界面：删旧牌桌消息、发新牌桌消息、更新 game_msg_id，并恢复按钮/timer。
+
+    对 game 状态无副作用（仅按 game.phase 决定恢复 open_pending 按钮还是行动按钮/timer）。
+    供 on_text 的「刷新」分支与 on_button 的 jh_refresh 复用。返回新消息对象（失败为 None）。
+    """
+    await safe_delete(app.bot, game.chat_id, game.game_msg_id)
+    msg = await safe_send(app.bot, game.chat_id, await jinhua_table_text(game, app))
+    if msg:
+        game.game_msg_id = msg.message_id
+        # 恢复按钮/timer：跟平阶段发开牌/继续加注按钮；下注阶段恢复当前玩家行动
+        if game.phase == "open_pending":
+            await show_jinhua_action(game, app)
+        else:
+            await start_jinhua_turn_timer(game, app)
+    return msg
 
 
 async def settle_jinhua(game, app):
@@ -5288,6 +5317,10 @@ async def on_button(update, context):
         if data.startswith("jh_"):
             game = active_jinhua_games.get(cid)
             if not game: await q.answer("炸金花游戏已结束", show_alert=True); return
+            if data == "jh_refresh":
+                await _refresh_jinhua_table(game, context.application)
+                await q.answer("已刷新界面")
+                return
             if data == "jh_see":
                 if uid not in game.hands or uid in game.folded:
                     await q.answer("当前无法看牌", show_alert=True); return
@@ -5297,8 +5330,10 @@ async def on_button(update, context):
                 cards = "  ".join(card_str(c) for c in game.hands[uid])
                 await q.answer(f"你的手牌：{cards}｜{game._hand_name(uid)}", show_alert=True)
                 if first:
+                    # 只刷新群内文本（玩家状态从"闷牌"变"已看牌"是公开信息），不重发按钮消息，
+                    # 避免按钮 label 变化影响其他存活玩家的当前操作视图
+                    await action_notice(cid, context.application, uid, "👁 看了牌")
                     await update_jinhua_table(game, context.application)
-                    await show_jinhua_action(game, context.application)
                 return
             if data == "jh_end":
                 if not is_bot_admin(uid) and uid not in game.players:
@@ -5419,6 +5454,11 @@ async def on_text(update, context):
                         poker.game_msg_id = msg.message_id
                         # 恢复当前行动玩家的操作按钮，防止刷新后游戏卡死
                         await start_turn_timer(poker, context.application)
+            # 3.5 炸金花：刷新发新界面（仿德州，避免长消息越拉越长）
+            jh = active_jinhua_games.get(cid)
+            if jh and jh.phase != "waiting":
+                found = True
+                await _refresh_jinhua_table(jh, context.application)
             # 4. 赛车
             race = active_horse_races.get(cid)
             if race and race.phase == "betting":
@@ -5511,7 +5551,7 @@ async def on_text(update, context):
 
 
         # 扑克类游戏文字加注（自动路由到玩家当前轮到的游戏：德州→梭哈→炸金花）
-        bet_match = re.fullmatch(r"(?:下注|加注)\s*[:：]?\s*(\d+)\s*(?:积分)?", text)
+        bet_match = re.fullmatch(r"(?:继续)?(?:下注|加注)\s*[:：]?\s*(\d+)\s*(?:积分)?", text)
         if bet_match:
             amount = int(bet_match.group(1))
             for game, settle, update, start_timer in [
@@ -5519,7 +5559,13 @@ async def on_text(update, context):
                 (active_stud_games.get(cid), settle_stud, update_stud_table, start_stud_turn_timer),
                 (active_jinhua_games.get(cid), settle_jinhua, update_jinhua_table, start_jinhua_turn_timer),
             ]:
-                if not (game and game.phase != "waiting" and user.id == game.current()):
+                if not game:
+                    continue
+                # 炸金花跟平阶段(open_pending)：所有存活玩家(未弃)均可加注，此时 current() 返回 None
+                if game is active_jinhua_games.get(cid) and game.phase == "open_pending":
+                    if user.id not in game.players or user.id in game.folded:
+                        continue
+                elif not (game.phase != "waiting" and user.id == game.current()):
                     continue
                 ok, desc = game.action(user.id, "raise", amount)
                 if not ok: await message.reply_text(f"❌ {desc}"); return
