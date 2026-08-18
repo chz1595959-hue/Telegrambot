@@ -460,6 +460,7 @@ def load_data():
                 for ginfo in entries:
                     wallet = game_chips
                     wallet[int(cid)][int(uid)] += int(ginfo.get("amount", 0))
+        pending_game_bets.clear()
         # 老虎机冷却恢复
         for uid, ts in data.get("user_cooldowns", {}).items(): user_cooldowns[int(uid)] = float(ts)
         # 老虎机命令防刷窗口恢复
@@ -700,6 +701,7 @@ class BlackjackGame:
         self.name_cache = {}
         self.timer_task = None
         self.wait_task = None # 新增等待解散任务变量
+        self.settled = False
 
     def cancel_timer(self):
         if self.timer_task and not self.timer_task.done():
@@ -801,6 +803,7 @@ class BaccaratGame:
         self.game_msg_id = None
         self.create_time = time.time()
         self.timer_task = None
+        self.settled = False
 
     def cancel_timer(self):
         if self.timer_task and not self.timer_task.done():
@@ -1770,6 +1773,9 @@ async def update_blackjack_ui(game, app):
         # 确保跳转到 finished 逻辑
         await update_blackjack_ui(game, app)
     elif game.phase == "finished":
+        if getattr(game, "settled", False):
+            return
+        game.settled = True
         # 增加整体 try-except 保护
         try:
             payments_applied = False
@@ -1794,15 +1800,23 @@ async def update_blackjack_ui(game, app):
                 result_str = ""
                 payout = 0
                 
-                if p_score > 21: result_str = "💥 爆牌 (负)"; payout = 0
-                elif d_score > 21: 
-                    if game.is_blackjack(game.hands[uid]): result_str = "🃏 Blackjack (胜)"; payout = int(bet * 2.5)
+                dealer_bj = game.is_blackjack(game.dealer_hand)
+                player_bj = game.is_blackjack(game.hands[uid])
+                if p_score > 21:
+                    result_str = "💥 爆牌 (负)"; payout = 0
+                elif dealer_bj and not player_bj:
+                    result_str = "🏛 庄家天生21 (负)"; payout = 0
+                elif d_score > 21:
+                    if player_bj: result_str = "🃏 Blackjack (胜)"; payout = int(bet * 2.5)
                     else: result_str = "🏛 庄爆 (胜)"; payout = bet * 2
                 elif p_score > d_score:
-                    if game.is_blackjack(game.hands[uid]): result_str = "🃏 Blackjack (胜)"; payout = int(bet * 2.5)
+                    if player_bj: result_str = "🃏 Blackjack (胜)"; payout = int(bet * 2.5)
                     else: result_str = "🎉 获胜"; payout = bet * 2
-                elif p_score < d_score: result_str = "💸 战败"; payout = 0
-                else: result_str = "🤝 平局"; payout = bet
+                elif p_score < d_score:
+                    result_str = "💸 战败"; payout = 0
+                else:
+                    if player_bj and dealer_bj: result_str = "🤝 双天生21 平局"; payout = bet
+                    else: result_str = "🤝 平局"; payout = bet
                 
                 net = payout - bet
                 hand_text = game.get_card_str(game.hands[uid])
@@ -1920,6 +1934,10 @@ async def update_baccarat_ui(game, app):
             if msg: game.game_msg_id = msg.message_id
 
 async def settle_baccarat(game, app):
+    if getattr(game, "settled", False):
+        return
+    game.settled = True
+    game.phase = "finished"
     # 模拟开牌动画
     await safe_edit(app.bot, game.chat_id, game.game_msg_id, "👑 <b>百家乐</b>\n━━━━━━━━━━━━━━━━━\n🎴 <b>正在开牌中，请稍候...</b>", reply_markup=None, parse_mode="HTML")
     await asyncio.sleep(1.5)
