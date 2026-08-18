@@ -2750,7 +2750,10 @@ class StudGame:
                 game_chips[self.chat_id][uid] += self.chips[uid] - self.initial_chips.get(uid, game_chips[self.chat_id][uid])
             save_data(); await asyncio.to_thread(force_save_now)
             return [(winner, "最后赢家", self.pot, [("全部底池", self.pot)], {})]
-        # 至少两人：5 张牌比大小（复用德州评估器，无公共牌）
+        # 至少两人：先补齐到 5 张牌（1暗+4明）再比大小，处理 early all-in 牌没发够的情况
+        for uid in alive:
+            while len(self.hand(uid)) < 5:
+                self.upcards[uid].append(self.deck.pop())
         scores = {uid: self.evaluator.evaluate(self.hand(uid), []) for uid in alive}
         names = {uid: HAND_NAME_CN.get(self.evaluator.class_to_string(self.evaluator.get_rank_class(score)), "未知") for uid, score in scores.items()}
         payouts = distribute_side_pots(self.total_bet, scores)
@@ -3012,7 +3015,7 @@ class JinhuaGame:
         self.total_bet, self.round_bets = {}, {}
         self.hands = {}        # uid -> [3张牌]
         self.seen = set()      # 已看牌玩家（看牌者下注翻倍）
-        self.folded, self.acted = set(), set()
+        self.folded, self.all_in, self.acted, self.raise_locked = set(), set(), set(), set()
         self.deck = []
         self.pot = self.current_bet = self.actor_idx = 0
         self.game_msg_id = self.action_msg_id = None
@@ -3029,7 +3032,7 @@ class JinhuaGame:
     def start(self):
         if len(self.players) < 2: return False
         random.shuffle(self.players)
-        self.cancel_wait(); self.folded.clear(); self.acted.clear(); self.seen.clear()
+        self.cancel_wait(); self.folded.clear(); self.all_in.clear(); self.acted.clear(); self.raise_locked.clear(); self.seen.clear()
         self.pot = self.current_bet = 0; self.settled = False
         self.deck = [Card.new(rank + suit) for rank in "23456789TJQKA" for suit in "shdc"]
         random.shuffle(self.deck)
@@ -3037,9 +3040,14 @@ class JinhuaGame:
             self.chips[uid] = game_chips[self.chat_id][uid]; self.initial_chips[uid] = self.chips[uid]
             self.total_bet[uid] = self.round_bets[uid] = 0
             ante = min(JINHUA_ANTE, self.chips[uid]); self.chips[uid] -= ante; self.total_bet[uid] += ante; self.pot += ante
+            if not self.chips[uid]: self.all_in.add(uid)
             self.hands[uid] = [self.deck.pop(), self.deck.pop(), self.deck.pop()]
         self.phase = "betting"
         self.actor_idx = 0
+        # 跳过开局即全下(ante 后 0 筹)的玩家，避免首轮无人可行动而卡死
+        if self.current() is None:
+            self._next()
+            if self.current() is None: self.phase = "showdown"
         return True
 
     def _target(self, uid):
@@ -3049,32 +3057,72 @@ class JinhuaGame:
     def current(self):
         if self.actor_idx >= len(self.players): return None
         uid = self.players[self.actor_idx]
-        return uid if uid not in self.folded and uid not in self.acted else None
+        return uid if uid not in self.folded and uid not in self.all_in and uid not in self.acted else None
 
     def _next(self):
         n = len(self.players)
         for offset in range(1, n + 1):
             idx = (self.actor_idx + offset) % n
             uid = self.players[idx]
-            if uid not in self.folded and uid not in self.acted:
+            if uid not in self.folded and uid not in self.all_in and uid not in self.acted:
                 self.actor_idx = idx
                 return uid
         return None
 
     def _round_done(self):
-        return all(uid in self.folded or uid in self.acted for uid in self.players)
+        return all(uid in self.folded or uid in self.all_in or uid in self.acted for uid in self.players)
 
     def _do_raise(self, uid, extra):
         try: extra = int(extra)
         except (TypeError, ValueError): return False, "无效加注额"
         if extra < JINHUA_BASE: return False, f"最低加注为 {JINHUA_BASE}"
+        if uid in self.raise_locked: return False, "短全下后已行动玩家只能跟注或弃牌"
         self.current_bet += extra
         target = self._target(uid)
         paid = target - self.round_bets[uid]
         if paid > self.chips[uid]: return False, f"积分不足：需要 {paid}，你只有 {self.chips[uid]}"
         self.chips[uid] -= paid; self.round_bets[uid] = target; self.total_bet[uid] += paid; self.pot += paid
+        if not self.chips[uid]: self.all_in.add(uid)
         self.acted = {uid}; self.phase = "betting"
         return True, f"加注 {extra}"
+
+    def _do_allin(self, uid):
+        """炸金花全下：不足跟注或部分高出(不足一个单位加注)按 call 处理；超出足够则全下并加注、重开下注。"""
+        if self.chips[uid] <= 0:
+            return False, "你没有可下的筹码"
+        mult = 2 if uid in self.seen else 1
+        to_call = max(0, self._target(uid) - self.round_bets[uid])
+        paid = self.chips[uid]
+        if paid <= to_call or (paid - to_call) < mult:
+            # 部分跟注：不足一个单位加注时按 call 处理（余下零星筹码保留），不重开下注
+            shove = min(paid, to_call)
+            self.chips[uid] -= shove
+            self.round_bets[uid] += shove
+            self.total_bet[uid] += shove
+            self.pot += shove
+            self.acted.add(uid)
+            desc = f"全下 {shove}" if shove else "过牌"
+        else:
+            # 超出跟注足够：全下并加注，重开下注让其余玩家响应
+            excess = paid - to_call
+            raise_units = excess // mult
+            shove = to_call + raise_units * mult
+            self.chips[uid] -= shove
+            self.round_bets[uid] += shove
+            self.total_bet[uid] += shove
+            self.pot += shove
+            self.current_bet += raise_units
+            prior_actors = self.acted.copy()
+            if raise_units * mult < JINHUA_BASE:
+                # 短全下(加注不足一个单位)：已行动者只能跟注/弃牌，不能再加注
+                self.raise_locked.update(prior_actors - {uid})
+            else:
+                self.raise_locked.clear()
+            self.acted = {uid}
+            desc = f"全下 {shove}"
+        if self.chips[uid] == 0:
+            self.all_in.add(uid)
+        return True, desc
 
     def action(self, uid, kind, extra=0):
         if kind == "see":
@@ -3097,10 +3145,14 @@ class JinhuaGame:
             paid = max(0, target - self.round_bets[uid])
             if paid > self.chips[uid]: return False, f"积分不足：需要 {paid}，你只有 {self.chips[uid]}"
             self.chips[uid] -= paid; self.round_bets[uid] += paid; self.total_bet[uid] += paid; self.pot += paid
+            if not self.chips[uid]: self.all_in.add(uid)
             self.acted.add(uid)
             desc = f"跟注 {paid}" if paid else "过牌"
         elif kind == "raise":
             ok, desc = self._do_raise(uid, extra)
+            if not ok: return False, desc
+        elif kind == "allin":
+            ok, desc = self._do_allin(uid)
             if not ok: return False, desc
         else: return False, "未知操作"
         alive = [p for p in self.players if p not in self.folded]
@@ -3116,6 +3168,33 @@ class JinhuaGame:
         if is_235(self.hands[uid]): return "235"
         return JINHUA_HAND_NAMES.get(evaluate_jinhua(self.hands[uid])[0], "散牌")
 
+    def jinhua_side_pot_payouts(self):
+        """炸金花边池派奖：按总投入分层主池/边池，每层用 jinhua_winners 选赢家(保留 235 专杀)。"""
+        payouts = defaultdict(lambda: {"amount": 0, "details": []})
+        total_pot = sum(self.total_bet.values())
+        for index, (amount, contributors) in enumerate(side_pots(self.total_bet)):
+            alive_contributors = [u for u in contributors if u not in self.folded]
+            if not alive_contributors:
+                continue
+            winners = jinhua_winners({u: self.hands[u] for u in alive_contributors})
+            share, remainder = divmod(amount, len(winners))
+            for pos, uid in enumerate(sorted(winners)):
+                won = share + (1 if pos < remainder else 0)
+                payouts[uid]["amount"] += won
+                payouts[uid]["details"].append(("主池" if index == 0 else f"边池{index}", won))
+        # 守恒兜底：未被分配的底池归入最佳牌型存活玩家，禁止积分凭空消失
+        allocated = sum(item["amount"] for item in payouts.values())
+        unallocated = total_pot - allocated
+        if unallocated > 0:
+            alive = [u for u in self.players if u not in self.folded]
+            winners = jinhua_winners({u: self.hands[u] for u in alive})
+            share, remainder = divmod(unallocated, len(winners))
+            for pos, uid in enumerate(sorted(winners)):
+                won = share + (1 if pos < remainder else 0)
+                payouts[uid]["amount"] += won
+                payouts[uid]["details"].append(("底池兜底", won))
+        return payouts
+
     async def showdown(self):
         alive = [uid for uid in self.players if uid not in self.folded]
         self.showdown_order = alive.copy()
@@ -3126,19 +3205,14 @@ class JinhuaGame:
                 game_chips[self.chat_id][uid] += self.chips[uid] - self.initial_chips.get(uid, game_chips[self.chat_id][uid])
             save_data(); await asyncio.to_thread(force_save_now)
             return [(winner, "最后赢家", self.pot, [("全部底池", self.pot)], {})]
-        winners = jinhua_winners({uid: self.hands[uid] for uid in alive})
-        share, remainder = divmod(self.pot, len(winners))
         names = {uid: self._hand_name(uid) for uid in alive}
-        payouts = defaultdict(lambda: {"amount": 0, "details": []})
-        for i, uid in enumerate(sorted(winners)):
-            won = share + (1 if i < remainder else 0)
-            self.chips[uid] += won
-            payouts[uid]["amount"] = won
-            payouts[uid]["details"].append(("主池", won))
+        payouts = self.jinhua_side_pot_payouts()
+        for uid, item in payouts.items():
+            self.chips[uid] += item["amount"]
         for uid in self.players:
             game_chips[self.chat_id][uid] += self.chips[uid] - self.initial_chips.get(uid, game_chips[self.chat_id][uid])
         save_data(); await asyncio.to_thread(force_save_now)
-        return [(uid, names[uid], payouts[uid]["amount"], payouts[uid]["details"], names) for uid in alive]
+        return [(uid, names[uid], payouts[uid]["amount"], payouts[uid]["details"], names) for uid in alive if payouts[uid]["amount"] > 0]
 
     def cancel_timer(self):
         task, self.turn_task = self.turn_task, None
@@ -3177,7 +3251,7 @@ async def jinhua_table_text(game, app):
         lines.append(f"⏳ 当前行动：{await get_name(app, current)}｜需补：{max(0, game._target(current) - game.round_bets[current])}")
         lines.append("")
     for index, uid in enumerate(game.players, 1):
-        status = "❌ 弃牌" if uid in game.folded else "🟢 在局"
+        status = "❌ 弃牌" if uid in game.folded else "🔥 全下" if uid in game.all_in else "🟢 在局"
         seen_mark = "👁 已看牌" if uid in game.seen else "🎴 闷牌"
         lines.extend([
             f"{index}. {await get_name(app, uid)}",
@@ -3196,8 +3270,10 @@ def jinhua_buttons(game, uid):
         return InlineKeyboardMarkup(rows)
     to_call = max(0, game._target(uid) - game.round_bets[uid])
     rows.append([InlineKeyboardButton("❌ 弃牌", callback_data="jh_fold"), InlineKeyboardButton("✅ 过牌" if not to_call else f"✅ 跟注 {to_call}", callback_data="jh_call")])
-    if game.chips[uid] >= to_call + JINHUA_BASE:
+    if uid not in game.raise_locked and game.chips[uid] >= to_call + JINHUA_BASE:
         rows.append([InlineKeyboardButton(f"🔼 加注 {JINHUA_BASE}", callback_data=f"jh_raise_{JINHUA_BASE}")])
+    if game.chips[uid] > 0:
+        rows.append([InlineKeyboardButton(f"🔥 全下 {game.chips[uid]}", callback_data="jh_allin")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -5246,7 +5322,7 @@ async def on_button(update, context):
                 return
             # 下注阶段：当前玩家操作
             if uid != game.current(): await q.answer("还没轮到你", show_alert=True); return
-            action = {"jh_fold": "fold", "jh_call": "call"}.get(data); extra = 0
+            action = {"jh_fold": "fold", "jh_call": "call", "jh_allin": "allin"}.get(data); extra = 0
             if data.startswith("jh_raise_"):
                 try: action, extra = "raise", int(data.rsplit("_", 1)[1])
                 except ValueError: await q.answer("无效加注额", show_alert=True); return
@@ -5428,6 +5504,22 @@ async def on_text(update, context):
                 if not (game and game.phase != "waiting" and user.id == game.current()):
                     continue
                 ok, desc = game.action(user.id, "raise", amount)
+                if not ok: await message.reply_text(f"❌ {desc}"); return
+                await action_notice(cid, context.application, user.id, desc)
+                if game.phase == "showdown": await settle(game, context.application)
+                else: await update(game, context.application); await start_timer(game, context.application)
+                return
+
+        # 扑克类游戏文字全下（自动路由到玩家当前轮到的游戏：德州→梭哈→炸金花）
+        if re.fullmatch(r"全下|all\s*in", text.strip(), re.IGNORECASE):
+            for game, settle, update, start_timer in [
+                (active_poker_games.get(cid), settle_poker, update_poker_table, start_turn_timer),
+                (active_stud_games.get(cid), settle_stud, update_stud_table, start_stud_turn_timer),
+                (active_jinhua_games.get(cid), settle_jinhua, update_jinhua_table, start_jinhua_turn_timer),
+            ]:
+                if not (game and game.phase != "waiting" and user.id == game.current()):
+                    continue
+                ok, desc = game.action(user.id, "allin")
                 if not ok: await message.reply_text(f"❌ {desc}"); return
                 await action_notice(cid, context.application, user.id, desc)
                 if game.phase == "showdown": await settle(game, context.application)
