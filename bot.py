@@ -3071,13 +3071,15 @@ class JinhuaGame:
         self.folded, self.all_in, self.acted, self.raise_locked = set(), set(), set(), set()
         self.deck = []
         self.pot = self.current_bet = self.actor_idx = 0
-        self.game_msg_id = self.action_msg_id = None
+        self.game_msg_id = None  # 唯一权威牌桌消息（删旧发新：每次行动重发到群最新位置，全群始终只有这一条）
         self.turn_task = self.wait_task = None
         self.settled = False
         self.showdown_order = []
         self.last_compare = None
         self.penalty_log = []
-        self.compare_menu_msg_id = None
+        self.last_action = None          # 牌桌状态行：展示“上一手”动作，取代浮动提示消息
+        self.compare_menu_owner = None   # 比牌选人菜单发起者（锁），仅其可点选对手
+        self._render_lock = asyncio.Lock()  # 牌桌渲染锁：删旧发新期间防并发导致出现两条牌桌
 
     def add(self, uid):
         if self.phase != "waiting" or uid in self.players: return False
@@ -3349,11 +3351,15 @@ async def jinhua_table_text(game, app):
         "",
         "━━━━━━━━━━━━━━━━━",
         f"💰 奖池：{game.pot}｜单注：{game.current_bet}（看牌者×2）",
+    ]
+    if game.last_action:
+        lines.append(f"🔔 上一手：{game.last_action}")
+    lines.extend([
         "━━━━━━━━━━━━━━━━━",
         "",
         "👥 玩家状态",
         "",
-    ]
+    ])
     current = game.current() if game.phase == "betting" else None
     if current:
         lines.append(f"⏳ 当前行动：{await get_name(app, current)}｜需补：{max(0, game._target(current) - game.round_bets[current])}")
@@ -3389,17 +3395,49 @@ def jinhua_buttons(game, uid):
     return InlineKeyboardMarkup(rows)
 
 
+async def _sync_jinhua_msg(game, app, text, kb):
+    """渲染唯一权威牌桌消息：删旧发新，让牌桌永远停在群最新位置（不被聊天顶上去），全群始终只有这一条。
+
+    流程：先发新消息（更新 game_msg_id）再删旧消息，避免牌桌短暂消失；发送失败则回退原地编辑兜底。
+    加锁避免快速连续操作（连点/超时与点击并发）时出现两条牌桌。
+    """
+    async with game._render_lock:
+        old_id = game.game_msg_id
+        msg = await safe_send(app.bot, game.chat_id, text, reply_markup=kb, parse_mode="HTML")
+        if msg:
+            game.game_msg_id = msg.message_id
+            if old_id and old_id != game.game_msg_id:
+                await safe_delete(app.bot, game.chat_id, old_id)
+            return
+        # 发送失败兜底：原地编辑旧的（若还在），让牌桌不消失
+        if old_id:
+            edited = await safe_edit(app.bot, game.chat_id, old_id, text, reply_markup=kb, parse_mode="HTML")
+            if edited is not None:
+                return
+
+
 async def update_jinhua_table(game, app):
-    # 像德州一样每轮重发一条新牌桌消息（删旧发新），不再原地编辑最初那条，
-    # 避免牌桌被后续消息顶上去、玩家要翻历史
-    await safe_delete(app.bot, game.chat_id, game.game_msg_id)
-    msg = await safe_send(app.bot, game.chat_id, await jinhua_table_text(game, app))
-    if msg:
-        game.game_msg_id = msg.message_id
+    # 收敛为唯一牌桌消息：直接复用 show_jinhua_action（含当前操作者按钮），原地编辑不再删旧发新
+    await show_jinhua_action(game, app)
 
 
 async def show_jinhua_action(game, app):
-    """发送行动消息（牌桌 + 当前玩家按钮），open_pending 时对所有存活玩家发开牌/继续加注按钮。"""
+    """渲染唯一权威牌桌消息（牌桌文本 + 当前操作者按钮），原地编辑 game_msg_id。
+
+    三种视图：比牌选人菜单 / 跟平阶段全员开牌·继续加注 / 下注阶段当前玩家行动。
+    """
+    if game.compare_menu_owner is not None:
+        owner = game.compare_menu_owner
+        targets = [p for p in game.players if p not in game.folded and p != owner]
+        rows = []
+        for t in targets:
+            tname = await get_name(app, t)
+            tmark = "👁" if t in game.seen else "🎴"
+            rows.append([InlineKeyboardButton(f"{tmark} {tname}", callback_data=f"jh_pk_{t}")])
+        rows.append([InlineKeyboardButton("❌ 取消", callback_data="jh_cancel_pk")])
+        text = f"{await jinhua_table_text(game, app)}\n\n⚔️ {await get_name(app, owner)} 选择比牌对手（仅比牌双方亮牌，其余玩家看不到牌面）："
+        await _sync_jinhua_msg(game, app, text, InlineKeyboardMarkup(rows))
+        return
     if game.phase == "open_pending":
         text = f"{await jinhua_table_text(game, app)}\n\n💡 已跟平，可 <b>开牌</b> 比大小，或 <b>继续加注</b> 偷鸡。"
         kb = InlineKeyboardMarkup([
@@ -3407,31 +3445,22 @@ async def show_jinhua_action(game, app):
             [InlineKeyboardButton(f"🔼 继续加注 {JINHUA_BASE}", callback_data=f"jh_raise_{JINHUA_BASE}")],
             [InlineKeyboardButton("🔄 刷新界面", callback_data="jh_refresh")],
         ])
-        # 像德州一样每轮重发新消息（删旧发新），不再原地编辑最初那条牌桌
-        await safe_delete(app.bot, game.chat_id, game.game_msg_id)
-        msg = await safe_send(app.bot, game.chat_id, text, reply_markup=kb, parse_mode="HTML")
-        if msg: game.game_msg_id = msg.message_id
+        await _sync_jinhua_msg(game, app, text, kb)
         return
     uid = game.current()
     if uid is None:
         if game.phase == "showdown": await settle_jinhua(game, app)
         return
-    await safe_delete(app.bot, game.chat_id, game.action_msg_id)
     text = f"{await jinhua_table_text(game, app)}\n\n⏰ <b>{await get_name(app, uid)}</b> 请在 {TURN_TIMEOUT} 秒内行动。"
-    msg = await safe_send(app.bot, game.chat_id, text, reply_markup=jinhua_buttons(game, uid), parse_mode="HTML")
-    game.action_msg_id = msg.message_id if msg else None
+    await _sync_jinhua_msg(game, app, text, jinhua_buttons(game, uid))
 
 
 async def start_jinhua_turn_timer(game, app):
     game.cancel_timer()
-    if game.phase == "open_pending":
-        await show_jinhua_action(game, app)
+    await show_jinhua_action(game, app)
+    if game.phase in ("open_pending", "showdown"):
         return
     uid = game.current()
-    if uid is None:
-        if game.phase == "showdown": await settle_jinhua(game, app)
-        return
-    await show_jinhua_action(game, app)
 
     async def timeout_action():
         await asyncio.sleep(TURN_TIMEOUT)
@@ -3439,47 +3468,22 @@ async def start_jinhua_turn_timer(game, app):
         if game.phase == "open_pending": return
         if game.current() != uid: return
         game.action(uid, "fold")
-        await safe_send(app.bot, game.chat_id, f"⏰ 超时自动弃牌：{await get_name(app, uid)}")
+        game.last_action = f"{await get_name(app, uid)} 超时弃牌"
         if game.phase == "showdown":
-            await safe_delete(app.bot, game.chat_id, game.action_msg_id)
             await settle_jinhua(game, app)
-        elif game.phase == "open_pending":
-            await show_jinhua_action(game, app)
-        else: await update_jinhua_table(game, app); await start_jinhua_turn_timer(game, app)
+        else:
+            await start_jinhua_turn_timer(game, app)
     game.turn_task = asyncio.create_task(timeout_action())
 
 
 async def _refresh_jinhua_table(game, app):
-    """炸金花刷新发新界面：删旧牌桌消息、发新牌桌消息、更新 game_msg_id，并恢复按钮/timer。
+    """炸金花刷新界面：原地重编辑唯一牌桌消息（无副作用，仅恢复当前 phase 的视图与 timer）。
 
-    对 game 状态无副作用（仅按 game.phase 决定恢复 open_pending 按钮还是行动按钮/timer）。
-    供 on_text 的「刷新」分支与 on_button 的 jh_refresh 复用。返回新消息对象（失败为 None）。
+    供 on_text 的「刷新」分支与 on_button 的 jh_refresh 复用。
     """
-    await safe_delete(app.bot, game.chat_id, game.game_msg_id)
-    msg = await safe_send(app.bot, game.chat_id, await jinhua_table_text(game, app))
-    if msg:
-        game.game_msg_id = msg.message_id
-        # 恢复按钮/timer：跟平阶段发开牌/继续加注按钮；下注阶段恢复当前玩家行动
-        if game.phase == "open_pending":
-            await show_jinhua_action(game, app)
-        else:
-            await start_jinhua_turn_timer(game, app)
-    return msg
-
-
-async def send_jinhua_compare_menu(game, app, owner):
-    """炸金花比牌选人菜单：列出其他存活玩家为比牌对手，'取消'返回。仅比牌双方私聊亮牌。"""
-    targets = [p for p in game.players if p not in game.folded and p != owner]
-    if not targets:
-        return
-    rows = []
-    for t in targets:
-        tname = await get_name(app, t)
-        tmark = "👁" if t in game.seen else "🎴"
-        rows.append([InlineKeyboardButton(f"{tmark} {tname}", callback_data=f"jh_pk_{t}")])
-    rows.append([InlineKeyboardButton("❌ 取消", callback_data="jh_cancel_pk")])
-    msg = await safe_send(app.bot, game.chat_id, "⚔️ 选择比牌对手（仅你们两人亮牌，其余玩家看不到牌面）：", reply_markup=InlineKeyboardMarkup(rows))
-    if msg: game.compare_menu_msg_id = msg.message_id
+    game.cancel_timer()
+    await start_jinhua_turn_timer(game, app)
+    return None
 
 
 async def settle_jinhua(game, app):
@@ -3518,7 +3522,6 @@ async def settle_jinhua(game, app):
             rank = sorted(jinhua_profit_by_date[date][game.chat_id].items(), key=lambda item: item[1], reverse=True)[:50]
             lines.extend(["", "🏆 <b>当日炸金花累计盈利榜</b>", "━━━━━━━━━━━━━━━━━"])
             lines.extend([f"{rank_marker(index)} {names.get(uid) or await get_name(app, uid)}：{amount:+d}" for index, (uid, amount) in enumerate(rank, 1)])
-        await safe_delete(app.bot, game.chat_id, game.action_msg_id)
         await safe_delete(app.bot, game.chat_id, game.game_msg_id)
         delivered = await safe_send_long(app.bot, game.chat_id, "\n".join(lines), parse_mode="HTML")
         if delivered is None:
@@ -3552,8 +3555,6 @@ async def refund_jinhua(game, app, notice):
     game.phase = "cancelled"
     if active_jinhua_games.get(game.chat_id) is game:
         active_jinhua_games.pop(game.chat_id, None)
-    await safe_delete(app.bot, game.chat_id, game.action_msg_id)
-    # 像德州一样删旧发新（牌桌主消息不再原地编辑），避免取消通知顶在旧消息上
     await safe_delete(app.bot, game.chat_id, game.game_msg_id)
     await safe_send(app.bot, game.chat_id, notice)
     save_data()
@@ -5447,10 +5448,9 @@ async def on_button(update, context):
                 cards = "  ".join(card_str(c) for c in game.hands[uid])
                 await q.answer(f"你的手牌：{cards}｜{game._hand_name(uid)}", show_alert=True)
                 if first:
-                    # 只刷新群内文本（玩家状态从"闷牌"变"已看牌"是公开信息），不重发按钮消息，
-                    # 避免按钮 label 变化影响其他存活玩家的当前操作视图
-                    await action_notice(cid, context.application, uid, "👁 看了牌")
-                    await update_jinhua_table(game, context.application)
+                    # 看牌是公开信息（闷牌→已看牌），写入状态行并原地重编辑同一牌桌消息
+                    game.last_action = f"{await get_name(context.application, uid)} 看了牌"
+                    await show_jinhua_action(game, context.application)
                 return
             if data == "jh_compare_menu":
                 if uid in game.folded:
@@ -5463,27 +5463,27 @@ async def on_button(update, context):
                 if not targets:
                     await q.answer("没有可比对的对象", show_alert=True); return
                 game.cancel_timer()  # 选人期间暂停超时，避免被自动弃牌
-                await send_jinhua_compare_menu(game, context.application, uid)
+                game.compare_menu_owner = uid  # 锁：仅发起者能点选对手
+                await show_jinhua_action(game, context.application)  # 同一条消息切换为选人菜单
                 await q.answer("选择比牌对手"); return
             if data == "jh_cancel_pk":
-                if game.compare_menu_msg_id:
-                    await safe_delete(context.bot, cid, game.compare_menu_msg_id); game.compare_menu_msg_id = None
+                game.compare_menu_owner = None
                 if game.phase == "open_pending":
                     await show_jinhua_action(game, context.application)
                 else:
                     await start_jinhua_turn_timer(game, context.application)
                 await q.answer("已取消比牌"); return
             if data.startswith("jh_pk_"):
+                if game.compare_menu_owner is None or uid != game.compare_menu_owner:
+                    await q.answer("不是你发起的比牌", show_alert=True); return
                 try: target = int(data.rsplit("_", 1)[1])
                 except ValueError:
                     await q.answer("无效比牌对象", show_alert=True); return
-                if game.compare_menu_msg_id:
-                    await safe_delete(context.bot, cid, game.compare_menu_msg_id); game.compare_menu_msg_id = None
+                game.compare_menu_owner = None
                 ok, desc = game.action(uid, "compare", target)
                 if not ok:
                     await q.answer(desc, show_alert=True)
-                    if game.phase == "open_pending": await show_jinhua_action(game, context.application)
-                    elif game.phase == "betting": await start_jinhua_turn_timer(game, context.application)
+                    await start_jinhua_turn_timer(game, context.application)
                     return
                 cmp = game.last_compare
                 challenger, target, winner, penalty = cmp
@@ -5506,10 +5506,8 @@ async def on_button(update, context):
                 await q.answer(desc)
                 if game.phase == "showdown":
                     await settle_jinhua(game, context.application)
-                elif game.phase == "open_pending":
-                    await show_jinhua_action(game, context.application)
                 else:
-                    await update_jinhua_table(game, context.application); await start_jinhua_turn_timer(game, context.application)
+                    await start_jinhua_turn_timer(game, context.application)
                 return
             if data == "jh_end":
                 if not is_bot_admin(uid) and uid not in game.players:
@@ -5544,8 +5542,9 @@ async def on_button(update, context):
                     except ValueError: await q.answer("无效加注额", show_alert=True); return
                     ok, desc = game.action(uid, "raise", extra)
                     if not ok: await q.answer(desc, show_alert=True); return
-                    await q.answer(desc); await action_notice(cid, context.application, uid, desc)
-                    await update_jinhua_table(game, context.application); await start_jinhua_turn_timer(game, context.application)
+                    await q.answer(desc)
+                    game.last_action = f"{await get_name(context.application, uid)} {desc}"
+                    await show_jinhua_action(game, context.application)
                 else:
                     await q.answer("未知操作", show_alert=True)
                 return
@@ -5558,10 +5557,11 @@ async def on_button(update, context):
             if not action: await q.answer("未知操作", show_alert=True); return
             ok, desc = game.action(uid, action, extra)
             if not ok: await q.answer(desc, show_alert=True); return
-            await q.answer(desc); await safe_delete(context.bot, cid, game.action_msg_id); await action_notice(cid, context.application, uid, desc)
+            await q.answer(desc)
+            game.last_action = f"{await get_name(context.application, uid)} {desc}"
             if game.phase == "showdown": await settle_jinhua(game, context.application)
             elif game.phase == "open_pending": await show_jinhua_action(game, context.application)
-            else: await update_jinhua_table(game, context.application); await start_jinhua_turn_timer(game, context.application)
+            else: await start_jinhua_turn_timer(game, context.application)
             return
         if data.startswith("horsebet_"):
             race = active_horse_races.get(cid)
